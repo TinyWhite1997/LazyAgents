@@ -27,7 +27,7 @@ pub fn chunk_session_output(
         return vec![SessionOutputParams::from_bytes(session_id, start_seq, &[])];
     }
 
-    let mut out = Vec::with_capacity((data.len() + SESSION_OUTPUT_CHUNK_BYTES - 1) / SESSION_OUTPUT_CHUNK_BYTES);
+    let mut out = Vec::with_capacity(data.len().div_ceil(SESSION_OUTPUT_CHUNK_BYTES));
     let mut seq = start_seq;
     for slice in data.chunks(SESSION_OUTPUT_CHUNK_BYTES) {
         out.push(SessionOutputParams::from_bytes(session_id, seq, slice));

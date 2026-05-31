@@ -17,7 +17,7 @@ use std::time::Duration;
 use la_ipc::transport::{Endpoint, Listener};
 use la_ipc::Connection;
 use la_proto::jsonrpc::{Message, Response, ResponseOutcome};
-use la_proto::methods::{Initialize, Method, ServerCapabilities, InitializeResult};
+use la_proto::methods::{Initialize, InitializeResult, Method, ServerCapabilities};
 use la_proto::PROTOCOL_VERSION;
 use tempfile::TempDir;
 
@@ -34,7 +34,9 @@ async fn la_ipc_cat_round_trips_an_initialize_request() {
         let stream = listener.accept().await.unwrap();
         let mut conn = Connection::new(stream);
         let msg = conn.recv().await.unwrap().unwrap();
-        let Message::Request(req) = msg else { panic!("not a request") };
+        let Message::Request(req) = msg else {
+            panic!("not a request")
+        };
         assert_eq!(req.method, Initialize::NAME);
         let result = InitializeResult {
             server: "lad".into(),

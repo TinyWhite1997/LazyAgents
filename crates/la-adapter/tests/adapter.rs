@@ -10,9 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use la_adapter::claude::ClaudeAdapter;
-use la_adapter::{
-    AgentAdapter, ProbeResult, SpawnRequest, StdinMode, StopAction, StopSignal,
-};
+use la_adapter::{AgentAdapter, ProbeResult, SpawnRequest, StdinMode, StopAction, StopSignal};
 
 fn mock_cli() -> PathBuf {
     // Set by Cargo for bins in the same package.

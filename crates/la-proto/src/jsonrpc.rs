@@ -193,7 +193,10 @@ pub struct Notification {
 }
 
 impl Notification {
-    pub fn new<P: Serialize>(method: impl Into<String>, params: P) -> Result<Self, serde_json::Error> {
+    pub fn new<P: Serialize>(
+        method: impl Into<String>,
+        params: P,
+    ) -> Result<Self, serde_json::Error> {
         Ok(Self {
             jsonrpc: Version,
             method: method.into(),
@@ -319,7 +322,10 @@ impl RpcError {
         Self::new(error_codes::INVALID_REQUEST, message)
     }
     pub fn method_not_found(method: &str) -> Self {
-        Self::new(error_codes::METHOD_NOT_FOUND, format!("method not found: {method}"))
+        Self::new(
+            error_codes::METHOD_NOT_FOUND,
+            format!("method not found: {method}"),
+        )
     }
     pub fn invalid_params(message: impl Into<String>) -> Self {
         Self::new(error_codes::INVALID_PARAMS, message)

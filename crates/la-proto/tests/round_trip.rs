@@ -13,9 +13,9 @@
 use la_proto::chunking::chunk_session_output;
 use la_proto::jsonrpc::{Message, Notification, Request, RequestId, Response, RpcError, Version};
 use la_proto::methods::{
-    Initialize, InitializeParams, InitializeResult, Method, ServerCapabilities, SessionsAttach,
-    SessionsAttachParams, SessionsCreate, SessionsCreateParams, SessionsCreateResult, PtySize,
-    SessionState, SessionsWrite, SessionsWriteParams, SessionsWriteResult,
+    Initialize, InitializeParams, InitializeResult, Method, PtySize, ServerCapabilities,
+    SessionState, SessionsAttach, SessionsAttachParams, SessionsCreate, SessionsCreateParams,
+    SessionsCreateResult, SessionsWrite, SessionsWriteParams, SessionsWriteResult,
 };
 use la_proto::notifications::{NotificationMethod, SessionOutput, SessionOutputParams};
 use la_proto::{PROTOCOL_VERSION, SESSION_OUTPUT_CHUNK_BYTES};
@@ -136,7 +136,9 @@ fn response_error_round_trip() {
     let resp = Response::error(RequestId::Num(7), err.clone());
     let bytes = serde_json::to_vec(&resp).unwrap();
     let decoded = Message::from_slice(&bytes).unwrap();
-    let Message::Response(r) = decoded else { panic!() };
+    let Message::Response(r) = decoded else {
+        panic!()
+    };
     let back = match r.outcome {
         la_proto::jsonrpc::ResponseOutcome::Error(error) => error,
         _ => panic!("expected error outcome"),
@@ -214,7 +216,9 @@ fn session_output_notification_round_trip() {
     let n = Notification::new(SessionOutput::NAME, &n_params).unwrap();
     let bytes = serde_json::to_vec(&n).unwrap();
     let decoded = Message::from_slice(&bytes).unwrap();
-    let Message::Notification(nn) = decoded else { panic!() };
+    let Message::Notification(nn) = decoded else {
+        panic!()
+    };
     let p: SessionOutputParams = nn.params_as().unwrap();
     assert_eq!(p, n_params);
     assert_eq!(p.data_bytes().unwrap(), b"hello");
@@ -246,7 +250,10 @@ fn chunker_emits_single_heartbeat_for_empty_data() {
 fn method_not_found_error_helper() {
     let e = RpcError::method_not_found("xyz");
     let v: serde_json::Value = serde_json::to_value(&e).unwrap();
-    assert_eq!(v, json!({"code": -32601, "message": "method not found: xyz"}));
+    assert_eq!(
+        v,
+        json!({"code": -32601, "message": "method not found: xyz"})
+    );
 }
 
 #[test]
@@ -255,11 +262,17 @@ fn request_id_null_serializes_as_json_null() {
     let resp = Response::error(RequestId::Null, RpcError::parse_error("garbage"));
     let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
     assert!(v.get("id").is_some(), "id field must be present");
-    assert!(v["id"].is_null(), "id field must be JSON null, got {:?}", v["id"]);
+    assert!(
+        v["id"].is_null(),
+        "id field must be JSON null, got {:?}",
+        v["id"]
+    );
     // Round-trip.
     let bytes = serde_json::to_vec(&resp).unwrap();
     let m = Message::from_slice(&bytes).unwrap();
-    let Message::Response(r) = m else { panic!("not a response") };
+    let Message::Response(r) = m else {
+        panic!("not a response")
+    };
     assert_eq!(r.id, RequestId::Null);
 }
 

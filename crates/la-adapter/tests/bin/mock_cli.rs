@@ -21,9 +21,8 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let mode = pick_mode(&args).unwrap_or_else(|| {
-        env::var("MOCK_CLI_MODE").unwrap_or_else(|_| "ok".into())
-    });
+    let mode = pick_mode(&args)
+        .unwrap_or_else(|| env::var("MOCK_CLI_MODE").unwrap_or_else(|_| "ok".into()));
 
     let subcmd = args.iter().find(|a| !a.starts_with("--mode")).cloned();
 
@@ -31,7 +30,11 @@ fn main() -> ExitCode {
         Some("--version") => version(&mode),
         Some("--print") => print_prompt(&args),
         _ => {
-            let _ = writeln!(std::io::stderr(), "mock-cli: unknown invocation: {:?}", args);
+            let _ = writeln!(
+                std::io::stderr(),
+                "mock-cli: unknown invocation: {:?}",
+                args
+            );
             ExitCode::from(2)
         }
     }

@@ -71,7 +71,10 @@ where
     let params = InitializeParams {
         client: client_name.to_owned(),
         client_version: client_version.to_owned(),
-        protocol_versions: supported_protocol_versions.iter().map(|s| s.to_string()).collect(),
+        protocol_versions: supported_protocol_versions
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     };
     let req = Request::new(1i64, Initialize::NAME, &params)
         .map_err(|e| HandshakeError::UnexpectedMessage(format!("encode initialize: {e}")))?;
@@ -80,11 +83,9 @@ where
         .await
         .map_err(io_to_handshake)?;
 
-    let msg = conn
-        .recv()
-        .await
-        .map_err(io_to_handshake)?
-        .ok_or_else(|| HandshakeError::UnexpectedMessage("EOF before initialize response".into()))?;
+    let msg = conn.recv().await.map_err(io_to_handshake)?.ok_or_else(|| {
+        HandshakeError::UnexpectedMessage("EOF before initialize response".into())
+    })?;
 
     let resp = match msg {
         Message::Response(r) => r,

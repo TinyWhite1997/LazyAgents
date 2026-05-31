@@ -24,9 +24,9 @@ use la_ipc::{client_handshake, server_handshake, Connection};
 use la_proto::chunking::chunk_session_output;
 use la_proto::jsonrpc::{Message, Notification, Request, RequestId, Response, ResponseOutcome};
 use la_proto::methods::{
-    Method, PtySize, SessionState, SessionsAttach, SessionsAttachParams, SessionsAttachResult,
-    SessionsCreate, SessionsCreateParams, SessionsCreateResult, SessionsWrite,
-    SessionsWriteParams, SessionsWriteResult, ServerCapabilities,
+    Method, PtySize, ServerCapabilities, SessionState, SessionsAttach, SessionsAttachParams,
+    SessionsAttachResult, SessionsCreate, SessionsCreateParams, SessionsCreateResult,
+    SessionsWrite, SessionsWriteParams, SessionsWriteResult,
 };
 use la_proto::notifications::{NotificationMethod, SessionOutput};
 use la_proto::PROTOCOL_VERSION;
@@ -348,9 +348,7 @@ async fn split_halves_allow_concurrent_send_and_recv() {
         }
     });
     let mut count = 0;
-    while let Ok(Some(_seq)) =
-        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
-    {
+    while let Ok(Some(_seq)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
         count += 1;
         if count == 100 {
             break;

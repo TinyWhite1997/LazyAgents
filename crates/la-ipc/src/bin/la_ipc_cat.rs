@@ -117,9 +117,7 @@ async fn main() -> ExitCode {
     // be initialize, so a script that fed an empty stdin almost certainly
     // had a bug).
     if sent == 0 {
-        eprintln!(
-            "la-ipc-cat: no frames read from stdin; expected at least an initialize request"
-        );
+        eprintln!("la-ipc-cat: no frames read from stdin; expected at least an initialize request");
         return ExitCode::from(1);
     }
 

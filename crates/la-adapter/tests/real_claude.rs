@@ -31,7 +31,9 @@ const E2E_ENV_FLAG: &str = "LA_RUN_CLAUDE_E2E";
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn e2e_enabled() -> bool {
-    std::env::var(E2E_ENV_FLAG).map(|v| v == "1").unwrap_or(false)
+    std::env::var(E2E_ENV_FLAG)
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 fn claude_on_path() -> bool {
@@ -58,9 +60,7 @@ async fn real_claude_one_shot_prompt_reply() {
     let adapter = ClaudeAdapter::new();
     let mut req = SpawnRequest::new(std::env::temp_dir());
     req.stdin_mode = StdinMode::NullSink;
-    req.prompt = Some(
-        "Reply with exactly one word: PONG. No punctuation, no extra text.".into(),
-    );
+    req.prompt = Some("Reply with exactly one word: PONG. No punctuation, no extra text.".into());
 
     let spec = adapter.spawn_spec(&req).expect("spawn_spec");
 
@@ -76,7 +76,12 @@ async fn real_claude_one_shot_prompt_reply() {
         cmd.env(k, v);
     }
 
-    let size = PtySize { rows: spec.pty.rows, cols: spec.pty.cols, pixel_width: 0, pixel_height: 0 };
+    let size = PtySize {
+        rows: spec.pty.rows,
+        cols: spec.pty.cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
     let mut child = spawn(cmd, size).expect("la-pty spawn real claude");
 
     // Drain until EOF or timeout.
@@ -93,9 +98,15 @@ async fn real_claude_one_shot_prompt_reply() {
     let status = child.wait().await.expect("wait");
     let stdout = String::from_utf8_lossy(&collected);
     eprintln!("real-claude exit status: {status:?}");
-    eprintln!("real-claude stdout (truncated):\n{}", &stdout.chars().take(2000).collect::<String>());
+    eprintln!(
+        "real-claude stdout (truncated):\n{}",
+        &stdout.chars().take(2000).collect::<String>()
+    );
 
-    assert!(status.success(), "claude --print should exit 0, got {status:?}");
+    assert!(
+        status.success(),
+        "claude --print should exit 0, got {status:?}"
+    );
     assert!(
         !stdout.trim().is_empty(),
         "expected a non-empty reply on the PTY stream"

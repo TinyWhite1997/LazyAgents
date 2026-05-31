@@ -94,7 +94,11 @@ mod imp {
                 use std::os::unix::fs::MetadataExt as _;
                 m.ino()
             });
-            Ok(Self { inner, path, bound_inode })
+            Ok(Self {
+                inner,
+                path,
+                bound_inode,
+            })
         }
 
         /// Accept one connection.
