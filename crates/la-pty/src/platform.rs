@@ -57,7 +57,7 @@ pub(crate) fn send_signal(pid: u32, sig: Signal) -> Result<(), PtyError> {
         },
         Signal::Kill => unsafe {
             let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if handle == 0 {
+            if handle.is_null() {
                 let err = std::io::Error::last_os_error();
                 return Err(PtyError::Signal(format!("OpenProcess: {}", err)));
             }
