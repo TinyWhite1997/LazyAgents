@@ -1,32 +1,46 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Cargo build output
+/target/
+**/target/
 
-# Test binary, built with `go test -c`
-*.test
+# Cargo lock for libraries (LazyAgents ships binaries `lad` and `la`,
+# so Cargo.lock SHOULD be committed — do not ignore it).
 
-# Code coverage profiles and other test artifacts
-*.out
-coverage.*
-*.coverprofile
-profile.cov
+# sqlx offline query cache: keep `.sqlx/` checked in (CI builds without DB),
+# ignore only the transient prepared payloads if any tool writes them here.
+**/sqlx-data.json.tmp
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Test / coverage artifacts
+*.profraw
+*.profdata
+/coverage/
+/tarpaulin-report.*
+/cobertura.xml
+lcov.info
 
-# Go workspace file
-go.work
-go.work.sum
+# Criterion / flamegraph
+/criterion/
+flamegraph.svg
+perf.data
+perf.data.old
 
-# env file
+# Local environment & secrets
 .env
+.env.*
+!.env.example
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local agent runtime data (only present if a dev points
+# XDG_DATA_HOME at the repo; harmless to ignore by default)
+/.lazyagents/state/
+/.lazyagents/wt/
+/.lazyagents/*.sqlite*
+/.lazyagents/*.sock
