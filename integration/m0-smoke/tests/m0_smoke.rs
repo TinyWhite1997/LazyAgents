@@ -138,7 +138,7 @@ async fn run_mock_daemon(
                     RpcResponse::error(request.id, -32002, "session is not attached")
                 } else if let Some(session) = child.as_mut() {
                     let bytes = request.params["bytes"].as_str().unwrap_or_default();
-                    session.writer.write(format!("{bytes}\n")).await?;
+                    write_mock_prompt(session, bytes).await?;
                     let output =
                         read_until(session, &format!("mock-claude reply: {bytes}")).await?;
                     RpcResponse::result(request.id, json!({ "output": output }))
@@ -152,7 +152,7 @@ async fn run_mock_daemon(
             }
             "sessions.probe_alive" => {
                 if let Some(session) = child.as_mut() {
-                    session.writer.write("post-detach\n").await?;
+                    write_mock_prompt(session, "post-detach").await?;
                     let output = read_until(session, "mock-claude reply: post-detach").await?;
                     RpcResponse::result(request.id, json!({ "running": true, "output": output }))
                 } else {
@@ -183,6 +183,21 @@ async fn run_mock_daemon(
     Ok(())
 }
 
+async fn write_mock_prompt(
+    child: &mut PtyChild,
+    prompt: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if cfg!(windows) {
+        child
+            .writer
+            .write(format!("echo mock-claude reply: {prompt}\r\n"))
+            .await?;
+    } else {
+        child.writer.write(format!("{prompt}\n")).await?;
+    }
+    Ok(())
+}
+
 async fn read_until(
     child: &mut PtyChild,
     needle: &str,
@@ -210,11 +225,7 @@ async fn read_until(
 fn mock_claude_command() -> CommandBuilder {
     if cfg!(windows) {
         let mut cmd = CommandBuilder::new("cmd.exe");
-        cmd.args([
-            "/V:ON",
-            "/C",
-            "echo mock-claude ready & set /p line= & echo mock-claude reply: !line! & set /p line= & echo mock-claude reply: !line! & ping -n 30 127.0.0.1 > nul",
-        ]);
+        cmd.args(["/Q", "/K", "echo mock-claude ready"]);
         cmd
     } else {
         let mut cmd = CommandBuilder::new("sh");
