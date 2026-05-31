@@ -1,0 +1,25 @@
+[package]
+name = "la-adapter"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent adapter trait + built-in adapters for LazyAgents (la-adapter)"
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+la-pty = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process"] }
+
+[[bin]]
+name = "mock-cli"
+path = "tests/bin/mock_cli.rs"
+test = false
+doc = false
