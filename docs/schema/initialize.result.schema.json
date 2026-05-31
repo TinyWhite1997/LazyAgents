@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InitializeResult",
+  "type": "object",
+  "required": [
+    "capabilities",
+    "protocol_version",
+    "server",
+    "server_version"
+  ],
+  "properties": {
+    "server": {
+      "description": "Daemon name; for parity with `client`. Defaults to `\"lad\"`.",
+      "type": "string"
+    },
+    "server_version": {
+      "description": "Semver of the daemon binary.",
+      "type": "string"
+    },
+    "protocol_version": {
+      "description": "The single protocol version negotiated for this connection.",
+      "type": "string"
+    },
+    "capabilities": {
+      "description": "Server-advertised capabilities. Fields are additive across minors; unknown ones must be ignored by clients (architecture §3 版本策略).",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ServerCapabilities"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "ServerCapabilities": {
+      "type": "object",
+      "properties": {
+        "adapters": {
+          "description": "Names of adapters the daemon can spawn (e.g. `[\"claude\", \"codex\"]`).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cron": {
+          "description": "True once the cron subsystem is enabled (post-M1).",
+          "default": false,
+          "type": "boolean"
+        },
+        "worktree": {
+          "description": "True once worktree-based isolation is enabled (post-M1).",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

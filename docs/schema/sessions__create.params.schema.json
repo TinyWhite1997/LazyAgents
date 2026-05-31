@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsCreateParams",
+  "type": "object",
+  "required": [
+    "backend",
+    "project_dir"
+  ],
+  "properties": {
+    "project_dir": {
+      "description": "Absolute path of the project directory the agent should `cd` into.",
+      "type": "string"
+    },
+    "backend": {
+      "description": "Backend identifier — must match one of the names in [`ServerCapabilities::adapters`].",
+      "type": "string"
+    },
+    "args": {
+      "description": "Extra args appended to the adapter's base command.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "prompt": {
+      "description": "Initial prompt to push to stdin after the first prompt loop is ready. Omit to leave the session waiting for human input.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "worktree": {
+      "description": "If true, create a fresh git worktree for this session (post-M1; M0 daemon may ignore).",
+      "default": false,
+      "type": "boolean"
+    }
+  }
+}

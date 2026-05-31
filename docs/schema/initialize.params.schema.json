@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InitializeParams",
+  "type": "object",
+  "required": [
+    "client",
+    "client_version",
+    "protocol_versions"
+  ],
+  "properties": {
+    "client": {
+      "description": "Short client identifier, e.g. `\"la\"`.",
+      "type": "string"
+    },
+    "client_version": {
+      "description": "Semver of the client binary, e.g. `\"0.4.1\"`.",
+      "type": "string"
+    },
+    "protocol_versions": {
+      "description": "Ordered list of protocol majors the client supports. The daemon picks the highest one it also supports.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
