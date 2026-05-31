@@ -39,8 +39,16 @@ fn write_method<M: Method>(out_dir: &Path) {
     let params_schema = schema_for!(M::Params);
     let result_schema = schema_for!(M::Result);
     let safe = method_to_filename(M::NAME);
-    write_schema(out_dir, &format!("{safe}.params.schema.json"), &params_schema);
-    write_schema(out_dir, &format!("{safe}.result.schema.json"), &result_schema);
+    write_schema(
+        out_dir,
+        &format!("{safe}.params.schema.json"),
+        &params_schema,
+    );
+    write_schema(
+        out_dir,
+        &format!("{safe}.result.schema.json"),
+        &result_schema,
+    );
 }
 
 fn write_notification<N: NotificationMethod>(out_dir: &Path) {

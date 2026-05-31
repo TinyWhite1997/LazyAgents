@@ -15,8 +15,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::{
-    AdapterDescriptor, AdapterError, AgentAdapter, ProbeResult, SpawnRequest,
-    SpawnSpec, StdinMode, StopAction, StopSequence, StopSignal,
+    AdapterDescriptor, AdapterError, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec, StdinMode,
+    StopAction, StopSequence, StopSignal,
 };
 
 const DEFAULT_PROGRAM: &str = "claude";
@@ -45,7 +45,9 @@ impl ClaudeAdapter {
     /// path. Useful in tests (to point at `mock-cli`) and in production
     /// when the user has set `adapters.claude.command` in their config.
     pub fn with_program(program: impl Into<PathBuf>) -> Self {
-        Self { program: Some(program.into()) }
+        Self {
+            program: Some(program.into()),
+        }
     }
 
     fn resolved_program(&self, req_override: Option<&Path>) -> PathBuf {
@@ -95,10 +97,18 @@ impl AgentAdapter for ClaudeAdapter {
 
         let output = match timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
             Ok(Ok(o)) => o,
-            Ok(Err(e)) => return ProbeResult::Error { detail: format!("wait: {e}") },
+            Ok(Err(e)) => {
+                return ProbeResult::Error {
+                    detail: format!("wait: {e}"),
+                }
+            }
             Err(_) => {
                 return ProbeResult::Error {
-                    detail: format!("`{} --version` timed out after {:?}", program.display(), PROBE_TIMEOUT),
+                    detail: format!(
+                        "`{} --version` timed out after {:?}",
+                        program.display(),
+                        PROBE_TIMEOUT
+                    ),
                 }
             }
         };
@@ -109,7 +119,9 @@ impl AgentAdapter for ClaudeAdapter {
         // The CLI surfaces auth state via the exit code + a stderr
         // keyword on some versions; tolerate both.
         if looks_unauthenticated(&stdout, &stderr) {
-            return ProbeResult::Unauthenticated { docs_url: DOCS_URL.to_string() };
+            return ProbeResult::Unauthenticated {
+                docs_url: DOCS_URL.to_string(),
+            };
         }
 
         if !output.status.success() {
@@ -258,10 +270,22 @@ mod tests {
 
     #[test]
     fn parses_real_world_version_shapes() {
-        assert_eq!(parse_version("2.1.158 (Claude Code)\n").as_deref(), Some("2.1.158"));
-        assert_eq!(parse_version("claude 2.1.158\n").as_deref(), Some("2.1.158"));
-        assert_eq!(parse_version("Claude Code 2.1.158\n").as_deref(), Some("2.1.158"));
-        assert_eq!(parse_version("v2.1.158-beta.1\n").as_deref(), Some("2.1.158-beta.1"));
+        assert_eq!(
+            parse_version("2.1.158 (Claude Code)\n").as_deref(),
+            Some("2.1.158")
+        );
+        assert_eq!(
+            parse_version("claude 2.1.158\n").as_deref(),
+            Some("2.1.158")
+        );
+        assert_eq!(
+            parse_version("Claude Code 2.1.158\n").as_deref(),
+            Some("2.1.158")
+        );
+        assert_eq!(
+            parse_version("v2.1.158-beta.1\n").as_deref(),
+            Some("2.1.158-beta.1")
+        );
         assert_eq!(parse_version("nothing here\n"), None);
         assert_eq!(parse_version(""), None);
     }
@@ -294,7 +318,10 @@ mod tests {
 
     #[test]
     fn unauthenticated_detector() {
-        assert!(looks_unauthenticated("", "Error: not logged in. Run `claude login`."));
+        assert!(looks_unauthenticated(
+            "",
+            "Error: not logged in. Run `claude login`."
+        ));
         assert!(looks_unauthenticated("UNAUTHENTICATED\n", ""));
         assert!(!looks_unauthenticated("2.1.158 (Claude Code)", ""));
     }
@@ -303,7 +330,11 @@ mod tests {
     fn spawn_spec_default_is_interactive_no_prompt_flag() {
         let req = SpawnRequest::new("/tmp/wt");
         let spec = ClaudeAdapter::new().spawn_spec(&req).expect("spec");
-        assert!(spec.args.is_empty(), "interactive spawn should not pass --print, got {:?}", spec.args);
+        assert!(
+            spec.args.is_empty(),
+            "interactive spawn should not pass --print, got {:?}",
+            spec.args
+        );
         assert_eq!(spec.cwd, PathBuf::from("/tmp/wt"));
         assert_eq!(spec.stdin_mode, StdinMode::Pty);
     }
@@ -334,12 +365,15 @@ mod tests {
         req.extra_args = vec![OsString::from("--allowedTools"), OsString::from("Read")];
         let spec = ClaudeAdapter::new().spawn_spec(&req).expect("spec");
         let s: Vec<&OsString> = spec.args.iter().collect();
-        assert_eq!(s, vec![
-            &OsString::from("--print"),
-            &OsString::from("q"),
-            &OsString::from("--allowedTools"),
-            &OsString::from("Read"),
-        ]);
+        assert_eq!(
+            s,
+            vec![
+                &OsString::from("--print"),
+                &OsString::from("q"),
+                &OsString::from("--allowedTools"),
+                &OsString::from("Read"),
+            ]
+        );
     }
 
     #[test]

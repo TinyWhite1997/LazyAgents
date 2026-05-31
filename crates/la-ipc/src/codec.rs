@@ -119,7 +119,9 @@ mod tests {
     fn round_trip_small() {
         let mut codec = FrameCodec::new();
         let mut buf = empty_buf();
-        codec.encode(Bytes::from_static(b"hello"), &mut buf).unwrap();
+        codec
+            .encode(Bytes::from_static(b"hello"), &mut buf)
+            .unwrap();
         let frame = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(&frame[..], b"hello");
         assert!(buf.is_empty(), "decoder should drain a complete frame");
@@ -130,7 +132,9 @@ mod tests {
         let mut codec = FrameCodec::new();
         let payload = vec![0xAAu8; MAX_MESSAGE_BYTES];
         let mut buf = empty_buf();
-        codec.encode(Bytes::from(payload.clone()), &mut buf).unwrap();
+        codec
+            .encode(Bytes::from(payload.clone()), &mut buf)
+            .unwrap();
         let frame = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(frame.len(), payload.len());
         assert_eq!(&frame[..], &payload[..]);

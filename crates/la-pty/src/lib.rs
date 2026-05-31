@@ -26,7 +26,12 @@ pub struct PtySize {
 
 impl Default for PtySize {
     fn default() -> Self {
-        Self { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }
+        Self {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
     }
 }
 
@@ -92,11 +97,16 @@ pub struct PtyWriter {
 
 impl PtyWriter {
     pub async fn write<B: Into<Bytes>>(&self, data: B) -> Result<(), PtyError> {
-        self.tx.send(data.into()).await.map_err(|_| PtyError::WriterClosed)
+        self.tx
+            .send(data.into())
+            .await
+            .map_err(|_| PtyError::WriterClosed)
     }
 
     pub fn try_write<B: Into<Bytes>>(&self, data: B) -> Result<(), PtyError> {
-        self.tx.try_send(data.into()).map_err(|_| PtyError::WriterClosed)
+        self.tx
+            .try_send(data.into())
+            .map_err(|_| PtyError::WriterClosed)
     }
 }
 

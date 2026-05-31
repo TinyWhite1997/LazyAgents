@@ -78,7 +78,11 @@ async fn cat_round_trip_write_then_read() {
     let mut child = spawn(cat_cmd(), PtySize::default()).expect("spawn");
 
     // Newline matters: PTY is in ICANON mode by default, line buffered.
-    child.writer.write(&b"ping-pong\n"[..]).await.expect("write");
+    child
+        .writer
+        .write(&b"ping-pong\n"[..])
+        .await
+        .expect("write");
 
     let saw = read_until(&mut child.reader, b"ping-pong").await;
     assert!(saw.is_some(), "expected echoed line back from cat");
@@ -93,10 +97,20 @@ async fn resize_does_not_error() {
     let child = spawn(cat_cmd(), PtySize::default()).expect("spawn");
 
     child
-        .resize(PtySize { rows: 50, cols: 132, pixel_width: 0, pixel_height: 0 })
+        .resize(PtySize {
+            rows: 50,
+            cols: 132,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("resize");
     child
-        .resize(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .resize(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("resize");
 
     let _ = child.signal(Signal::Kill);

@@ -83,7 +83,11 @@ pub struct PtyHints {
 
 impl Default for PtyHints {
     fn default() -> Self {
-        Self { cols: 120, rows: 32, raw_mode: false }
+        Self {
+            cols: 120,
+            rows: 32,
+            raw_mode: false,
+        }
     }
 }
 

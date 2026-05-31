@@ -21,8 +21,7 @@ pub(crate) fn send_signal(pid: u32, sig: Signal) -> Result<(), PtyError> {
     // Signal the whole pgrp so foreground children (shells spawning
     // subprocesses) also get the signal — matches what hitting Ctrl-C
     // on a real terminal would do.
-    killpg(Pid::from_raw(pid as i32), nix_sig)
-        .map_err(|e| PtyError::Signal(e.to_string()))
+    killpg(Pid::from_raw(pid as i32), nix_sig).map_err(|e| PtyError::Signal(e.to_string()))
 }
 
 #[cfg(windows)]
@@ -31,9 +30,7 @@ pub(crate) fn send_signal(pid: u32, sig: Signal) -> Result<(), PtyError> {
     use windows_sys::Win32::System::Console::{
         GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT, CTRL_C_EVENT,
     };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
     match sig {
         Signal::Interrupt => unsafe {
@@ -57,7 +54,7 @@ pub(crate) fn send_signal(pid: u32, sig: Signal) -> Result<(), PtyError> {
         },
         Signal::Kill => unsafe {
             let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if handle == 0 {
+            if handle.is_null() {
                 let err = std::io::Error::last_os_error();
                 return Err(PtyError::Signal(format!("OpenProcess: {}", err)));
             }

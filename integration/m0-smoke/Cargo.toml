@@ -1,0 +1,18 @@
+[package]
+name = "m0-smoke"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+la-proto = { path = "../../crates/la-proto" }
+la-ipc = { path = "../../crates/la-ipc" }
+la-adapter = { path = "../../crates/la-adapter" }
+la-pty = { path = "../../crates/la-pty" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tempfile = { workspace = true }

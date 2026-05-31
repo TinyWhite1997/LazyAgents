@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# WEK-5 范围决策：v1 阶段只在 Linux 验证；代码保持跨平台兼容（cfg
+# gates、portable-pty 等），但 CI 仅跑 ubuntu-latest。macOS / Windows
+# 进入 M4 发布前再上 matrix。
+jobs:
+  test:
+    name: cargo test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --lib --bins -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --all-targets

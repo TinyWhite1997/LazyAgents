@@ -5,6 +5,7 @@ members = [
     "crates/la-proto",
     "crates/la-ipc",
     "crates/la-adapter",
+    "integration/m0-smoke",
 ]
 
 [workspace.package]
