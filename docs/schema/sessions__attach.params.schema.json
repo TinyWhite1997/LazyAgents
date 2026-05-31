@@ -19,7 +19,7 @@
       "minimum": 0.0
     },
     "acquire_input": {
-      "description": "Request input ownership. Only one writer per session at a time (architecture §3 关键不变量).",
+      "description": "Request input ownership. Only one writer per session at a time (architecture §3 关键不变量: 单一写者).",
       "default": false,
       "type": "boolean"
     }

@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionStateParams",
+  "type": "object",
+  "required": [
+    "session_id",
+    "state"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/definitions/SessionState"
+    },
+    "exit_code": {
+      "description": "Process exit code when `state == Exited`; absent otherwise.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int32"
+    },
+    "reason": {
+      "description": "Free-form reason populated when `state == Errored` (adapter name + short description) so the UI can show something more useful than the raw state string. Other states leave this `None`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "SessionState": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "starting",
+            "running",
+            "waiting",
+            "exited",
+            "errored"
+          ]
+        },
+        {
+          "description": "Soft-deleted by the user via `sessions.archive`. The row stays in SQLite (and may be restored) but is hidden from the default list.",
+          "type": "string",
+          "enum": [
+            "archived"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsSignalParams",
+  "type": "object",
+  "required": [
+    "session_id",
+    "signal"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "signal": {
+      "$ref": "#/definitions/SessionSignal"
+    }
+  },
+  "definitions": {
+    "SessionSignal": {
+      "description": "Signal-name vocabulary supported on the wire. Mapped per architecture §6.3 to the platform primitive (`nix::sys::signal::kill` on Unix, `GenerateConsoleCtrlEvent` / `TerminateProcess` on Windows).\n\nKept as a tagged enum (not a free `String`) so the dispatcher can reject unknown signals at `serde` decode time, before the request reaches the signal-mapping code path. Adding a signal here is a wire-level compatibility decision and must be backed by an architecture update.",
+      "oneOf": [
+        {
+          "description": "Equivalent of Ctrl-C: Unix SIGINT / Windows CTRL_C_EVENT.",
+          "type": "string",
+          "enum": [
+            "INT"
+          ]
+        },
+        {
+          "description": "Polite termination: Unix SIGTERM / Windows CTRL_BREAK_EVENT.",
+          "type": "string",
+          "enum": [
+            "TERM"
+          ]
+        },
+        {
+          "description": "Hard kill: Unix SIGKILL / Windows TerminateProcess.",
+          "type": "string",
+          "enum": [
+            "KILL"
+          ]
+        }
+      ]
+    }
+  }
+}

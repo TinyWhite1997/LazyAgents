@@ -1,15 +1,35 @@
 //! Typed payloads for server-pushed notifications.
 //!
-//! M0.2 only ships `session.output`; later milestones add `session.state`,
-//! `cron.fired`, and `daemon.health` (architecture §3 核心方法集).
+//! M1.1 covers the full notification surface from architecture §3:
+//! - `session.output` — PTY increment (chunked at 64 KiB, see [`crate::chunking`])
+//! - `session.state`  — lifecycle transitions
+//! - `session.gap`    — backpressure drop notice (paired with `sessions.replay`)
+//! - `cron.fired`     — emitted post-M3 once the scheduler is wired up
+//! - `daemon.health`  — status-bar pulse
+//!
+//! The daemon may push some of these only after the client has subscribed
+//! via [`crate::methods::EventsSubscribe`] (cron.fired / daemon.health), but
+//! `session.output` / `session.state` / `session.gap` are implicitly active
+//! for any session the client has attached to.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// All notification methods defined by `la-proto` at M0.2.
-pub const NOTIFICATION_NAMES: &[&str] = &[SessionOutput::NAME];
+use crate::methods::SessionState;
+
+/// All notification methods defined by `la-proto`.
+///
+/// Order matches the structure of architecture §3 (per-session first, then
+/// daemon-global). Order is not meaningful at runtime.
+pub const NOTIFICATION_NAMES: &[&str] = &[
+    SessionOutput::NAME,
+    SessionStateNotice::NAME,
+    SessionGap::NAME,
+    CronFired::NAME,
+    DaemonHealth::NAME,
+];
 
 /// Trait mirroring [`crate::methods::Method`] but for one-way notifications
 /// (no `Result` type).
@@ -20,6 +40,8 @@ pub trait NotificationMethod {
     const NAME: &'static str;
     type Params: Serialize + for<'de> Deserialize<'de> + JsonSchema;
 }
+
+// ---------- session.output ----------
 
 /// PTY output increment for an attached session.
 ///
@@ -64,4 +86,119 @@ impl SessionOutputParams {
 impl NotificationMethod for SessionOutput {
     const NAME: &'static str = "session.output";
     type Params = SessionOutputParams;
+}
+
+// ---------- session.state ----------
+
+/// Lifecycle transition for a session (architecture §3:
+/// `starting/running/waiting/exited/errored`).
+///
+/// The type alias `SessionState` is reused from [`crate::methods`] so both
+/// surfaces speak exactly one vocabulary.
+///
+/// Named `SessionStateNotice` (not `SessionState`) on the Rust side to avoid
+/// the shared `SessionState` enum collision; on the wire it stays
+/// `"session.state"`.
+pub enum SessionStateNotice {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionStateParams")]
+pub struct SessionStateParams {
+    pub session_id: String,
+    pub state: SessionState,
+    /// Process exit code when `state == Exited`; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Free-form reason populated when `state == Errored` (adapter name +
+    /// short description) so the UI can show something more useful than the
+    /// raw state string. Other states leave this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl NotificationMethod for SessionStateNotice {
+    const NAME: &'static str = "session.state";
+    type Params = SessionStateParams;
+}
+
+// ---------- session.gap ----------
+
+/// Notice that the daemon evicted bytes `[from_seq, to_seq]` from a
+/// session's ring buffer before the client could consume them
+/// (architecture §3 关键不变量: 背压).
+///
+/// The client should respond by calling [`crate::methods::SessionsReplay`]
+/// with `from_seq` if it wants to recover what's still in the buffer; bytes
+/// already evicted are gone.
+pub enum SessionGap {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionGapParams")]
+pub struct SessionGapParams {
+    pub session_id: String,
+    /// Inclusive lower bound of the missing range.
+    pub from_seq: u64,
+    /// Inclusive upper bound of the missing range. Equal to `from_seq` when
+    /// exactly one chunk was dropped.
+    pub to_seq: u64,
+    /// Bytes evicted so the client can show a "missed N bytes" hint without
+    /// having to round-trip a replay request first.
+    pub dropped_bytes: u64,
+}
+
+impl NotificationMethod for SessionGap {
+    const NAME: &'static str = "session.gap";
+    type Params = SessionGapParams;
+}
+
+// ---------- cron.fired ----------
+
+/// Cron trigger event for the status bar / run list (architecture §3, §5.5).
+/// Sent to clients that subscribed to `EventTopic::CronFired` via
+/// [`crate::methods::EventsSubscribe`].
+///
+/// Defined now so the protocol is stable when M3 wires up the scheduler;
+/// daemons that don't yet implement cron simply never push this.
+pub enum CronFired {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronFiredParams")]
+pub struct CronFiredParams {
+    pub cron_id: String,
+    pub run_id: String,
+    /// RFC3339 timestamp of the firing.
+    pub fired_at: String,
+    /// Status of the run at the moment this notification is emitted (most
+    /// commonly `"spawning"` or `"running"`). Use the full `runs.list` for
+    /// terminal status — this is the kick-off pulse.
+    pub status: String,
+}
+
+impl NotificationMethod for CronFired {
+    const NAME: &'static str = "cron.fired";
+    type Params = CronFiredParams;
+}
+
+// ---------- daemon.health ----------
+
+/// Periodic health pulse used by the TUI status bar (architecture §3, §9.3).
+/// Pushed roughly every 5 s by the daemon to any client subscribed via
+/// `EventTopic::DaemonHealth`.
+pub enum DaemonHealth {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "DaemonHealthParams")]
+pub struct DaemonHealthParams {
+    /// Total number of in-flight + queued cron runs.
+    pub queue_depth: u32,
+    /// Number of currently running sessions.
+    pub running: u32,
+    /// Errors observed in the last 5 minutes (any kind, used for the
+    /// status-bar dot colour).
+    pub errors_last_5m: u32,
+}
+
+impl NotificationMethod for DaemonHealth {
+    const NAME: &'static str = "daemon.health";
+    type Params = DaemonHealthParams;
 }

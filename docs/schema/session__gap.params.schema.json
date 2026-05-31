@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionGapParams",
+  "type": "object",
+  "required": [
+    "dropped_bytes",
+    "from_seq",
+    "session_id",
+    "to_seq"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "from_seq": {
+      "description": "Inclusive lower bound of the missing range.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "to_seq": {
+      "description": "Inclusive upper bound of the missing range. Equal to `from_seq` when exactly one chunk was dropped.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "dropped_bytes": {
+      "description": "Bytes evicted so the client can show a \"missed N bytes\" hint without having to round-trip a replay request first.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  }
+}

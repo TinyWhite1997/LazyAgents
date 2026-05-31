@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsImportResult",
+  "type": "object",
+  "required": [
+    "imported"
+  ],
+  "properties": {
+    "imported": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ImportedSession"
+      }
+    }
+  },
+  "definitions": {
+    "ImportedSession": {
+      "description": "A read-only reference to a backend-native session discovered on disk. The daemon assigns a fresh `session_id` so the rest of the system can reference it uniformly; `external_id` preserves the backend's own id.",
+      "type": "object",
+      "required": [
+        "backend",
+        "created_at",
+        "external_id",
+        "session_id"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "external_id": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "project_hint": {
+          "description": "Project root hint reported by the backend (if any). Used to auto-place the session under an existing `projects` row.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp as recorded by the backend.",
+          "type": "string"
+        },
+        "title_hint": {
+          "description": "Backend-provided title or first-line preview (if any).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}
