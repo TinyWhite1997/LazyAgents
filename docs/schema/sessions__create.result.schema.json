@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsCreateResult",
+  "type": "object",
+  "required": [
+    "backend",
+    "cwd",
+    "initial_size",
+    "session_id",
+    "state"
+  ],
+  "properties": {
+    "session_id": {
+      "description": "Newly assigned session id (UUID v7).",
+      "type": "string"
+    },
+    "backend": {
+      "description": "Backend echoed back so a multi-backend client doesn't need to remember.",
+      "type": "string"
+    },
+    "cwd": {
+      "description": "Resolved working directory of the child process.",
+      "type": "string"
+    },
+    "initial_size": {
+      "description": "Initial PTY size the child was spawned with.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/PtySize"
+        }
+      ]
+    },
+    "state": {
+      "description": "State the session is in when this response is returned.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SessionState"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "PtySize": {
+      "type": "object",
+      "required": [
+        "cols",
+        "rows"
+      ],
+      "properties": {
+        "rows": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "cols": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SessionState": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "waiting",
+        "exited",
+        "errored"
+      ]
+    }
+  }
+}

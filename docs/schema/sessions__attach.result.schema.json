@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsAttachResult",
+  "type": "object",
+  "required": [
+    "input_acquired",
+    "session_id",
+    "snapshot_seq"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "snapshot_seq": {
+      "description": "Last `seq` covered by the catch-up replay; the first strictly-greater `session.output` is live.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "input_acquired": {
+      "description": "Whether this client acquired input ownership (might differ from `acquire_input` if another client is already the writer).",
+      "type": "boolean"
+    }
+  }
+}

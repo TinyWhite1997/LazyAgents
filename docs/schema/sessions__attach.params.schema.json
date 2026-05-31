@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsAttachParams",
+  "type": "object",
+  "required": [
+    "session_id"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "replay_bytes": {
+      "description": "Replay window: the daemon should resend at most this many bytes from its ring buffer before live streaming. `None` ⇒ daemon default.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "acquire_input": {
+      "description": "Request input ownership. Only one writer per session at a time (architecture §3 关键不变量).",
+      "default": false,
+      "type": "boolean"
+    }
+  }
+}

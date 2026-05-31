@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionOutputParams",
+  "type": "object",
+  "required": [
+    "data_base64",
+    "seq",
+    "session_id"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "seq": {
+      "description": "Monotonically increasing sequence number, per session. Clients use gaps to detect dropped frames (architecture §3 关键不变量: 背压).",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "data_base64": {
+      "description": "Base64-encoded PTY bytes (≤ 64 KiB per notification).",
+      "type": "string"
+    }
+  }
+}

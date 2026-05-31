@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsWriteParams",
+  "type": "object",
+  "required": [
+    "data_base64",
+    "session_id"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "data_base64": {
+      "description": "Base64-encoded bytes to write to the PTY master.",
+      "type": "string"
+    }
+  }
+}
