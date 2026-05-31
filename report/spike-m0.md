@@ -18,7 +18,7 @@
 | [WEK-11 / M0.1](mention://issue/744aa95a-1d8e-4bc6-924c-f0c348ee2f09) | `cargo test -p la-pty` (5 smoke) | ✅ 本地 Linux 5/5 绿 |
 | [WEK-12 / M0.2](mention://issue/96138202-5ce8-48b5-a350-03ab6125c5d0) | `cargo test -p la-proto -p la-ipc`（≥30 单元 + round-trip） | ✅ 本地 Linux 全绿 |
 | [WEK-13 / M0.3](mention://issue/9de6530d-0224-41c6-9d27-33eae60975c6) | `cargo test -p la-adapter` + `LA_RUN_CLAUDE_E2E` 真实 CLI 实测 | ✅ probe/spawn_spec/encode/stop 通过 |
-| [WEK-14 / M0.4](mention://issue/3c5705eb-dd8b-420b-ad84-d43cc82dd7c9) | `cargo test -p m0-smoke`：real la-pty + real la-proto + real la-ipc + real la-adapter + mock echo 后端 → write 后看到回声、drop client 后 PTY 仍 alive | ✅ Linux/macOS/Windows hosted matrix 通过 |
+| [WEK-14 / M0.4](mention://issue/3c5705eb-dd8b-420b-ad84-d43cc82dd7c9) | `cargo test -p m0-smoke`：real la-pty + real la-proto + real la-ipc + real la-adapter + mock echo 后端 → write 后看到回声、drop client 后 PTY 仍 alive | ✅ Linux 通过（v1 范围内仅 Linux 实测） |
 
 集成测试位于 `integration/m0-smoke/tests/m0_smoke.rs`，使用 `tokio::io::duplex` 作为 daemon ↔ client 的本地 transport，通过 `la-ipc` 的真实 length-prefix framing 编解码 `la-proto` JSON-RPC 消息，PTY 字节通过 `session.output` 推回客户端，最后通过 `drop(conn)` 模拟 client 退出并断言 daemon 端 `PtyChild.pid()` 仍存在。
 
@@ -30,17 +30,17 @@
 | daemon ↔ client 协议选型？ | 已 ADR-001 决策 | JSON-RPC 2.0 over length-prefix framing；m0-smoke 已用真实通路跑通。 |
 | 既有会话发现/导入策略？ | 推迟到 M2 | M0 不涉及。 |
 
-## 跨平台兼容现状（三端 hosted CI 实测）
+## 跨平台兼容现状（仅 Linux 实测，Windows/macOS 设计兼容）
 
-| 议题 | Linux 证据 | Windows ConPTY 证据 / 风险 | macOS pty 证据 |
+| 议题 | Linux 证据 | Windows ConPTY 设计期望 | macOS pty 设计期望 |
 | --- | --- | --- | --- |
-| Spawn / read / write | la-pty smoke + m0-smoke echo 回环 | hosted Windows matrix 通过；ConPTY 字节流可能注入额外 ANSI/console 控制序列，渲染层必须容忍 | hosted macOS matrix 通过 |
-| Resize | `MasterPty::resize` 成功 | `ResizePseudoConsole` 在 hosted Windows 通过；Windows 不发 `SIGWINCH` | hosted macOS matrix 通过 |
-| Signal | `killpg(SIGINT/SIGTERM/SIGKILL)` 验过 | `TerminateProcess` hard-kill 通过；hosted runner 上 `GenerateConsoleCtrlEvent` 可返回成功但不终止 `ping`，因此 shutdown 必须 timeout 后 hard-kill | hosted macOS matrix 通过 |
-| EOF | drop slave 后 reader 见 EOF | hosted runner 上短命 `cmd /C echo` 输出可见但 reader EOF 不保证及时；daemon 不应只依赖 EOF 判断 liveness | hosted macOS matrix 通过 |
-| Detach 语义 | m0-smoke `drop(conn)` 后 `pid()` 仍存在 | hosted Windows matrix 通过（daemon 持 PTY，client 是订阅者） | hosted macOS matrix 通过 |
+| Spawn / read / write | la-pty smoke + m0-smoke echo 回环 | ConPTY master read/write 已写好，未实测 | 与 Linux 同分支 |
+| Resize | `MasterPty::resize` 成功 | `ResizePseudoConsole`；Windows 不发 `SIGWINCH` | 同 Linux |
+| Signal | `killpg(SIGINT/SIGTERM/SIGKILL)` 验过 | `GenerateConsoleCtrlEvent` + `TerminateProcess` 已编译 | 同 Linux |
+| EOF | drop slave 后 reader 见 EOF | 依赖 ConPTY 关闭 + 进程退出 | 同 Linux |
+| Detach 语义 | m0-smoke `drop(conn)` 后 `pid()` 仍存在 | 与 Linux 相同（daemon 持 PTY，client 是订阅者） | 与 Linux 相同 |
 
-当前 GitHub Actions workflow 对 `ubuntu-latest / macos-latest / windows-latest` 运行 `cargo test --workspace --all-targets`；lint（fmt + clippy）仍在 Linux job 单独执行。
+WEK-5 范围决策（用户）：v1 阶段只在 Linux 验证；ConPTY 路径靠 cfg gate 编译保留、真实测试推迟到 M4。测试代码中保留的 `cfg!(windows)` 分支属于 defensive future-proofing，但 hosted 三端 matrix 已被还原（曾在 PR #7 误开）。
 
 ## 已验证 / 推翻的假设
 
@@ -56,7 +56,7 @@
 
 1. **背压**：m0-smoke 用测试级 fan-out 简化驱动；M1 必须按架构 §3 实现 1 MiB 订阅缓冲 + `session.gap` 通知 + `sessions.replay`。
 2. **多 client**：M0 只有单 client；M1 需要在 `Connection::split()` 之上挂事件总线 + 写权抢占。
-3. **ConPTY ANSI 注入**：三端 smoke 已验证可读写，但渲染层仍必须用 `vte` parser 容忍光标查询 / OSC。
+3. **ConPTY ANSI 注入**：未实测；M1 客户端渲染必须用 `vte` parser 容忍光标查询 / OSC。
 4. **PtyChild::reader 所有权拆分**：当前 m0-smoke 用 `std::mem::replace` 把 reader 换走是一个 hack；建议 M1 在 la-pty 暴露官方 `into_parts()` 把 PTY 拆成 `(handle, reader, writer)` 三元组。
 
 ## 后续
