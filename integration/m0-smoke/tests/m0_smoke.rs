@@ -4,9 +4,9 @@
 //! The harness wires a tokio `duplex` as the daemon↔client connection and
 //! runs a minimal in-process dispatcher (mock daemon) that delegates spawn
 //! decisions to the adapter and streams real PTY output back to the client.
-//! The backend is a `CatAdapter` driving POSIX `cat`, so we can write
-//! arbitrary bytes and assert the same bytes echo back through the JSON-RPC
-//! pipe — no real CLI auth, no network.
+//! The backend is a `CatAdapter` driving a local echo-capable shell command,
+//! so we can write arbitrary bytes and assert the same bytes echo back through
+//! the JSON-RPC pipe — no real CLI auth, no network.
 //!
 //! Asserts the four M0 invariants:
 //!   1. JSON-RPC framing round-trips `initialize` / `sessions.create` /
@@ -44,7 +44,8 @@ use tokio::time::timeout;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// M0 mock backend: drives POSIX `cat` so a write echoes back on the PTY.
+/// M0 mock backend: drives a local echo-capable command so a write comes back
+/// through the PTY on every supported OS.
 struct CatAdapter;
 
 #[async_trait::async_trait]
@@ -53,21 +54,34 @@ impl AgentAdapter for CatAdapter {
         AdapterDescriptor {
             id: "cat-mock",
             display_name: "cat (M0 smoke mock)",
-            default_program: "cat",
+            default_program: if cfg!(windows) { "cmd.exe" } else { "cat" },
             docs_url: "https://example.invalid/cat",
         }
     }
 
     async fn probe(&self) -> ProbeResult {
         ProbeResult::Available {
-            version: "posix-1".into(),
+            version: if cfg!(windows) {
+                "cmd-echo".into()
+            } else {
+                "posix-cat".into()
+            },
         }
     }
 
     fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, la_adapter::AdapterError> {
+        let (program, args) = if cfg!(windows) {
+            (
+                PathBuf::from("cmd.exe"),
+                vec!["/Q".into(), "/K".into(), "echo cat-mock ready".into()],
+            )
+        } else {
+            (PathBuf::from("cat"), vec![])
+        };
+
         Ok(SpawnSpec {
-            program: PathBuf::from("cat"),
-            args: vec![],
+            program,
+            args,
             env: req.env.clone(),
             cwd: req.cwd.clone(),
             pty: req.pty,
@@ -76,6 +90,10 @@ impl AgentAdapter for CatAdapter {
     }
 
     fn encode_user_input(&self, text: &str) -> Bytes {
+        if cfg!(windows) {
+            return Bytes::from(format!("echo {text}\r\n"));
+        }
+
         // cat is line-buffered; ensure a trailing newline so the line echoes.
         let mut s = text.to_owned();
         if !s.ends_with('\n') {
@@ -190,7 +208,12 @@ async fn m0_end_to_end_initialize_create_attach_write_detach() {
     if let Some((_, pty)) = state.session.lock().await.take() {
         // Closing all PtyWriter clones in the daemon by dropping `pty.writer`
         // causes the write-fan-in thread to exit; cat sees EOF and quits.
-        let _ = pty.signal(la_pty::Signal::Terminate);
+        let signal = if cfg!(windows) {
+            la_pty::Signal::Kill
+        } else {
+            la_pty::Signal::Terminate
+        };
+        let _ = pty.signal(signal);
         let _ = timeout(Duration::from_secs(3), pty.wait()).await;
     }
     daemon.abort();
