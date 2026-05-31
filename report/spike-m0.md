@@ -33,8 +33,8 @@ Current implemented evidence comes from `la-pty` unit tests plus the M0 smoke te
 | --- | --- | --- |
 | Spawn/read/write | `la-pty` tests spawn `echo`/`cat`; M0 smoke spawns the mock `claude` shell loop | ConPTY should expose the same master read/write contract, but may emit extra console control sequences. Consumers must parse with a tolerant terminal parser. |
 | Resize | `la-pty` calls `MasterPty::resize` and asserts no error | ConPTY resize maps to `ResizePseudoConsole`; Windows apps do not receive `SIGWINCH`, so adapters must not rely on POSIX signal semantics. |
-| Signals | `Signal::Interrupt`, `Terminate`, and `Kill` are mapped per platform | Windows uses `GenerateConsoleCtrlEvent` for Ctrl-C/Break and `TerminateProcess` for hard kill. Child process-group isolation is required to avoid signaling the daemon. |
-| EOF | `la-pty` drops the slave handle after spawn so reader EOF is observable | ConPTY EOF depends on pseudoconsole closure plus process exit; tests must stay in CI to catch regressions. |
+| Signals | `Signal::Interrupt`, `Terminate`, and `Kill` are mapped per platform | Windows uses `GenerateConsoleCtrlEvent` for Ctrl-C/Break and `TerminateProcess` for hard kill. Hosted CI showed Ctrl-C delivery can succeed at the API layer without terminating a `ping` process behind ConPTY; shutdown paths need timeout + hard-kill fallback. |
+| EOF | `la-pty` drops the slave handle after spawn so reader EOF is observable on Unix | GitHub-hosted Windows showed ConPTY reader EOF is not prompt for a short-lived `cmd /C echo` child, even after output is visible. The daemon must not depend on EOF as the only liveness signal. |
 | Detach semantics | M0 smoke detaches the client, then writes an internal probe to the same PTY and receives a reply | This validates daemon ownership: client detach must remove only the subscription/input lease, not terminate the child. |
 
 Known risk: `portable-pty` normalizes the API but not all terminal byte streams. Windows ConPTY can inject cursor queries, mode changes, and OSC/control bytes; renderer and replay layers must be byte-preserving and tolerant.
