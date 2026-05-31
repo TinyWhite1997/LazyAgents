@@ -209,12 +209,11 @@ async fn read_until(
 
 fn mock_claude_command() -> CommandBuilder {
     if cfg!(windows) {
-        let mut cmd = CommandBuilder::new("powershell.exe");
+        let mut cmd = CommandBuilder::new("cmd.exe");
         cmd.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-Command",
-            "Write-Output 'mock-claude ready'; while (($line = [Console]::In.ReadLine()) -ne $null) { Write-Output ('mock-claude reply: ' + $line) }",
+            "/V:ON",
+            "/C",
+            "echo mock-claude ready & set /p line= & echo mock-claude reply: !line! & set /p line= & echo mock-claude reply: !line! & ping -n 30 127.0.0.1 > nul",
         ]);
         cmd
     } else {
