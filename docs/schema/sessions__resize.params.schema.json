@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsResizeParams",
+  "type": "object",
+  "required": [
+    "cols",
+    "rows",
+    "session_id"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "cols": {
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0.0
+    },
+    "rows": {
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0.0
+    }
+  }
+}

@@ -322,6 +322,7 @@ async fn dispatch(
                         adapters: vec!["cat-mock".into()],
                         cron: false,
                         worktree: false,
+                        events: false,
                     },
                 },
             )

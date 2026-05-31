@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsImportParams",
+  "type": "object",
+  "required": [
+    "backend"
+  ],
+  "properties": {
+    "backend": {
+      "type": "string"
+    },
+    "source_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

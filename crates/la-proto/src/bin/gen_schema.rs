@@ -1,18 +1,28 @@
-//! Exports the JSON Schemas for all M0.2 method params/results and
-//! notifications into `docs/schema/`.
+//! Exports the JSON Schemas for the full M1 method/notification surface
+//! into `docs/schema/`.
 //!
 //! Run with: `cargo run -p la-proto --bin la-proto-gen-schema -- <out-dir>`.
 //!
 //! If `<out-dir>` is omitted, defaults to `docs/schema` relative to the
 //! current working directory. We deliberately fail loudly on IO errors so
 //! the CI step that calls this catches missing-directory drift early.
+//!
+//! The same set of files is also asserted byte-for-byte by the `schema_*`
+//! golden tests in `tests/round_trip.rs`, so editing a typed struct without
+//! re-running this binary turns CI red.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use la_proto::methods::{Initialize, Method, SessionsAttach, SessionsCreate, SessionsWrite};
-use la_proto::notifications::{NotificationMethod, SessionOutput};
+use la_proto::methods::{
+    EventsSubscribe, Initialize, Method, SessionsArchive, SessionsAttach, SessionsCreate,
+    SessionsDelete, SessionsDetach, SessionsImport, SessionsList, SessionsReplay, SessionsResize,
+    SessionsSignal, SessionsWrite, Shutdown,
+};
+use la_proto::notifications::{
+    CronFired, DaemonHealth, NotificationMethod, SessionGap, SessionOutput, SessionStateNotice,
+};
 use schemars::schema::RootSchema;
 use schemars::schema_for;
 
@@ -25,12 +35,26 @@ fn main() {
 
     // Methods: emit `<method>.params.schema.json` and `<method>.result.schema.json`.
     write_method::<Initialize>(&out_dir);
+    write_method::<Shutdown>(&out_dir);
+    write_method::<SessionsList>(&out_dir);
     write_method::<SessionsCreate>(&out_dir);
     write_method::<SessionsAttach>(&out_dir);
+    write_method::<SessionsDetach>(&out_dir);
     write_method::<SessionsWrite>(&out_dir);
+    write_method::<SessionsResize>(&out_dir);
+    write_method::<SessionsSignal>(&out_dir);
+    write_method::<SessionsArchive>(&out_dir);
+    write_method::<SessionsDelete>(&out_dir);
+    write_method::<SessionsImport>(&out_dir);
+    write_method::<SessionsReplay>(&out_dir);
+    write_method::<EventsSubscribe>(&out_dir);
 
     // Notifications: only params have a schema.
     write_notification::<SessionOutput>(&out_dir);
+    write_notification::<SessionStateNotice>(&out_dir);
+    write_notification::<SessionGap>(&out_dir);
+    write_notification::<CronFired>(&out_dir);
+    write_notification::<DaemonHealth>(&out_dir);
 
     println!("wrote schemas to {}", out_dir.display());
 }

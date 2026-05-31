@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsListResult",
+  "type": "object",
+  "required": [
+    "sessions"
+  ],
+  "properties": {
+    "sessions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SessionSummary"
+      }
+    }
+  },
+  "definitions": {
+    "SessionSummary": {
+      "description": "Compact session row returned by `sessions.list`. Larger / costlier fields (transcript path, spawn args) live on the create/attach results instead and are only returned when the client actually wants them.",
+      "type": "object",
+      "required": [
+        "backend",
+        "created_at",
+        "origin",
+        "project_id",
+        "session_id",
+        "state",
+        "updated_at"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "description": "Owning project id (UUID v7).",
+          "type": "string"
+        },
+        "backend": {
+          "description": "Backend name; matches one of [`ServerCapabilities::adapters`].",
+          "type": "string"
+        },
+        "title": {
+          "description": "User-editable title; `None` until the user names the session.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/SessionState"
+        },
+        "origin": {
+          "description": "`'user'` for a human-started session, `'cron:<cron_id>'` for a scheduled run, `'import'` for one discovered on disk.",
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC3339 timestamp the session row was created.",
+          "type": "string"
+        },
+        "updated_at": {
+          "description": "RFC3339 timestamp of the last state change (output, write, exit, …).",
+          "type": "string"
+        },
+        "worktree_path": {
+          "description": "Worktree path if any; `None` for sessions sharing the project root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SessionState": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "starting",
+            "running",
+            "waiting",
+            "exited",
+            "errored"
+          ]
+        },
+        {
+          "description": "Soft-deleted by the user via `sessions.archive`. The row stays in SQLite (and may be restored) but is hidden from the default list.",
+          "type": "string",
+          "enum": [
+            "archived"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -51,6 +51,11 @@
           "description": "True once worktree-based isolation is enabled (post-M1).",
           "default": false,
           "type": "boolean"
+        },
+        "events": {
+          "description": "True once `events.subscribe` is honoured by the daemon (M1+).",
+          "default": false,
+          "type": "boolean"
         }
       }
     }

@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DaemonHealthParams",
+  "type": "object",
+  "required": [
+    "errors_last_5m",
+    "queue_depth",
+    "running"
+  ],
+  "properties": {
+    "queue_depth": {
+      "description": "Total number of in-flight + queued cron runs.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "running": {
+      "description": "Number of currently running sessions.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "errors_last_5m": {
+      "description": "Errors observed in the last 5 minutes (any kind, used for the status-bar dot colour).",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  }
+}

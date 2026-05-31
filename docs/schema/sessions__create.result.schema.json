@@ -60,13 +60,24 @@
       }
     },
     "SessionState": {
-      "type": "string",
-      "enum": [
-        "starting",
-        "running",
-        "waiting",
-        "exited",
-        "errored"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "starting",
+            "running",
+            "waiting",
+            "exited",
+            "errored"
+          ]
+        },
+        {
+          "description": "Soft-deleted by the user via `sessions.archive`. The row stays in SQLite (and may be restored) but is hidden from the default list.",
+          "type": "string",
+          "enum": [
+            "archived"
+          ]
+        }
       ]
     }
   }

@@ -1,28 +1,50 @@
-//! Typed parameters and results for the M0.2 minimum method set.
+//! Typed parameters and results for the daemon ↔ client RPC surface.
 //!
-//! Per the issue (WEK-12), M0.2 must implement five wire methods:
-//! `initialize`, `sessions.create`, `sessions.attach`, `sessions.write`, and
-//! the server notification `session.output`. Other methods listed in
-//! architecture §3 are out of scope until later milestones; only the five
-//! shipped here are guaranteed by [`METHOD_NAMES`].
+//! M1.1 extends the earlier M0.2 minimum set (`initialize`, `sessions.create`,
+//! `sessions.attach`, `sessions.write`, plus the `session.output`
+//! notification) to cover the full `sessions.*` / `events.subscribe` table
+//! in architecture §3. Cron and run history (`crons.*`, `runs.*`) are
+//! still out of scope until M3 and are NOT defined here.
 //!
-//! Each method type implements [`Method`], which centralizes the method name
-//! string so dispatch / schema export stays in lock-step with the type.
+//! Each method type implements [`Method`], which centralizes the method-name
+//! string so the dispatcher and the schema-export binary stay in lock-step
+//! with the type. [`METHOD_NAMES`] enumerates every wire method this crate
+//! knows about (in handshake-friendly order).
+//!
+//! ### Backwards compatibility rule
+//!
+//! New fields added across the M1 minor are non-breaking ONLY because every
+//! optional field on every params struct carries `#[serde(default)]`. Adding
+//! a required field is a wire break and requires bumping
+//! [`crate::PROTOCOL_VERSION`]. Tests in `tests/round_trip.rs` deserialize
+//! older-shaped payloads to catch accidental breaks.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// All RPC methods defined by `la-proto` at M0.2 (in the order they are
-/// expected to be called by a fresh client).
+/// All RPC methods defined by `la-proto`, in the order a fresh client is
+/// expected to call them.
 ///
-/// Used by the dispatcher and by `gen_schema` to enumerate types.
+/// Used by the dispatcher and by `gen_schema` to enumerate types. Order
+/// matters for documentation only — at runtime any method may arrive first
+/// after `initialize`.
 pub const METHOD_NAMES: &[&str] = &[
     Initialize::NAME,
+    Shutdown::NAME,
+    SessionsList::NAME,
     SessionsCreate::NAME,
     SessionsAttach::NAME,
+    SessionsDetach::NAME,
     SessionsWrite::NAME,
+    SessionsResize::NAME,
+    SessionsSignal::NAME,
+    SessionsArchive::NAME,
+    SessionsDelete::NAME,
+    SessionsImport::NAME,
+    SessionsReplay::NAME,
+    EventsSubscribe::NAME,
 ];
 
 /// Trait carried by every RPC method type for static method-name lookup.
@@ -82,12 +104,97 @@ pub struct ServerCapabilities {
     /// True once worktree-based isolation is enabled (post-M1).
     #[serde(default)]
     pub worktree: bool,
+    /// True once `events.subscribe` is honoured by the daemon (M1+).
+    #[serde(default)]
+    pub events: bool,
 }
 
 impl Method for Initialize {
     const NAME: &'static str = "initialize";
     type Params = InitializeParams;
     type Result = InitializeResult;
+}
+
+// ---------- shutdown ----------
+
+/// Polite disconnect: the daemon flushes pending work for this connection
+/// and closes it. The daemon process keeps running and serving other
+/// clients (architecture §3: "礼貌断开（daemon 不退出）").
+pub enum Shutdown {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "ShutdownParams")]
+pub struct ShutdownParams {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "ShutdownResult")]
+pub struct ShutdownResult {}
+
+impl Method for Shutdown {
+    const NAME: &'static str = "shutdown";
+    type Params = ShutdownParams;
+    type Result = ShutdownResult;
+}
+
+// ---------- sessions.list ----------
+
+/// Enumerate known sessions, optionally filtered by project / backend /
+/// archive state. Returns lightweight summaries; full detail comes from
+/// `sessions.attach` (which is when the daemon actually subscribes the
+/// client to the output stream).
+pub enum SessionsList {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsListParams")]
+pub struct SessionsListParams {
+    /// Restrict to a single project id (UUID v7). `None` ⇒ all projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Restrict to a single backend name (e.g. `"claude"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Include archived sessions in the result. Default `false` mirrors the
+    /// TUI's primary view, which hides archives behind a toggle.
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsListResult")]
+pub struct SessionsListResult {
+    pub sessions: Vec<SessionSummary>,
+}
+
+/// Compact session row returned by `sessions.list`. Larger / costlier fields
+/// (transcript path, spawn args) live on the create/attach results instead
+/// and are only returned when the client actually wants them.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub session_id: String,
+    /// Owning project id (UUID v7).
+    pub project_id: String,
+    /// Backend name; matches one of [`ServerCapabilities::adapters`].
+    pub backend: String,
+    /// User-editable title; `None` until the user names the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub state: SessionState,
+    /// `'user'` for a human-started session, `'cron:<cron_id>'` for a
+    /// scheduled run, `'import'` for one discovered on disk.
+    pub origin: String,
+    /// RFC3339 timestamp the session row was created.
+    pub created_at: String,
+    /// RFC3339 timestamp of the last state change (output, write, exit, …).
+    pub updated_at: String,
+    /// Worktree path if any; `None` for sessions sharing the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+}
+
+impl Method for SessionsList {
+    const NAME: &'static str = "sessions.list";
+    type Params = SessionsListParams;
+    type Result = SessionsListResult;
 }
 
 // ---------- sessions.create ----------
@@ -146,6 +253,9 @@ pub enum SessionState {
     Waiting,
     Exited,
     Errored,
+    /// Soft-deleted by the user via `sessions.archive`. The row stays in
+    /// SQLite (and may be restored) but is hidden from the default list.
+    Archived,
 }
 
 impl Method for SessionsCreate {
@@ -170,7 +280,7 @@ pub struct SessionsAttachParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_bytes: Option<u64>,
     /// Request input ownership. Only one writer per session at a time
-    /// (architecture §3 关键不变量).
+    /// (architecture §3 关键不变量: 单一写者).
     #[serde(default)]
     pub acquire_input: bool,
 }
@@ -191,6 +301,30 @@ impl Method for SessionsAttach {
     const NAME: &'static str = "sessions.attach";
     type Params = SessionsAttachParams;
     type Result = SessionsAttachResult;
+}
+
+// ---------- sessions.detach ----------
+
+/// Cancel a single connection's subscription. The session itself keeps
+/// running (architecture §3: "不影响会话存活"). The daemon also auto-detaches
+/// on connection close, so calling this is optional but lets a client free
+/// its server-side ring-buffer slot eagerly.
+pub enum SessionsDetach {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsDetachParams")]
+pub struct SessionsDetachParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsDetachResult")]
+pub struct SessionsDetachResult {}
+
+impl Method for SessionsDetach {
+    const NAME: &'static str = "sessions.detach";
+    type Params = SessionsDetachParams;
+    type Result = SessionsDetachResult;
 }
 
 // ---------- sessions.write ----------
@@ -270,4 +404,249 @@ impl Method for SessionsWrite {
     const NAME: &'static str = "sessions.write";
     type Params = SessionsWriteParams;
     type Result = SessionsWriteResult;
+}
+
+// ---------- sessions.resize ----------
+
+/// Adjust the PTY window size for the session (cols/rows). `portable-pty`
+/// applies this consistently on ConPTY and Unix; the daemon also pushes a
+/// `WINCH` so curses-based UIs in the child redraw.
+pub enum SessionsResize {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsResizeParams")]
+pub struct SessionsResizeParams {
+    pub session_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsResizeResult")]
+pub struct SessionsResizeResult {}
+
+impl Method for SessionsResize {
+    const NAME: &'static str = "sessions.resize";
+    type Params = SessionsResizeParams;
+    type Result = SessionsResizeResult;
+}
+
+// ---------- sessions.signal ----------
+
+/// Signal-name vocabulary supported on the wire. Mapped per architecture
+/// §6.3 to the platform primitive (`nix::sys::signal::kill` on Unix,
+/// `GenerateConsoleCtrlEvent` / `TerminateProcess` on Windows).
+///
+/// Kept as a tagged enum (not a free `String`) so the dispatcher can reject
+/// unknown signals at `serde` decode time, before the request reaches the
+/// signal-mapping code path. Adding a signal here is a wire-level
+/// compatibility decision and must be backed by an architecture update.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SessionSignal {
+    /// Equivalent of Ctrl-C: Unix SIGINT / Windows CTRL_C_EVENT.
+    Int,
+    /// Polite termination: Unix SIGTERM / Windows CTRL_BREAK_EVENT.
+    Term,
+    /// Hard kill: Unix SIGKILL / Windows TerminateProcess.
+    Kill,
+}
+
+pub enum SessionsSignal {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsSignalParams")]
+pub struct SessionsSignalParams {
+    pub session_id: String,
+    pub signal: SessionSignal,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsSignalResult")]
+pub struct SessionsSignalResult {}
+
+impl Method for SessionsSignal {
+    const NAME: &'static str = "sessions.signal";
+    type Params = SessionsSignalParams;
+    type Result = SessionsSignalResult;
+}
+
+// ---------- sessions.archive / sessions.delete ----------
+
+/// Soft-delete: hide from the default `sessions.list` view and mark
+/// `state=archived`. The row, worktree, and transcript stay on disk until
+/// the prune window expires (architecture §8.4).
+pub enum SessionsArchive {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsArchiveParams")]
+pub struct SessionsArchiveParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsArchiveResult")]
+pub struct SessionsArchiveResult {}
+
+impl Method for SessionsArchive {
+    const NAME: &'static str = "sessions.archive";
+    type Params = SessionsArchiveParams;
+    type Result = SessionsArchiveResult;
+}
+
+/// Hard-delete: remove the session row, cascade `session_chunks`, and
+/// schedule worktree teardown. Irreversible; the daemon SHOULD refuse if
+/// the session is still `running` (use `sessions.signal` first).
+pub enum SessionsDelete {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsDeleteParams")]
+pub struct SessionsDeleteParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsDeleteResult")]
+pub struct SessionsDeleteResult {}
+
+impl Method for SessionsDelete {
+    const NAME: &'static str = "sessions.delete";
+    type Params = SessionsDeleteParams;
+    type Result = SessionsDeleteResult;
+}
+
+// ---------- sessions.import ----------
+
+/// Discover sessions managed by the named backend on this host and import
+/// them as read-only references (architecture §4.2 双轨发现).
+///
+/// `source_path` lets the client point the adapter at a non-default
+/// discovery root (e.g. `~/.claude/projects` overridden during testing);
+/// `None` ⇒ the adapter's built-in default.
+pub enum SessionsImport {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsImportParams")]
+pub struct SessionsImportParams {
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsImportResult")]
+pub struct SessionsImportResult {
+    pub imported: Vec<ImportedSession>,
+}
+
+/// A read-only reference to a backend-native session discovered on disk.
+/// The daemon assigns a fresh `session_id` so the rest of the system can
+/// reference it uniformly; `external_id` preserves the backend's own id.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ImportedSession {
+    pub session_id: String,
+    pub external_id: String,
+    pub backend: String,
+    /// Project root hint reported by the backend (if any). Used to
+    /// auto-place the session under an existing `projects` row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_hint: Option<String>,
+    /// RFC3339 creation timestamp as recorded by the backend.
+    pub created_at: String,
+    /// Backend-provided title or first-line preview (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_hint: Option<String>,
+}
+
+impl Method for SessionsImport {
+    const NAME: &'static str = "sessions.import";
+    type Params = SessionsImportParams;
+    type Result = SessionsImportResult;
+}
+
+// ---------- sessions.replay ----------
+
+/// Catch-up after a `session.gap` notification. The client passes the gap's
+/// `from_seq` (inclusive) and the daemon replays whatever still survives in
+/// the ring buffer as `session.output` notifications. Bytes evicted before
+/// replay was requested are NOT recovered (the gap stands).
+pub enum SessionsReplay {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsReplayParams")]
+pub struct SessionsReplayParams {
+    pub session_id: String,
+    /// Inclusive starting sequence number for the replay.
+    pub from_seq: u64,
+    /// Optional hard cap on the bytes the daemon will resend before
+    /// switching back to live streaming. `None` ⇒ daemon default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SessionsReplayResult")]
+pub struct SessionsReplayResult {
+    /// Last `seq` covered by the replay. If equal to `from_seq - 1`, the
+    /// ring buffer no longer contained anything for that range.
+    pub last_seq: u64,
+    /// Total bytes about to be (re)delivered as `session.output`
+    /// notifications. Lets the client budget UI updates.
+    pub bytes_queued: u64,
+}
+
+impl Method for SessionsReplay {
+    const NAME: &'static str = "sessions.replay";
+    type Params = SessionsReplayParams;
+    type Result = SessionsReplayResult;
+}
+
+// ---------- events.subscribe ----------
+
+/// Topic vocabulary for [`EventsSubscribe`]. Each variant maps 1:1 to a
+/// notification method name in [`crate::notifications::NOTIFICATION_NAMES`].
+/// Adding a topic here is a wire-compat change; the dispatcher MUST reject
+/// unknown ones at decode time so older daemons fail loudly rather than
+/// silently dropping a subscription.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EventTopic {
+    /// Per-session PTY output stream (`session.output`).
+    SessionOutput,
+    /// State transitions for any visible session (`session.state`).
+    SessionState,
+    /// Backpressure / drop notice for a session ring buffer (`session.gap`).
+    SessionGap,
+    /// Cron firing events (`cron.fired`).
+    CronFired,
+    /// Daemon health pulse for the status bar (`daemon.health`).
+    DaemonHealth,
+}
+
+/// Subscribe to the global event stream (architecture §3). Per-session
+/// output subscriptions are still done via `sessions.attach`; this method
+/// covers the "status bar" topics that are not bound to a single session.
+pub enum EventsSubscribe {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "EventsSubscribeParams")]
+pub struct EventsSubscribeParams {
+    /// Topics this client wants pushed. Empty ⇒ no-op; the daemon must
+    /// still reply OK so the client can confirm the round-trip.
+    pub topics: Vec<EventTopic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "EventsSubscribeResult")]
+pub struct EventsSubscribeResult {
+    /// Topics the daemon will actually push to this connection. The set may
+    /// be a strict subset of `topics` if the daemon does not yet implement
+    /// some of them (e.g. `cron_fired` before M3).
+    pub topics: Vec<EventTopic>,
+}
+
+impl Method for EventsSubscribe {
+    const NAME: &'static str = "events.subscribe";
+    type Params = EventsSubscribeParams;
+    type Result = EventsSubscribeResult;
 }

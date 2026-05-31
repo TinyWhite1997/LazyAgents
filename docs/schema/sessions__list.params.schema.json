@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionsListParams",
+  "type": "object",
+  "properties": {
+    "project": {
+      "description": "Restrict to a single project id (UUID v7). `None` ⇒ all projects.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "backend": {
+      "description": "Restrict to a single backend name (e.g. `\"claude\"`).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "include_archived": {
+      "description": "Include archived sessions in the result. Default `false` mirrors the TUI's primary view, which hides archives behind a toggle.",
+      "default": false,
+      "type": "boolean"
+    }
+  }
+}

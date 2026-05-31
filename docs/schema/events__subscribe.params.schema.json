@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EventsSubscribeParams",
+  "type": "object",
+  "required": [
+    "topics"
+  ],
+  "properties": {
+    "topics": {
+      "description": "Topics this client wants pushed. Empty ⇒ no-op; the daemon must still reply OK so the client can confirm the round-trip.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/EventTopic"
+      }
+    }
+  },
+  "definitions": {
+    "EventTopic": {
+      "description": "Topic vocabulary for [`EventsSubscribe`]. Each variant maps 1:1 to a notification method name in [`crate::notifications::NOTIFICATION_NAMES`]. Adding a topic here is a wire-compat change; the dispatcher MUST reject unknown ones at decode time so older daemons fail loudly rather than silently dropping a subscription.",
+      "oneOf": [
+        {
+          "description": "Per-session PTY output stream (`session.output`).",
+          "type": "string",
+          "enum": [
+            "session_output"
+          ]
+        },
+        {
+          "description": "State transitions for any visible session (`session.state`).",
+          "type": "string",
+          "enum": [
+            "session_state"
+          ]
+        },
+        {
+          "description": "Backpressure / drop notice for a session ring buffer (`session.gap`).",
+          "type": "string",
+          "enum": [
+            "session_gap"
+          ]
+        },
+        {
+          "description": "Cron firing events (`cron.fired`).",
+          "type": "string",
+          "enum": [
+            "cron_fired"
+          ]
+        },
+        {
+          "description": "Daemon health pulse for the status bar (`daemon.health`).",
+          "type": "string",
+          "enum": [
+            "daemon_health"
+          ]
+        }
+      ]
+    }
+  }
+}
