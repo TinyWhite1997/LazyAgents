@@ -661,13 +661,26 @@ mod tests {
 
         hub.publish(b"first").await;
         let ev = sub.recv().await.unwrap();
-        let last_seq = if let HubEvent::Output(p) = ev { p.seq } else { panic!() };
+        let last_seq = if let HubEvent::Output(p) = ev {
+            p.seq
+        } else {
+            panic!()
+        };
 
         let id = sub.id();
         drop(sub);
         tokio::task::yield_now().await;
         for _ in 0..10 {
-            if hub.inner.state.lock().await.subs.get(&id).and_then(|e| e.parked).is_some() {
+            if hub
+                .inner
+                .state
+                .lock()
+                .await
+                .subs
+                .get(&id)
+                .and_then(|e| e.parked)
+                .is_some()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;

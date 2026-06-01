@@ -222,7 +222,17 @@ mod tests {
 
         // Build payloads with distinguishable content so a swap would
         // be detectable.
-        let sizes = [0usize, 1, 2, 7, 32, 1024, 64 * 1024 - 1, 64 * 1024, 64 * 1024 + 1];
+        let sizes = [
+            0usize,
+            1,
+            2,
+            7,
+            32,
+            1024,
+            64 * 1024 - 1,
+            64 * 1024,
+            64 * 1024 + 1,
+        ];
         let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(sizes.len());
         for (i, &sz) in sizes.iter().enumerate() {
             payloads.push((0..sz).map(|j| ((i * 31 + j) % 251) as u8).collect());
@@ -233,9 +243,7 @@ mod tests {
         {
             let mut codec = FrameCodec::new();
             for p in &payloads {
-                codec
-                    .encode(Bytes::from(p.clone()), &mut encoded)
-                    .unwrap();
+                codec.encode(Bytes::from(p.clone()), &mut encoded).unwrap();
             }
         }
         let encoded = encoded.freeze();
@@ -270,14 +278,15 @@ mod tests {
                 buf.extend_from_slice(&encoded[offset..offset + take]);
                 offset += take;
                 // Decode greedily; multiple complete frames may now live in `buf`.
-                while let Some(frame) =
-                    codec.decode(&mut buf).expect("decode must not fail")
-                {
+                while let Some(frame) = codec.decode(&mut buf).expect("decode must not fail") {
                     decoded.push(frame.to_vec());
                 }
             }
             // After feeding everything, no partial bytes should be left.
-            assert!(buf.is_empty(), "iter {iter}: trailing bytes after stream end");
+            assert!(
+                buf.is_empty(),
+                "iter {iter}: trailing bytes after stream end"
+            );
             assert_eq!(
                 decoded.len(),
                 payloads.len(),

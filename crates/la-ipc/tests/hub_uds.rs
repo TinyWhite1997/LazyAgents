@@ -251,7 +251,9 @@ async fn kill_and_reconnect_within_grace_loses_no_bytes() {
             .unwrap()
             .unwrap()
             .unwrap();
-        let Message::Notification(n) = m else { panic!() };
+        let Message::Notification(n) = m else {
+            panic!()
+        };
         assert_eq!(
             n.method,
             SessionOutput::NAME,
@@ -368,8 +370,7 @@ async fn slow_client_gap_does_not_affect_fast_client() {
             tokio::time::sleep(Duration::from_millis(100)).await;
             match m {
                 Ok(Ok(Some(Message::Notification(n)))) if n.method == SessionGap::NAME => {
-                    let p: la_proto::notifications::SessionGapParams =
-                        n.params_as().unwrap();
+                    let p: la_proto::notifications::SessionGapParams = n.params_as().unwrap();
                     gap_count += 1;
                     dropped += p.dropped_bytes;
                 }
@@ -421,11 +422,7 @@ async fn slow_client_gap_does_not_affect_fast_client() {
         fast_count, 64,
         "fast client must receive every chunk (got {fast_count})"
     );
-    assert_eq!(
-        fast_bytes,
-        64 * 4 * 1024,
-        "fast client byte total mismatch"
-    );
+    assert_eq!(fast_bytes, 64 * 4 * 1024, "fast client byte total mismatch");
     assert!(
         slow_gap_count >= 1,
         "slow client must see at least one gap notice (got 0; outputs={slow_outputs}, dropped={slow_dropped})"
@@ -485,7 +482,10 @@ async fn no_reconnect_within_grace_evicts_subscription() {
     // Wait past the park deadline.
     tokio::time::sleep(Duration::from_millis(150)).await;
     let evicted = hub.evict_if_still_parked(id).await;
-    assert!(evicted, "subscription should be evicted past its park deadline");
+    assert!(
+        evicted,
+        "subscription should be evicted past its park deadline"
+    );
     assert!(
         hub.resume(id, None).await.is_none(),
         "evicted id must not be resumable"
