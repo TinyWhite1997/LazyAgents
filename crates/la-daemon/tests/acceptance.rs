@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,7 +30,10 @@ use la_ipc::transport::{connect, Endpoint};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
 use la_proto::methods::{
-    SessionsAttachParams, SessionsAttachResult, SessionsCreateParams, SessionsCreateResult,
+    SessionState, SessionsArchiveParams, SessionsArchiveResult, SessionsAttachParams,
+    SessionsAttachResult, SessionsCreateParams, SessionsCreateResult, SessionsDeleteParams,
+    SessionsDeleteResult, SessionsDetachParams, SessionsDetachResult, SessionsListParams,
+    SessionsListResult, SessionsWriteParams, SessionsWriteResult,
 };
 use la_proto::notifications::SessionOutputParams;
 use tempfile::TempDir;
@@ -166,6 +170,46 @@ async fn recv_response_for(
     }
 }
 
+async fn call<T, R>(
+    conn: &mut Connection<tokio::net::UnixStream>,
+    id: i64,
+    method: &str,
+    params: T,
+) -> R
+where
+    T: serde::Serialize,
+    R: serde::de::DeserializeOwned,
+{
+    send_request(conn, id, method, params).await;
+    serde_json::from_value(recv_response_for(conn, id).await).expect("decode response")
+}
+
+async fn drain_output_until(
+    conn: &mut Connection<tokio::net::UnixStream>,
+    needle: &[u8],
+    timeout_duration: Duration,
+) -> Vec<u8> {
+    let mut seen = Vec::<u8>::new();
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    while tokio::time::Instant::now() < deadline && !contains(&seen, needle) {
+        let msg = match tokio::time::timeout(Duration::from_millis(500), conn.recv()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => continue,
+        };
+        if let Message::Notification(n) = msg {
+            if n.method == "session.output" {
+                if let Some(params) = n.params.as_ref() {
+                    let p: SessionOutputParams =
+                        serde_json::from_value(params.clone()).expect("decode output");
+                    let bytes = p.data_bytes().expect("base64");
+                    seen.extend_from_slice(&bytes);
+                }
+            }
+        }
+    }
+    seen
+}
+
 #[tokio::test]
 async fn end_to_end_create_and_attach() {
     let project = tempfile::tempdir().expect("project tmp");
@@ -226,6 +270,322 @@ async fn end_to_end_create_and_attach() {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+async fn spawn_lad_binary(
+    socket: &std::path::Path,
+    state_dir: &std::path::Path,
+    script: &str,
+) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lad"))
+        .arg("start")
+        .arg("--socket")
+        .arg(socket)
+        .arg("--state-dir")
+        .arg(state_dir)
+        .arg("--log-level")
+        .arg("warn")
+        .arg("--test-shell-adapter")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn lad binary");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if connect(&Endpoint::uds(socket)).await.is_ok() {
+            return child;
+        }
+        if let Some(status) = child.try_wait().expect("poll lad") {
+            panic!("lad exited before socket was ready: {status}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = child.kill();
+    panic!("lad socket did not become ready at {}", socket.display());
+}
+
+fn stop_child(child: &mut Child) {
+    if child.try_wait().expect("poll child").is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn kill_pid(pid: i32, signal: i32) {
+    unsafe {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        assert_eq!(kill(pid, signal), 0, "kill({pid}, {signal}) failed");
+    }
+}
+
+#[tokio::test]
+async fn lad_binary_m1_end_to_end_lifecycle() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let runtime = tempdir.path().join("runtime");
+    let state = tempdir.path().join("state");
+    let project = tempdir.path().join("project");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let socket = runtime.join("lad-1.sock");
+    let script = "\
+printf 'ready-from-shtest\\n'
+while IFS= read -r line; do
+  printf 'echo:%s\\n' \"$line\"
+  [ \"$line\" = quit ] && exit 0
+done
+";
+    let mut lad = spawn_lad_binary(&socket, &state, script).await;
+    let mut conn = client(&socket).await;
+
+    let create: SessionsCreateResult = call(
+        &mut conn,
+        1,
+        "sessions.create",
+        &SessionsCreateParams {
+            project_dir: project.to_string_lossy().to_string(),
+            backend: "shtest".to_string(),
+            args: vec![],
+            prompt: None,
+            worktree: false,
+        },
+    )
+    .await;
+    let session_id = create.session_id.clone();
+
+    let attach: SessionsAttachResult = call(
+        &mut conn,
+        2,
+        "sessions.attach",
+        &SessionsAttachParams {
+            session_id: session_id.clone(),
+            replay_bytes: None,
+            acquire_input: true,
+        },
+    )
+    .await;
+    assert!(attach.input_acquired);
+
+    let ready = drain_output_until(&mut conn, b"ready-from-shtest", Duration::from_secs(5)).await;
+    assert!(
+        contains(&ready, b"ready-from-shtest"),
+        "missing startup output; got {:?}",
+        String::from_utf8_lossy(&ready)
+    );
+
+    let _: SessionsWriteResult = call(
+        &mut conn,
+        3,
+        "sessions.write",
+        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"hello-m1\n").unwrap(),
+    )
+    .await;
+    let echoed = drain_output_until(&mut conn, b"echo:hello-m1", Duration::from_secs(5)).await;
+    assert!(
+        contains(&echoed, b"echo:hello-m1"),
+        "missing echoed write; got {:?}",
+        String::from_utf8_lossy(&echoed)
+    );
+
+    let _: SessionsDetachResult = call(
+        &mut conn,
+        4,
+        "sessions.detach",
+        &SessionsDetachParams {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let reattach: SessionsAttachResult = call(
+        &mut conn,
+        5,
+        "sessions.attach",
+        &SessionsAttachParams {
+            session_id: session_id.clone(),
+            replay_bytes: None,
+            acquire_input: true,
+        },
+    )
+    .await;
+    assert!(reattach.input_acquired);
+
+    let _: SessionsWriteResult = call(
+        &mut conn,
+        6,
+        "sessions.write",
+        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"quit\n").unwrap(),
+    )
+    .await;
+
+    let mut final_list = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let list: SessionsListResult = call(
+            &mut conn,
+            7,
+            "sessions.list",
+            &SessionsListParams {
+                project: None,
+                backend: None,
+                include_archived: true,
+            },
+        )
+        .await;
+        if list
+            .sessions
+            .iter()
+            .any(|s| s.session_id == session_id && s.state == SessionState::Exited)
+        {
+            final_list = Some(list);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(final_list.is_some(), "session did not reach exited state");
+
+    let _: SessionsArchiveResult = call(
+        &mut conn,
+        8,
+        "sessions.archive",
+        &SessionsArchiveParams {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let visible: SessionsListResult = call(
+        &mut conn,
+        9,
+        "sessions.list",
+        &SessionsListParams {
+            project: None,
+            backend: None,
+            include_archived: false,
+        },
+    )
+    .await;
+    assert!(
+        visible.sessions.iter().all(|s| s.session_id != session_id),
+        "archived session should be hidden by default"
+    );
+    let archived: SessionsListResult = call(
+        &mut conn,
+        10,
+        "sessions.list",
+        &SessionsListParams {
+            project: None,
+            backend: None,
+            include_archived: true,
+        },
+    )
+    .await;
+    assert!(
+        archived
+            .sessions
+            .iter()
+            .any(|s| s.session_id == session_id && s.state == SessionState::Archived),
+        "archived session should be visible when requested"
+    );
+
+    let _: SessionsDeleteResult = call(
+        &mut conn,
+        11,
+        "sessions.delete",
+        &SessionsDeleteParams {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let deleted: SessionsListResult = call(
+        &mut conn,
+        12,
+        "sessions.list",
+        &SessionsListParams {
+            project: None,
+            backend: None,
+            include_archived: true,
+        },
+    )
+    .await;
+    assert!(
+        deleted.sessions.iter().all(|s| s.session_id != session_id),
+        "deleted session must not remain in sessions.list"
+    );
+
+    stop_child(&mut lad);
+}
+
+#[tokio::test]
+async fn lad_binary_restart_reaps_orphaned_session_rows() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let runtime = tempdir.path().join("runtime");
+    let state = tempdir.path().join("state");
+    let project = tempdir.path().join("project");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let socket = runtime.join("lad-1.sock");
+    let pid_file = project.join("child.pid");
+    let script = "printf '%s\\n' $$ > child.pid; trap '' TERM; sleep 120";
+    let mut first = spawn_lad_binary(&socket, &state, script).await;
+    let mut conn = client(&socket).await;
+
+    let create: SessionsCreateResult = call(
+        &mut conn,
+        1,
+        "sessions.create",
+        &SessionsCreateParams {
+            project_dir: project.to_string_lossy().to_string(),
+            backend: "shtest".to_string(),
+            args: vec![],
+            prompt: None,
+            worktree: false,
+        },
+    )
+    .await;
+    drop(conn);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !pid_file.exists() {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(pid_file.exists(), "test child did not write pid file");
+    let child_pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("read pid file")
+        .trim()
+        .parse()
+        .expect("parse pid");
+
+    stop_child(&mut first);
+    #[cfg(unix)]
+    kill_pid(child_pid, 9);
+
+    let mut second = spawn_lad_binary(&socket, &state, "sleep 1").await;
+    let mut conn = client(&socket).await;
+    let list: SessionsListResult = call(
+        &mut conn,
+        2,
+        "sessions.list",
+        &SessionsListParams {
+            project: None,
+            backend: None,
+            include_archived: true,
+        },
+    )
+    .await;
+    let restored = list
+        .sessions
+        .iter()
+        .find(|s| s.session_id == create.session_id)
+        .expect("session row should survive restart");
+    assert_eq!(restored.state, SessionState::Exited);
+
+    stop_child(&mut second);
 }
 
 #[tokio::test]
