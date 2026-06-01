@@ -248,7 +248,7 @@ async fn run_writer(state: ConnState, ctx: ConnectionContext) {
     let attach_changed = state.attachments_changed.clone();
     let shutdown = state.shutdown.clone();
     let mut active: HashMap<SessionId, ()> = HashMap::new();
-    let mut sub_tasks: JoinSet<()> = JoinSet::new();
+    let mut sub_tasks: JoinSet<SessionId> = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -259,7 +259,7 @@ async fn run_writer(state: ConnState, ctx: ConnectionContext) {
                 for (id, sub) in new {
                     let send = state.send.clone();
                     sub_tasks.spawn(async move {
-                        drain_subscription(id, sub, send).await;
+                        drain_subscription(id, sub, send).await
                     });
                 }
             },
@@ -270,8 +270,18 @@ async fn run_writer(state: ConnState, ctx: ConnectionContext) {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => { break; },
                 }
             },
-            Some(_joined) = sub_tasks.join_next() => {
+            Some(joined) = sub_tasks.join_next() => {
                 // Drain finished writer tasks so the JoinSet doesn't grow.
+                if let Ok(id) = joined {
+                    active.remove(&id);
+                    let new = collect_new_subs(&state, &mut active).await;
+                    for (id, sub) in new {
+                        let send = state.send.clone();
+                        sub_tasks.spawn(async move {
+                            drain_subscription(id, sub, send).await
+                        });
+                    }
+                }
             }
         }
     }
@@ -297,7 +307,11 @@ async fn collect_new_subs(
     new
 }
 
-async fn drain_subscription(_id: SessionId, mut sub: Subscription, send: Arc<dyn MessageSink>) {
+async fn drain_subscription(
+    id: SessionId,
+    mut sub: Subscription,
+    send: Arc<dyn MessageSink>,
+) -> SessionId {
     while let Some(event) = sub.recv().await {
         let result = match event {
             HubEvent::Output(p) => Notification::new(SessionOutput::NAME, &*p),
@@ -316,6 +330,7 @@ async fn drain_subscription(_id: SessionId, mut sub: Subscription, send: Arc<dyn
             }
         }
     }
+    id
 }
 
 async fn deliver_bus_event(state: &ConnState, event: BusEvent) {

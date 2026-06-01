@@ -29,9 +29,14 @@ use la_ipc::transport::{connect, Endpoint};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
 use la_proto::methods::{
-    SessionsAttachParams, SessionsAttachResult, SessionsCreateParams, SessionsCreateResult,
+    SessionState, SessionsArchiveParams, SessionsArchiveResult, SessionsAttachParams,
+    SessionsAttachResult, SessionsCreateParams, SessionsCreateResult, SessionsDeleteParams,
+    SessionsDeleteResult, SessionsDetachParams, SessionsDetachResult, SessionsListParams,
+    SessionsListResult, SessionsWriteParams, SessionsWriteResult,
 };
 use la_proto::notifications::SessionOutputParams;
+use la_storage::{BackendUpsert, NewProject, NewSession, Storage, StorageConfig};
+use serde::de::DeserializeOwned;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -166,6 +171,107 @@ async fn recv_response_for(
     }
 }
 
+async fn call<T, R>(
+    conn: &mut Connection<tokio::net::UnixStream>,
+    id: i64,
+    method: &str,
+    params: &T,
+) -> R
+where
+    T: serde::Serialize,
+    R: DeserializeOwned,
+{
+    send_request(conn, id, method, params).await;
+    serde_json::from_value(recv_response_for(conn, id).await).expect("decode rpc response")
+}
+
+async fn write_and_wait_for_output(
+    conn: &mut Connection<tokio::net::UnixStream>,
+    id: i64,
+    session_id: &str,
+    input: &[u8],
+    needle: &[u8],
+) {
+    let params = SessionsWriteParams::try_from_bytes(session_id.to_string(), input).unwrap();
+    send_request(conn, id, "sessions.write", &params).await;
+
+    let mut saw_response = false;
+    let mut seen = Vec::<u8>::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let msg = match tokio::time::timeout(remaining, conn.recv()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => break,
+        };
+        match msg {
+            Message::Response(resp) => {
+                assert_eq!(resp.id, RequestId::Num(id), "id mismatch");
+                match resp.outcome {
+                    la_proto::jsonrpc::ResponseOutcome::Result(v) => {
+                        let _: SessionsWriteResult =
+                            serde_json::from_value(v).expect("decode write");
+                        saw_response = true;
+                    }
+                    la_proto::jsonrpc::ResponseOutcome::Error(e) => panic!("rpc error: {e:?}"),
+                }
+            }
+            Message::Notification(n) if n.method == "session.output" => {
+                if let Some(params) = n.params.as_ref() {
+                    let p: SessionOutputParams =
+                        serde_json::from_value(params.clone()).expect("decode output");
+                    if p.session_id == session_id {
+                        seen.extend_from_slice(&p.data_bytes().expect("base64"));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if saw_response && contains(&seen, needle) {
+            return;
+        }
+    }
+
+    assert!(saw_response, "missing sessions.write response");
+    panic!(
+        "missing expected output {:?}; got {:?}",
+        String::from_utf8_lossy(needle),
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+async fn wait_until_session_state(
+    conn: &mut Connection<tokio::net::UnixStream>,
+    session_id: &str,
+    expected: SessionState,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut request_id = 500;
+    while tokio::time::Instant::now() < deadline {
+        let result: SessionsListResult = call(
+            conn,
+            request_id,
+            "sessions.list",
+            &SessionsListParams {
+                project: None,
+                backend: Some("shtest".to_string()),
+                include_archived: true,
+            },
+        )
+        .await;
+        request_id += 1;
+        if result
+            .sessions
+            .iter()
+            .any(|s| s.session_id == session_id && s.state == expected)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("session {session_id} did not reach {expected:?}");
+}
+
 #[tokio::test]
 async fn end_to_end_create_and_attach() {
     let project = tempfile::tempdir().expect("project tmp");
@@ -226,6 +332,271 @@ async fn end_to_end_create_and_attach() {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[tokio::test]
+async fn m1_end_to_end_write_detach_reattach_archive_delete() {
+    let project = tempfile::tempdir().expect("project tmp");
+    let script = "printf 'mock-cli ready\\n'; while IFS= read -r line; do printf 'mock-cli:%s\\n' \"$line\"; if [ \"$line\" = quit ]; then exit 0; fi; done";
+    let daemon = bootstrap_daemon(script).await;
+    let mut conn = client(&daemon.socket).await;
+
+    let create: SessionsCreateResult = call(
+        &mut conn,
+        10,
+        "sessions.create",
+        &SessionsCreateParams {
+            project_dir: project.path().to_string_lossy().to_string(),
+            backend: "shtest".to_string(),
+            args: vec![],
+            prompt: None,
+            worktree: false,
+        },
+    )
+    .await;
+    assert_eq!(create.backend, "shtest");
+    let session_id = create.session_id.clone();
+
+    let attach: SessionsAttachResult = call(
+        &mut conn,
+        11,
+        "sessions.attach",
+        &SessionsAttachParams {
+            session_id: session_id.clone(),
+            replay_bytes: None,
+            acquire_input: true,
+        },
+    )
+    .await;
+    assert!(attach.input_acquired, "first attach should own input");
+
+    write_and_wait_for_output(&mut conn, 12, &session_id, b"first\n", b"mock-cli:first").await;
+
+    let _: SessionsDetachResult = call(
+        &mut conn,
+        13,
+        "sessions.detach",
+        &SessionsDetachParams {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+
+    let reattach: SessionsAttachResult = call(
+        &mut conn,
+        14,
+        "sessions.attach",
+        &SessionsAttachParams {
+            session_id: session_id.clone(),
+            replay_bytes: None,
+            acquire_input: true,
+        },
+    )
+    .await;
+    assert!(
+        reattach.input_acquired,
+        "reattach should reacquire input after detach"
+    );
+
+    write_and_wait_for_output(&mut conn, 15, &session_id, b"quit\n", b"mock-cli:quit").await;
+    wait_until_session_state(&mut conn, &session_id, SessionState::Exited).await;
+
+    let listed: SessionsListResult = call(
+        &mut conn,
+        16,
+        "sessions.list",
+        &SessionsListParams {
+            project: None,
+            backend: Some("shtest".to_string()),
+            include_archived: false,
+        },
+    )
+    .await;
+    let project_id = listed
+        .sessions
+        .iter()
+        .find(|s| s.session_id == session_id)
+        .expect("session visible before archive")
+        .project_id
+        .clone();
+
+    let _: SessionsArchiveResult = call(
+        &mut conn,
+        17,
+        "sessions.archive",
+        &SessionsArchiveParams {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+
+    let default_list: SessionsListResult = call(
+        &mut conn,
+        18,
+        "sessions.list",
+        &SessionsListParams {
+            project: Some(project_id.clone()),
+            backend: Some("shtest".to_string()),
+            include_archived: false,
+        },
+    )
+    .await;
+    assert!(
+        default_list
+            .sessions
+            .iter()
+            .all(|s| s.session_id != session_id),
+        "archived session should be hidden from default list"
+    );
+
+    let archived_list: SessionsListResult = call(
+        &mut conn,
+        19,
+        "sessions.list",
+        &SessionsListParams {
+            project: Some(project_id),
+            backend: Some("shtest".to_string()),
+            include_archived: true,
+        },
+    )
+    .await;
+    assert!(
+        archived_list
+            .sessions
+            .iter()
+            .any(|s| s.session_id == session_id && s.state == SessionState::Archived),
+        "archived session should remain visible when requested"
+    );
+
+    let _: SessionsDeleteResult = call(
+        &mut conn,
+        20,
+        "sessions.delete",
+        &SessionsDeleteParams {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let after_delete: SessionsListResult = call(
+        &mut conn,
+        21,
+        "sessions.list",
+        &SessionsListParams {
+            project: None,
+            backend: Some("shtest".to_string()),
+            include_archived: true,
+        },
+    )
+    .await;
+    assert!(
+        after_delete
+            .sessions
+            .iter()
+            .all(|s| s.session_id != session_id),
+        "deleted session should be gone"
+    );
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+#[tokio::test]
+async fn daemon_restart_reaps_orphan_sessions_from_storage() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let runtime_dir = tempdir.path().join("runtime");
+    let state_dir = tempdir.path().join("state");
+    let project_root = tempdir.path().join("project");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::create_dir_all(&project_root).unwrap();
+
+    let storage = Storage::open(StorageConfig::new(
+        state_dir.join("lad.sqlite"),
+        state_dir.clone(),
+    ))
+    .await
+    .expect("open storage");
+    storage
+        .backends()
+        .upsert(BackendUpsert {
+            id: "shtest",
+            display_name: "Shell Test Backend",
+            version: Some("0.0.0"),
+            available: true,
+        })
+        .await
+        .expect("backend");
+    let project_id = la_storage::new_id();
+    storage
+        .projects()
+        .create(NewProject {
+            id: project_id.clone(),
+            root_path: project_root.to_string_lossy().to_string(),
+            display_name: "project".to_string(),
+            vcs: None,
+        })
+        .await
+        .expect("project");
+    let orphan_id = la_storage::new_id();
+    storage
+        .sessions()
+        .create(NewSession {
+            id: orphan_id.clone(),
+            project_id: project_id.clone(),
+            backend_id: "shtest".to_string(),
+            external_id: None,
+            title: Some("orphan".to_string()),
+            state: "running".to_string(),
+            pid: Some(i64::from(u32::MAX) - 1),
+            worktree_path: None,
+            worktree_branch: None,
+            base_branch: None,
+            spawn_args: serde_json::json!({}),
+            origin: "user".to_string(),
+        })
+        .await
+        .expect("orphan session");
+    storage.close().await;
+    drop(storage);
+
+    let socket = runtime_dir.join("lad-1.sock");
+    let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+    adapters.insert(
+        "shtest".to_string(),
+        Arc::new(ShellAdapter {
+            script: "sleep 1".into(),
+        }) as Arc<dyn AgentAdapter>,
+    );
+    let config = DaemonConfig {
+        state_dir,
+        socket_discovery: SocketDiscovery::with_override(socket.clone()),
+        adapters,
+        ..DaemonConfig::default()
+    };
+    let daemon = Daemon::bind(config).await.expect("bind daemon");
+    let (handle, join) = daemon.spawn();
+    let mut conn = client(&socket).await;
+
+    let list: SessionsListResult = call(
+        &mut conn,
+        30,
+        "sessions.list",
+        &SessionsListParams {
+            project: Some(project_id),
+            backend: Some("shtest".to_string()),
+            include_archived: true,
+        },
+    )
+    .await;
+    assert!(
+        list.sessions
+            .iter()
+            .any(|s| s.session_id == orphan_id && s.state == SessionState::Exited),
+        "orphan row should be marked exited after daemon restart"
+    );
+
+    handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), join).await;
 }
 
 #[tokio::test]
