@@ -320,7 +320,8 @@ fn kill_pid(pid: i32, signal: i32) {
         extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
-        assert_eq!(kill(pid, signal), 0, "kill({pid}, {signal}) failed");
+        // Best-effort cleanup: closing the PTY may have already ended the child.
+        let _ = kill(pid, signal);
     }
 }
 
@@ -383,7 +384,7 @@ done
         &mut conn,
         3,
         "sessions.write",
-        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"hello-m1\n").unwrap(),
+        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"hello-m1\r").unwrap(),
     )
     .await;
     let echoed = drain_output_until(&mut conn, b"echo:hello-m1", Duration::from_secs(5)).await;
@@ -419,7 +420,7 @@ done
         &mut conn,
         6,
         "sessions.write",
-        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"quit\n").unwrap(),
+        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"quit\r").unwrap(),
     )
     .await;
 
