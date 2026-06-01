@@ -17,11 +17,16 @@ use crate::app::{AppMsg, Modal, Tab};
 /// be routed to the right [`AppMsg`].
 ///
 /// `tabs` is the (tab, column_range) list returned by
-/// [`crate::tabs::render_tabs`]; `sidebar` is the sidebar's inner content
-/// rect (so we can compute the clicked row index).
+/// [`crate::tabs::render_tabs`]; `sidebar` is the sidebar's **inner** content
+/// rect — the area *inside* the borders, so the translator does not need to
+/// special-case the border row. `sidebar_scroll_offset` is the list's
+/// top-of-viewport index from the previous render, used to map a visible
+/// row to the absolute index inside [`crate::sidebar::SidebarState::items`]
+/// when the list has scrolled past its visible height.
 pub struct HitBoxes {
     pub tabs: Vec<(Tab, std::ops::Range<u16>)>,
     pub sidebar: Rect,
+    pub sidebar_scroll_offset: usize,
     pub tab_bar_row: u16,
 }
 
@@ -131,13 +136,16 @@ fn translate_mouse(
                     return Some(AppMsg::SetTab(t));
                 }
             }
-            // Sidebar row click: translate the row offset inside the
-            // sidebar's content area to a list index. We assume the
-            // sidebar is bordered (1-cell margin) — matches
-            // `render_sidebar`'s Block::default().borders(ALL).
+            // Sidebar row click: `hit.sidebar` is already the inner area
+            // (borders excluded by the renderer), so a click inside it
+            // maps directly to a visible-row offset. Add the list's
+            // scroll offset to get the absolute index in `items` — the
+            // ratatui `List` widget auto-scrolls long lists and without
+            // this correction `d`/`a` would target the wrong row.
             if hit.sidebar.contains(ratatui::layout::Position::new(event.column, event.row)) {
-                let inner_row = event.row.saturating_sub(hit.sidebar.y + 1);
-                return Some(AppMsg::SidebarSelect(inner_row as usize));
+                let inner_row = event.row.saturating_sub(hit.sidebar.y) as usize;
+                let abs_index = hit.sidebar_scroll_offset.saturating_add(inner_row);
+                return Some(AppMsg::SidebarSelect(abs_index));
             }
             None
         }
@@ -156,7 +164,10 @@ mod tests {
                 (Tab::Sessions, 0u16..10u16),
                 (Tab::Crons, 10u16..20u16),
             ],
-            sidebar: Rect::new(0, 2, 30, 10),
+            // Pre-trimmed inner rect (borders already removed by the
+            // renderer). y=2 ⇒ first visible row is at terminal row 2.
+            sidebar: Rect::new(1, 2, 28, 8),
+            sidebar_scroll_offset: 0,
             tab_bar_row: 0,
         }
     }
@@ -219,11 +230,44 @@ mod tests {
         let ev = Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
-            row: 5, // sidebar at y=2 + inner_row(3 - 1 border) = absolute 5
+            row: 5, // sidebar inner y=2; row 5 ⇒ inner_row = 3
             modifiers: KeyModifiers::NONE,
         });
-        // sidebar y=2, border row at y=2; the click at row=5 ⇒ inner_row = 5-2-1 = 2
-        assert_eq!(translate(ev, None, &hit()), Some(AppMsg::SidebarSelect(2)));
+        assert_eq!(translate(ev, None, &hit()), Some(AppMsg::SidebarSelect(3)));
+    }
+
+    #[test]
+    fn left_click_inside_sidebar_compensates_for_scroll_offset() {
+        // Long list scenario: the renderer scrolled the list by 12 rows
+        // before drawing. A click on the first visible row must resolve to
+        // item index 12, not 0 — otherwise `d`/`a` hit the wrong session
+        // when the user is operating in the lower half of a tall list.
+        let h = HitBoxes {
+            tabs: vec![(Tab::Sessions, 0u16..10u16), (Tab::Crons, 10u16..20u16)],
+            sidebar: Rect::new(1, 2, 28, 8),
+            sidebar_scroll_offset: 12,
+            tab_bar_row: 0,
+        };
+        let ev = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 4, // inner_row = 2; absolute = 12 + 2 = 14
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(translate(ev, None, &h), Some(AppMsg::SidebarSelect(14)));
+    }
+
+    #[test]
+    fn left_click_on_sidebar_border_is_outside_inner_hit_box() {
+        // Border row sits one row above the inner hit box (y=1 vs y=2)
+        // and must not snap the selection to item 0.
+        let ev = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(translate(ev, None, &hit()), None);
     }
 
     #[test]

@@ -118,7 +118,11 @@ impl HintRegistry {
                     }
                 }
                 Selection::Empty => {
-                    out.push(Hint::new("n", "new", Importance::Primary));
+                    // PRD §5.6 第 3 条: hint 反映**真实绑定**。`n` 在空
+                    // workspace 上是 no-op（[`crate::app::App::on_new_session`]
+                    // 没有 project 可挂载，直接 return），所以这里不再 advertise；
+                    // 空态文案由 [`crate::runner::render_content_placeholder`]
+                    // 负责。等 M1.7 daemon 支持"创建项目"路径，再恢复 `n`。
                 }
             }
             // Always-on navigation inside the sidebar. Placed AFTER the
@@ -152,7 +156,9 @@ impl HintRegistry {
             Modal::NewSession { .. } => vec![
                 Hint::new("⏎", "create", Importance::Primary),
                 Hint::new("Esc", "cancel", Importance::High),
-                Hint::new("Tab", "next backend", Importance::Medium),
+                // PRD §5.6 第 3 条: hint 必须 == 当前真实绑定。Tab/Backend
+                // 选择在 M1.7 落 daemon 之前没有 handler，所以这里**不**
+                // advertise — 等 backend chooser 上线再加回来。
             ],
         }
     }
@@ -282,5 +288,118 @@ mod tests {
         let hints = vec![Hint::new("verylongkey", "verylonglabel", Importance::High)];
         let out = format_hint_bar(&hints, 5);
         assert_eq!(out, "Press ? for help");
+    }
+
+    /// Cross-check: every key the registry advertises in a non-modal Sessions
+    /// context must be translatable by [`crate::input::translate`] — otherwise
+    /// the hint bar is documenting an action that does nothing. Guards against
+    /// future drift between the two layers (review a906b484 §1, §2).
+    #[test]
+    fn every_advertised_session_key_is_translatable() {
+        use crate::input::{translate, HitBoxes};
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        use ratatui::layout::Rect;
+
+        let hit = HitBoxes {
+            tabs: Vec::new(),
+            sidebar: Rect::default(),
+            sidebar_scroll_offset: 0,
+            tab_bar_row: 0,
+        };
+
+        let contexts = [
+            Selection::Empty,
+            Selection::Group { project_id: "p1".into() },
+            Selection::Group {
+                project_id: crate::model::ProjectGroup::ARCHIVED_ID.into(),
+            },
+            Selection::Session {
+                project_id: "p1".into(),
+                session_id: "s1".into(),
+            },
+        ];
+        for sel in &contexts {
+            let hints =
+                HintRegistry::for_context(Tab::Sessions, Focus::Sidebar, sel, None);
+            for h in &hints {
+                let Some(code) = single_char_key(h.key) else {
+                    continue;
+                };
+                let ev = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+                assert!(
+                    translate(ev, None, &hit).is_some(),
+                    "hint {:?} -> {} advertises key '{}' that input layer ignores in selection {sel:?}",
+                    h.label,
+                    h.key,
+                    h.key,
+                );
+            }
+        }
+    }
+
+    /// Same cross-check for modal contexts: NewSession used to advertise
+    /// `Tab next backend` even though [`crate::input::translate_modal_key`]
+    /// only handles Enter/Esc inside it. Pin the invariant so the next
+    /// reviewer doesn't have to spot it again (review a906b484 §1).
+    #[test]
+    fn every_advertised_modal_key_is_translatable() {
+        use crate::app::Modal;
+        use crate::input::{translate, HitBoxes};
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        use ratatui::layout::Rect;
+
+        let hit = HitBoxes {
+            tabs: Vec::new(),
+            sidebar: Rect::default(),
+            sidebar_scroll_offset: 0,
+            tab_bar_row: 0,
+        };
+        let modals = [
+            Modal::ConfirmDelete { session_id: "s1".into() },
+            Modal::FullHints,
+            Modal::NewSession { project_id: "p1".into() },
+        ];
+        for m in &modals {
+            let hints = HintRegistry::for_context(
+                Tab::Sessions,
+                Focus::Sidebar,
+                &Selection::Empty,
+                Some(m.clone()),
+            );
+            for h in &hints {
+                let Some(code) = single_char_key(h.key) else {
+                    continue;
+                };
+                let ev = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+                assert!(
+                    translate(ev, Some(m), &hit).is_some(),
+                    "modal {m:?} advertises key '{}' that input layer ignores",
+                    h.key,
+                );
+            }
+        }
+    }
+
+    /// Map the registry's presentational key labels back to the [`KeyCode`]
+    /// the input layer matches against. Returns `None` for composite labels
+    /// (`j/k`, `g/G`, `n / Esc`, `Esc / ?`) — the test treats those as
+    /// "one of the chars works"; the explicit assertions below cover the
+    /// individual keys.
+    fn single_char_key(label: &str) -> Option<crossterm::event::KeyCode> {
+        use crossterm::event::KeyCode;
+        match label {
+            "⏎" => Some(KeyCode::Enter),
+            "Tab" => Some(KeyCode::Tab),
+            "Esc" => Some(KeyCode::Esc),
+            "d" => Some(KeyCode::Char('d')),
+            "a" => Some(KeyCode::Char('a')),
+            "n" => Some(KeyCode::Char('n')),
+            "h" => Some(KeyCode::Char('h')),
+            "l" => Some(KeyCode::Char('l')),
+            "q" => Some(KeyCode::Char('q')),
+            "y" => Some(KeyCode::Char('y')),
+            "?" => Some(KeyCode::Char('?')),
+            _ => None,
+        }
     }
 }

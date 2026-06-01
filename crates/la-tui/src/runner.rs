@@ -71,6 +71,7 @@ fn event_loop<S: SessionSource>(
     let mut hit = HitBoxes {
         tabs: Vec::new(),
         sidebar: Rect::default(),
+        sidebar_scroll_offset: 0,
         tab_bar_row: 0,
     };
     loop {
@@ -162,7 +163,12 @@ pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
 
     HitBoxes {
         tabs: tab_ranges,
-        sidebar: sidebar_area,
+        // Exclude the border so a click on the title/border row is not
+        // misrouted to row 0 (review feedback from a906b484).
+        sidebar: sidebar_area.inner(Margin { vertical: 1, horizontal: 1 }),
+        // Mirror the post-render scroll offset so mouse routing stays in
+        // sync with what ratatui's List widget actually drew.
+        sidebar_scroll_offset: app.sidebar.scroll_offset(),
         tab_bar_row: tabs_area.y,
     }
 }
@@ -173,7 +179,15 @@ fn render_content_placeholder(
     selection: &Selection,
 ) {
     let body = match selection {
-        Selection::Empty => "No sessions yet — press `n` to create one.".to_string(),
+        Selection::Empty => {
+            // The daemon (M1.7) is the only authority that can create the
+            // first project; until it lands, `n` is a no-op on an empty
+            // workspace (see [`crate::app::App::on_new_session`]). Surface
+            // that so the user is not waiting for a key that does nothing.
+            "No sessions yet.\n\nThe `la` daemon (M1.7) creates projects from your working directory on first attach. \
+Once a project exists, press `n` here to start a session inside it."
+                .to_string()
+        }
         Selection::Group { project_id } => {
             format!("Group: {project_id}\n\nPress ⏎ to fold/expand, j/k to navigate.")
         }

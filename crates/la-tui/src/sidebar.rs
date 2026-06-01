@@ -17,6 +17,8 @@
 //! rebuild the flat list on data refresh (cheap: < 100 items per realistic
 //! workspace) and on fold toggles, but never on cursor moves.
 
+use std::cell::Cell;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -86,6 +88,16 @@ pub struct SidebarState {
     items: Vec<Item>,
     /// Index into `items`; `None` when `items` is empty.
     cursor: Option<usize>,
+    /// First visible row (top-of-viewport) as reported by ratatui's
+    /// `ListState::offset` after the last render. We mirror it here so the
+    /// mouse-click translator can convert a screen-row inside the sidebar
+    /// to the correct absolute index in `items` when the list has scrolled
+    /// (PRD §5.3 keyboard is first-class, but mouse must not mis-target —
+    /// `d` / `a` would otherwise hit the wrong session on long lists).
+    ///
+    /// Wrapped in [`Cell`] so the renderer can write it through a `&self`
+    /// borrow without forcing the whole sidebar widget tree to be `&mut`.
+    scroll_offset: Cell<usize>,
 }
 
 impl SidebarState {
@@ -94,6 +106,7 @@ impl SidebarState {
             groups: Vec::new(),
             items: Vec::new(),
             cursor: None,
+            scroll_offset: Cell::new(0),
         }
     }
 
@@ -139,6 +152,12 @@ impl SidebarState {
 
     pub fn cursor(&self) -> Option<usize> {
         self.cursor
+    }
+
+    /// Last known top-of-viewport row index inside `items`. Returns 0 before
+    /// the first render or whenever the list fits inside its area.
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset.get()
     }
 
     /// Current [`Selection`] for the cursor.
@@ -343,6 +362,10 @@ pub fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &SidebarState, f
 
     let mut list_state = ListState::default();
     list_state.select(state.cursor);
+    // Seed the list state with the previous render's scroll position so
+    // ratatui's auto-scroll picks up where we left off when the cursor
+    // hasn't moved.
+    *list_state.offset_mut() = state.scroll_offset.get();
 
     let highlight_style = Style::default()
         .fg(Color::Black)
@@ -355,6 +378,9 @@ pub fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &SidebarState, f
         .highlight_symbol("▌ ");
 
     frame.render_stateful_widget(list, area, &mut list_state);
+    // Mirror the post-render offset so the mouse hit-tester can compensate
+    // for scrolling on the very next event without an extra render pass.
+    state.scroll_offset.set(list_state.offset());
 }
 
 fn render_item<'a>(state: &'a SidebarState, item: &'a Item) -> ListItem<'a> {
