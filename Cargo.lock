@@ -811,6 +811,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "la-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "la-adapter",
+ "la-ipc",
+ "la-proto",
+ "la-pty",
+ "la-storage",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "la-ipc"
 version = "0.1.0"
 dependencies = [
