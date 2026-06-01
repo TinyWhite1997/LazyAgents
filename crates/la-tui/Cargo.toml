@@ -5,15 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ratatui + crossterm widgets for the LazyAgents client (la). Pure presentation; depends only on la-proto + la-ipc."
+description = "Terminal UI client (`la`) for LazyAgents: ratatui + crossterm Sessions sidebar plus the conversation main area (transcript, composer, detach toast)."
 
 [dependencies]
 # Architecture §2.1: la-tui MUST NOT depend on la-core / la-storage. Only the
 # wire-contract + transport crates are permitted here. A clippy lint enforces
 # this in CI; if a future change needs richer types, route them through
-# la-proto instead. These two crates are declared as anchors for §2.1 even
-# though they are not yet called from this widget-only crate — they become
-# live once la-tui is wired into the `la` binary in M1.5 / M1.7.
+# la-proto instead.
 la-proto = { path = "../la-proto" }
 la-ipc = { path = "../la-ipc" }
 
@@ -21,6 +19,17 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 vte = { workspace = true }
 unicode-width = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[[bin]]
+name = "la"
+path = "src/bin/la.rs"

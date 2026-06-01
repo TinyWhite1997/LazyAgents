@@ -23,5 +23,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --lib --bins -- -D warnings
+      - name: la-storage migration smoke
+        run: cargo test -p la-storage migrations_enable_wal_and_schema_meta
       - name: cargo test
         run: cargo test --workspace --all-targets
