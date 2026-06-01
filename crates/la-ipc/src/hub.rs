@@ -515,6 +515,21 @@ impl Subscription {
         &self.hub
     }
 
+    /// Synchronously park this subscription and consume it. Preferred over
+    /// relying on [`Drop`] when the caller has an `async` context (e.g. the
+    /// daemon's connection reader observing EOF) — it guarantees the parked
+    /// state is visible *before* the caller schedules its eviction timer,
+    /// avoiding a reconnect-vs-park race in which a fast resume() finds the
+    /// entry not-yet-parked, or the timer fires before park lands.
+    ///
+    /// Callers that drop the [`Subscription`] without calling this still get
+    /// best-effort parking via the [`Drop`] impl (a detached `tokio::spawn`),
+    /// which is fine for shutdown paths but introduces nondeterminism into
+    /// any timer-driven eviction logic that runs immediately after.
+    pub async fn park(self) {
+        self.hub.park(self.id).await;
+    }
+
     /// Pull the next event for this subscriber, awaiting until one arrives
     /// or the hub closes the subscription. Returns `None` when the channel
     /// is closed and drained (which happens on hub close, eviction past the
@@ -537,12 +552,13 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        // Park the subscription so a reconnect within the grace window
-        // resumes in place. We can't .await here, so we hand the work to
-        // a detached task. The hub.park call only flips an Instant; the
-        // actual eviction is scheduled by the caller (typically the
-        // daemon's per-attach supervisor), so we don't spawn an eviction
-        // timer from Drop and risk it outliving the runtime.
+        // Best-effort parking for callers that didn't go through the
+        // preferred [`Subscription::park`] async path (e.g. abrupt panic on
+        // the writer task, tests that just `drop()`). The detached spawn
+        // means there is a brief window during which a fast reconnect could
+        // observe `parked.is_none()` and fall through; production paths
+        // should call `.park().await` explicitly when they observe EOF.
+        // Eviction is the caller's responsibility — see `evict_if_still_parked`.
         let hub = self.hub.clone();
         let id = self.id;
         tokio::spawn(async move {
@@ -698,6 +714,32 @@ mod tests {
         }
         assert_eq!(got[0], b"second");
         assert_eq!(got[1], b"third");
+    }
+
+    #[tokio::test]
+    async fn explicit_park_is_visible_synchronously() {
+        // Daemon-shaped pattern: when the connection reader observes EOF,
+        // it should call sub.park().await so the parked state is visible
+        // to a concurrent resume() before the caller arms its eviction
+        // timer. The Drop-only path is best-effort and may race; this is
+        // the deterministic path callers should use.
+        let hub = OutputHub::new("sid");
+        let sub = hub.subscribe(None).await;
+        let id = sub.id();
+        sub.park().await;
+        let parked = hub
+            .inner
+            .state
+            .lock()
+            .await
+            .subs
+            .get(&id)
+            .and_then(|e| e.parked)
+            .is_some();
+        assert!(
+            parked,
+            "park().await must mark the sub as parked before returning"
+        );
     }
 
     #[tokio::test]
