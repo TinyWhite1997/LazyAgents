@@ -1,0 +1,26 @@
+[package]
+name = "la-tui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ratatui + crossterm widgets for the LazyAgents client (la). Pure presentation; depends only on la-proto + la-ipc."
+
+[dependencies]
+# Architecture §2.1: la-tui MUST NOT depend on la-core / la-storage. Only the
+# wire-contract + transport crates are permitted here. A clippy lint enforces
+# this in CI; if a future change needs richer types, route them through
+# la-proto instead.
+la-proto = { path = "../la-proto" }
+la-ipc = { path = "../la-ipc" }
+
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+vte = { workspace = true }
+unicode-width = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
