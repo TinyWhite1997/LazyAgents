@@ -7,8 +7,8 @@
 //! ## Layering
 //!
 //! Per architecture §2.1, `la-tui` MUST stay a pure presentation crate:
-//! - Allowed deps: `la-proto`, `la-ipc`, ratatui/crossterm/vte, plus pure
-//!   helpers (`bytes`, `unicode-width`, `tracing`).
+//! - Allowed deps: `la-proto`, `la-ipc`, ratatui/crossterm/vte, plus the
+//!   pure `unicode-width` helper.
 //! - Forbidden deps: `la-core`, `la-storage`, `la-adapter`, `la-pty`. The
 //!   server-side state and the PTY itself are reached only over RPC.
 //!

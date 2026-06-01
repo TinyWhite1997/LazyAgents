@@ -46,10 +46,6 @@ pub enum ComposerAction {
     Idle,
     /// The buffer or cursor changed; repaint the composer.
     Repaint,
-    /// Reserved for a future `on_key`-style helper that batches submit;
-    /// not currently produced by any method here but kept so the variant
-    /// name reads naturally from a host's match arm.
-    Send { text: String },
 }
 
 const DEFAULT_HISTORY: usize = 200;
@@ -356,9 +352,23 @@ impl<'a> Widget for ComposerView<'a> {
         }
 
         let (cur_row, mut cur_col) = self.composer.cursor();
-        let mut visible: Vec<Line> = Vec::with_capacity(self.composer.lines.len());
-        for (row, line) in self.composer.lines.iter().enumerate() {
-            if row != cur_row {
+        let total_rows = self.composer.lines.len();
+        let view_height = inner.height as usize;
+        // Vertical scroll: keep the cursor row in view by sliding the
+        // window down only as far as needed. Without this slice ratatui's
+        // Paragraph renders from the top and silently drops trailing rows,
+        // so a 5-line prompt in a 3-row composer would hide the line the
+        // user is actively typing on.
+        let top = if cur_row >= view_height {
+            cur_row + 1 - view_height
+        } else {
+            0
+        };
+        let end = total_rows.min(top + view_height);
+        let mut visible: Vec<Line> = Vec::with_capacity(end - top);
+        for (row, line) in self.composer.lines[top..end].iter().enumerate() {
+            let abs_row = top + row;
+            if abs_row != cur_row {
                 visible.push(Line::from(line.as_str()));
                 continue;
             }
@@ -534,5 +544,59 @@ mod tests {
         let area = Rect::new(0, 0, 8, 1);
         let mut buf = Buffer::empty(area);
         ComposerView::new(&c).render(area, &mut buf);
+    }
+
+    #[test]
+    fn render_scrolls_to_keep_cursor_visible_when_overflowing() {
+        // 5 logical lines into a 3-row composer: the cursor row (4) would
+        // be hidden if we naively drew from the top. The view must slide
+        // down so the cursor line lands inside the rendered area.
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        let mut c = Composer::new(10);
+        for ch in "L0".chars() {
+            c.insert_char(ch);
+        }
+        c.insert_newline();
+        for ch in "L1".chars() {
+            c.insert_char(ch);
+        }
+        c.insert_newline();
+        for ch in "L2".chars() {
+            c.insert_char(ch);
+        }
+        c.insert_newline();
+        for ch in "L3".chars() {
+            c.insert_char(ch);
+        }
+        c.insert_newline();
+        for ch in "L4".chars() {
+            c.insert_char(ch);
+        }
+        assert_eq!(c.cursor(), (4, 2));
+        let area = Rect::new(0, 0, 8, 3);
+        let mut buf = Buffer::empty(area);
+        ComposerView::new(&c).render(area, &mut buf);
+        // Bottom row must hold the cursor's current line ("L4").
+        let bottom: String = (0..area.width)
+            .map(|x| {
+                buf[(x, area.height - 1)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect();
+        assert!(
+            bottom.starts_with("L4"),
+            "cursor line should be visible in the composer, got bottom={bottom:?}"
+        );
+        // Top row should NOT be "L0" — the window slid down.
+        let top: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            !top.starts_with("L0"),
+            "viewport should have slid past L0, got top={top:?}"
+        );
     }
 }

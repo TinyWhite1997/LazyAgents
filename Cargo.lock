@@ -438,13 +438,11 @@ dependencies = [
 name = "la-tui"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "crossterm",
  "la-ipc",
  "la-proto",
  "ratatui",
  "tokio",
- "tracing",
  "unicode-width 0.2.0",
  "vte",
 ]

@@ -11,7 +11,9 @@ description = "ratatui + crossterm widgets for the LazyAgents client (la). Pure 
 # Architecture §2.1: la-tui MUST NOT depend on la-core / la-storage. Only the
 # wire-contract + transport crates are permitted here. A clippy lint enforces
 # this in CI; if a future change needs richer types, route them through
-# la-proto instead.
+# la-proto instead. These two crates are declared as anchors for §2.1 even
+# though they are not yet called from this widget-only crate — they become
+# live once la-tui is wired into the `la` binary in M1.5 / M1.7.
 la-proto = { path = "../la-proto" }
 la-ipc = { path = "../la-ipc" }
 
@@ -19,8 +21,6 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 vte = { workspace = true }
 unicode-width = { workspace = true }
-bytes = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

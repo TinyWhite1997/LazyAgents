@@ -30,6 +30,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph, Widget},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::vte_term::{TerminalLine, TerminalScreen};
 
@@ -214,15 +215,27 @@ impl Transcript {
         }
     }
 
-    /// Project the current state into ratatui [`Line`]s for rendering.
-    /// The renderer slices `[view_top .. view_top + viewport_height]`.
-    pub fn render_lines<'a>(&'a self) -> Vec<Line<'a>> {
-        let mut out: Vec<Line<'a>> = Vec::with_capacity(self.lines.len() + 1);
-        for line in &self.lines {
-            out.push(to_ratatui_line(line));
+    /// Project the visible window `[top .. top + height]` into ratatui
+    /// [`Line`]s. Only lines that fall inside the viewport are converted —
+    /// for a 10k-line scrollback rendered into a 40-row pane this means
+    /// touching 40 lines per frame instead of 10_000, which is the per-frame
+    /// cost the PRD §5.3 "long-output scrolling" bar implicitly assumes.
+    pub fn render_visible_lines<'a>(&'a self, top: usize, height: usize) -> Vec<Line<'a>> {
+        let total = self.renderable_len();
+        if height == 0 || top >= total {
+            return Vec::new();
         }
-        if !self.pending.is_empty() {
-            out.push(to_ratatui_line(&self.pending));
+        let end = top.saturating_add(height).min(total);
+        let committed_len = self.lines.len();
+        let mut out: Vec<Line<'a>> = Vec::with_capacity(end - top);
+        for idx in top..end {
+            if idx < committed_len {
+                out.push(to_ratatui_line(&self.lines[idx]));
+            } else {
+                // Past the committed slice: must be the pending tail (we
+                // only counted it in `total` when non-empty).
+                out.push(to_ratatui_line(&self.pending));
+            }
         }
         out
     }
@@ -297,9 +310,9 @@ impl<'a> Widget for TranscriptView<'a> {
             return;
         }
         self.transcript.clamp_for_viewport(inner.height as usize);
-        let all_lines = self.transcript.render_lines();
         let top = self.transcript.view_top();
         let h = inner.height as usize;
+        let total = self.transcript.renderable_len();
         // Slice in logical-line units. We deliberately do NOT enable
         // `Paragraph::wrap` here: Paragraph's `.scroll` and the wrap
         // policy count *visual rows*, while `view_top` / `max_top` count
@@ -308,28 +321,40 @@ impl<'a> Widget for TranscriptView<'a> {
         // the user would see a short window with a partial tail. Long
         // lines are truncated at the right edge, which matches what
         // every other terminal-style log viewer (less, lazygit, k9s) does.
-        let end = (top + h).min(all_lines.len());
-        let visible: Vec<Line> = if top >= all_lines.len() {
-            Vec::new()
-        } else {
-            all_lines[top..end].to_vec()
-        };
+        let visible = self.transcript.render_visible_lines(top, h);
+        let end = top + visible.len();
         Paragraph::new(visible).style(self.style).render(inner, buf);
 
         // "follow off" affordance: paint a dim hint inside the bottom row
         // when there is more content below the visible window. Done as a
         // direct cell write so it does not lie about the row count or
         // perturb the slice math above.
-        if !self.transcript.is_following() && end < all_lines.len() && inner.height > 0 {
+        if !self.transcript.is_following() && end < total && inner.height > 0 {
             let hint = "── more below (G/End to follow) ──";
             let row = inner.bottom().saturating_sub(1);
             let start_x = inner.x
                 + inner
                     .width
-                    .saturating_sub(hint.chars().count() as u16)
+                    .saturating_sub(UnicodeWidthStr::width(hint) as u16)
                     .saturating_sub(1);
             let dim = Style::default().fg(Color::DarkGray);
             buf.set_string(start_x.max(inner.x), row, hint, dim);
+        }
+
+        // Architecture §6 / PRD §5.3: scrollback can be lossy at the cap.
+        // Surface that explicitly at the top of the viewport when the user
+        // is parked at the oldest retained line — otherwise the "…N lines
+        // dropped" promise in the module docstring would be a lie.
+        let dropped = self.transcript.dropped();
+        if dropped > 0 && top == 0 && inner.height > 0 {
+            let hint = format!("── 起始前已丢弃 {dropped} 行 ──");
+            let dim = Style::default().fg(Color::DarkGray);
+            // CJK chars in the hint are 2 cells wide each; use display
+            // width so the right-anchored placement does not overflow the
+            // pane and overwrite content on the next row.
+            let hint_width = UnicodeWidthStr::width(hint.as_str()) as u16;
+            let start_x = inner.x + inner.width.saturating_sub(hint_width);
+            buf.set_string(start_x.max(inner.x), inner.y, &hint, dim);
         }
     }
 }
@@ -518,6 +543,84 @@ mod tests {
         assert!(
             row_str.starts_with("xxxx"),
             "expected the tail line to occupy the bottom row, got {row_str:?}"
+        );
+    }
+
+    #[test]
+    fn render_visible_lines_only_touches_the_window() {
+        // Regression for "TranscriptView::render walks the whole scrollback
+        // every frame". With 10k lines committed and a 40-row viewport we
+        // expect exactly 40 ratatui Lines to come back, regardless of how
+        // many lines are off-screen.
+        let mut t = Transcript::new(10_000);
+        for i in 0..10_000 {
+            t.feed(format!("L{i}\n").as_bytes());
+        }
+        t.clamp_for_viewport(40);
+        let top = t.view_top();
+        let lines = t.render_visible_lines(top, 40);
+        assert_eq!(lines.len(), 40);
+        assert_eq!(t.renderable_len(), 10_000);
+        assert_eq!(top, 10_000 - 40);
+
+        // A window completely past the end yields nothing instead of
+        // panicking — important because callers feed `view_top` after a
+        // resize that could shrink the buffer.
+        assert!(t.render_visible_lines(20_000, 10).is_empty());
+        // Zero-height window is a no-op.
+        assert!(t.render_visible_lines(0, 0).is_empty());
+    }
+
+    #[test]
+    fn render_visible_includes_pending_tail_when_in_window() {
+        let mut t = Transcript::new(100);
+        // 3 committed + 1 pending.
+        t.feed(b"a\nb\nc\npending");
+        assert_eq!(t.renderable_len(), 4);
+        let lines = t.render_visible_lines(0, 4);
+        assert_eq!(lines.len(), 4);
+        let plain: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(plain[3], "pending");
+    }
+
+    #[test]
+    fn dropped_hint_renders_at_top_when_scrolled_to_oldest() {
+        let mut t = Transcript::new(3);
+        for i in 0..10 {
+            t.feed(format!("L{i}\n").as_bytes());
+        }
+        assert_eq!(t.dropped(), 7);
+        t.scroll(ScrollAction::Top, 3);
+        assert_eq!(t.view_top(), 0);
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buf = Buffer::empty(area);
+        TranscriptView::new(&mut t).render(area, &mut buf);
+        // ratatui's set_string advances by the grapheme's display width
+        // and leaves the wide-char continuation cell at its default
+        // symbol — collecting raw cell symbols therefore yields the hint
+        // interleaved with blanks. Asserting each cell that should carry
+        // a glyph is present is enough to catch a missing hint.
+        let painted: Vec<String> = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        for needle in ['丢', '弃', '行'] {
+            assert!(
+                painted.iter().any(|s| s == &needle.to_string()),
+                "expected '{needle}' from dropped-lines hint, painted={painted:?}"
+            );
+        }
+        // The count must be in there too.
+        assert!(
+            painted.iter().any(|s| s == "7"),
+            "expected dropped count, painted={painted:?}"
         );
     }
 }
