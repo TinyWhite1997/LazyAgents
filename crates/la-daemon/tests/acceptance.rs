@@ -302,6 +302,52 @@ async fn shutdown_signals_live_sessions_within_deadline() {
     );
 }
 
+/// §6.4 hard-cap regression: a child that *ignores* SIGTERM still has
+/// to be cleaned up via SIGKILL within the documented 10 s ceiling.
+///
+/// Without the single-deadline fix (PR review feedback) this test would
+/// fail because the daemon ran two sequential 10 s windows — one for
+/// connection drain, one for session drain — so the SIGKILL escalation
+/// landed at ~20 s instead of within the §6.4 budget.
+#[tokio::test]
+async fn shutdown_kills_term_ignoring_child_within_hard_cap() {
+    let project = tempfile::tempdir().expect("project tmp");
+    // `trap '' TERM` permanently ignores SIGTERM; only SIGKILL stops it.
+    // Sleep long enough that there is no race with natural exit.
+    let daemon = bootstrap_daemon("trap '' TERM; sleep 120").await;
+    let mut conn = client(&daemon.socket).await;
+
+    let create_params = SessionsCreateParams {
+        project_dir: project.path().to_string_lossy().to_string(),
+        backend: "shtest".to_string(),
+        args: vec![],
+        prompt: None,
+        worktree: false,
+    };
+    send_request(&mut conn, 1, "sessions.create", &create_params).await;
+    let result: SessionsCreateResult =
+        serde_json::from_value(recv_response_for(&mut conn, 1).await).expect("decode");
+    let _ = result.session_id;
+
+    // Give the child a beat to install the signal mask before we ask
+    // the daemon to shut down — otherwise we might race and SIGTERM the
+    // shell before `trap` finishes parsing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = std::time::Instant::now();
+    daemon.handle.shutdown();
+    let joined = timeout(Duration::from_secs(11), daemon.join).await;
+    let elapsed = started.elapsed();
+    assert!(
+        joined.is_ok(),
+        "daemon shutdown didn't finish within §6.4's 10s+epsilon (elapsed {elapsed:?})"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(11),
+        "SIGKILL escalation must happen inside the 10s ceiling, took {elapsed:?}"
+    );
+}
+
 /// `lad daemonize` end-to-end: spawn the actual binary, confirm the
 /// socket appears, then send SIGTERM and confirm cleanup.
 ///

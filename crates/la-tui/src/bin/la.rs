@@ -21,6 +21,7 @@ use la_ipc::transport::{connect, Endpoint};
 use la_ipc::SocketDiscovery;
 use la_tui::status::Status;
 use la_tui::{App, AppMsg, MockSessionSource};
+use tokio::runtime::Runtime;
 
 const AUTO_DAEMON_ENV: &str = "LAZYAGENTS_NO_AUTODAEMON";
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,7 +91,25 @@ impl BootstrapOutcome {
 }
 
 fn bootstrap_daemon(socket: &Path) -> BootstrapOutcome {
-    if probe_socket(socket) {
+    // Build the tokio runtime once for the whole bootstrap so the
+    // `wait_for_socket` polling loop reuses one reactor instead of
+    // spinning a fresh `new_current_thread` runtime every 50 ms (which
+    // is wasteful and adds log noise on the spawn path).
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => {
+            return BootstrapOutcome {
+                connected: false,
+                note: BootstrapNote::SpawnFailed("tokio runtime build failed".to_string()),
+            }
+        }
+    };
+
+    if probe_socket(&rt, socket) {
         return BootstrapOutcome {
             connected: true,
             note: BootstrapNote::AlreadyUp,
@@ -117,7 +136,7 @@ fn bootstrap_daemon(socket: &Path) -> BootstrapOutcome {
             }
         }
     }
-    if wait_for_socket(socket, SPAWN_READY_TIMEOUT) {
+    if wait_for_socket(&rt, socket, SPAWN_READY_TIMEOUT) {
         BootstrapOutcome {
             connected: true,
             note: BootstrapNote::Spawned,
@@ -133,16 +152,8 @@ fn bootstrap_daemon(socket: &Path) -> BootstrapOutcome {
     }
 }
 
-fn probe_socket(socket: &Path) -> bool {
+fn probe_socket(rt: &Runtime, socket: &Path) -> bool {
     let endpoint = endpoint_for(socket);
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(_) => return false,
-    };
     rt.block_on(async move {
         tokio::time::timeout(Duration::from_millis(250), connect(&endpoint))
             .await
@@ -151,10 +162,10 @@ fn probe_socket(socket: &Path) -> bool {
     })
 }
 
-fn wait_for_socket(socket: &Path, timeout: Duration) -> bool {
+fn wait_for_socket(rt: &Runtime, socket: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if probe_socket(socket) {
+        if probe_socket(rt, socket) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));

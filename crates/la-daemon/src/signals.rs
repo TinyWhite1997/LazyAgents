@@ -13,7 +13,6 @@
 
 use std::time::Duration;
 
-use tokio::signal::ctrl_c;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -57,12 +56,6 @@ pub async fn shutdown_token() {
     }
     #[cfg(not(unix))]
     {
-        let _ = ctrl_c().await;
-    }
-    // Make `ctrl_c` visible to non-unix builds too — avoids an unused
-    // import warning under cfg(unix).
-    #[cfg(unix)]
-    {
-        let _ = ctrl_c;
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

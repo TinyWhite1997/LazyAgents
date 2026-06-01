@@ -108,8 +108,17 @@ impl Daemon {
 
         // Refresh the backends table from the live adapter set so
         // `sessions.list` joins still resolve even on a fresh install.
+        // The registry key is what the wire surface uses (clients pass it
+        // as `SessionsCreateParams.backend`); we assert it matches the
+        // adapter's own declared id to catch mis-registration early.
         for (id, adapter) in &adapters {
             let desc = adapter.descriptor();
+            debug_assert_eq!(
+                id.as_str(),
+                desc.id,
+                "adapter registered as {id:?} declares descriptor id {:?}",
+                desc.id
+            );
             storage
                 .backends()
                 .upsert(la_storage::BackendUpsert {
@@ -119,7 +128,6 @@ impl Daemon {
                     available: true,
                 })
                 .await?;
-            let _ = desc.id; // silence unused warning until probe wiring lands
         }
 
         let manager = SessionManager::new(storage.clone(), manager_config);
@@ -228,23 +236,35 @@ impl Daemon {
             }
         }
 
-        // Bounded join: every connection task has its own timeout for the
-        // writer to drain; we additionally cap the whole shutdown at
-        // `shutdown_deadline`.
-        let drain_deadline = tokio::time::Instant::now() + shutdown_deadline;
-        loop {
-            if conns.is_empty() {
-                break;
-            }
-            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
+        // §6.4: "整个序列在 daemon 关闭时对所有 session 并发执行，硬超时
+        // 10 s". `hard_deadline` is the single ceiling that every drain
+        // phase below honours; the per-phase budgets are carved out of it
+        // so connection drain + SIGTERM grace + SIGKILL all complete
+        // before it expires.
+        //
+        // Phase budget inside `shutdown_deadline`:
+        //   - first half  → connection drain (writer flush, sub teardown)
+        //   - second half → SIGTERM grace before escalating to SIGKILL
+        // The numbers are advisory; the only invariant the contract cares
+        // about is that the SIGKILL path runs strictly before
+        // `hard_deadline`.
+        let hard_deadline = tokio::time::Instant::now() + shutdown_deadline;
+        let term_grace_deadline = tokio::time::Instant::now() + shutdown_deadline / 2;
+
+        // Drain in-flight connection tasks until either they all finish
+        // or we hit the SIGTERM-grace milestone — leaving the rest of
+        // the budget for the kill escalation below.
+        while !conns.is_empty() {
+            let now = tokio::time::Instant::now();
+            if now >= term_grace_deadline {
                 tracing::warn!(
                     pending = conns.len(),
-                    "graceful shutdown deadline expired — aborting remaining connections"
+                    "connection drain budget exhausted — aborting remaining connections"
                 );
                 conns.abort_all();
                 break;
             }
+            let remaining = term_grace_deadline.saturating_duration_since(now);
             match tokio::time::timeout(remaining, conns.join_next()).await {
                 Ok(Some(_)) => continue,
                 Ok(None) => break,
@@ -252,23 +272,36 @@ impl Daemon {
             }
         }
 
-        // Wait for any live sessions to actually exit (their state pump
-        // will close the storage row and drop the registry entry).
-        let session_drain_deadline = tokio::time::Instant::now() + shutdown_deadline;
+        // Wait for live sessions to actually exit (their state pump
+        // closes the storage row and drops the registry entry on its
+        // own when the child exits). If anything is still around at
+        // `hard_deadline - epsilon`, escalate to SIGKILL so the
+        // §6.4 10 s ceiling is observed.
+        const KILL_LANDING_TICK: Duration = Duration::from_millis(200);
+        let kill_by = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let kill_escalation_at =
+            tokio::time::Instant::now() + kill_by.saturating_sub(KILL_LANDING_TICK);
         while manager.active_count().await > 0 {
-            if tokio::time::Instant::now() >= session_drain_deadline {
+            let now = tokio::time::Instant::now();
+            if now >= kill_escalation_at {
                 let remaining = manager.active_ids().await;
                 tracing::warn!(
                     pending = remaining.len(),
-                    "session drain deadline expired; sending SIGKILL"
+                    "graceful deadline elapsed; escalating to SIGKILL"
                 );
                 for id in remaining {
                     let _ = manager
                         .signal(&id, la_proto::methods::SessionSignal::Kill)
                         .await;
                 }
-                // Give the kill a brief tick to land before final close.
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Brief tick so the kill can land + the pump can persist
+                // the exited row — bounded by `hard_deadline`.
+                let landing = hard_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(KILL_LANDING_TICK);
+                if !landing.is_zero() {
+                    tokio::time::sleep(landing).await;
+                }
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
