@@ -20,11 +20,16 @@ pub mod codec;
 pub mod connection;
 pub mod handshake;
 pub mod hub;
+pub mod paths;
 pub mod transport;
 
 pub use connection::{Connection, RecvHalf, SendHalf};
 pub use handshake::{client_handshake, server_handshake, HandshakeError, ServerInfo};
 pub use hub::{HubConfig, HubEvent, OutputHub, SubId, Subscription};
+pub use paths::{
+    default_runtime_dir, default_socket_path, ensure_runtime_dir, socket_file_name,
+    SocketDiscovery, SocketLocation,
+};
 
 /// Maximum size of a single framed message (decoded JSON bytes), in bytes.
 ///
