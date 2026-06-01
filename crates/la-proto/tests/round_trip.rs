@@ -23,13 +23,13 @@ use la_proto::methods::{
     EventTopic, EventsSubscribe, EventsSubscribeParams, EventsSubscribeResult, ImportedSession,
     Initialize, InitializeParams, InitializeResult, Method, PtySize, ServerCapabilities,
     SessionSignal, SessionState, SessionSummary, SessionsArchive, SessionsArchiveParams,
-    SessionsAttach, SessionsAttachParams, SessionsCreate, SessionsCreateParams,
-    SessionsCreateResult, SessionsDelete, SessionsDeleteParams, SessionsDetach,
-    SessionsDetachParams, SessionsImport, SessionsImportParams, SessionsImportResult, SessionsList,
-    SessionsListParams, SessionsListResult, SessionsReplay, SessionsReplayParams,
-    SessionsReplayResult, SessionsResize, SessionsResizeParams, SessionsSignal,
-    SessionsSignalParams, SessionsWrite, SessionsWriteParams, SessionsWriteResult, Shutdown,
-    ShutdownParams, ShutdownResult,
+    SessionsAttach, SessionsAttachParams, SessionsAttachResult, SessionsCreate,
+    SessionsCreateParams, SessionsCreateResult, SessionsDelete, SessionsDeleteParams,
+    SessionsDetach, SessionsDetachParams, SessionsImport, SessionsImportParams,
+    SessionsImportResult, SessionsList, SessionsListParams, SessionsListResult, SessionsReplay,
+    SessionsReplayParams, SessionsReplayResult, SessionsResize, SessionsResizeParams,
+    SessionsSignal, SessionsSignalParams, SessionsWrite, SessionsWriteParams, SessionsWriteResult,
+    Shutdown, ShutdownParams, ShutdownResult,
 };
 use la_proto::notifications::{
     CronFired, CronFiredParams, DaemonHealth, DaemonHealthParams, NotificationMethod, SessionGap,
@@ -208,6 +208,7 @@ fn sessions_create_round_trip() {
 fn sessions_attach_round_trip() {
     let params = SessionsAttachParams {
         session_id: "abc".into(),
+        resume_from_seq: Some(42),
         replay_bytes: Some(4096),
         acquire_input: true,
     };
@@ -215,6 +216,79 @@ fn sessions_attach_round_trip() {
     let back: SessionsAttachParams = serde_json::from_str(&s).unwrap();
     assert_eq!(back, params);
     assert_eq!(SessionsAttach::NAME, "sessions.attach");
+}
+
+/// `resume_from_seq` is serde-optional (skip_serializing_if). A first-attach
+/// request omits it entirely, and an old client that never knew about it
+/// still decodes (back-compat for any in-the-wild serializers).
+#[test]
+fn sessions_attach_resume_from_seq_is_optional_on_wire() {
+    // Fresh attach: no resume token, no replay window.
+    let fresh = SessionsAttachParams {
+        session_id: "abc".into(),
+        resume_from_seq: None,
+        replay_bytes: None,
+        acquire_input: false,
+    };
+    let s = serde_json::to_string(&fresh).unwrap();
+    assert!(
+        !s.contains("resume_from_seq"),
+        "fresh attach must not put resume_from_seq on the wire ({s})"
+    );
+    assert!(
+        !s.contains("replay_bytes"),
+        "fresh attach must not put replay_bytes on the wire ({s})"
+    );
+
+    // Legacy client that only sends {session_id, acquire_input} still parses.
+    let legacy_json = r#"{"session_id":"abc","acquire_input":false}"#;
+    let back: SessionsAttachParams = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(back.resume_from_seq, None);
+    assert_eq!(back.replay_bytes, None);
+
+    // Reconnect: only resume_from_seq is set.
+    let resume = SessionsAttachParams {
+        session_id: "abc".into(),
+        resume_from_seq: Some(99),
+        replay_bytes: None,
+        acquire_input: false,
+    };
+    let v: serde_json::Value = serde_json::to_value(&resume).unwrap();
+    assert_eq!(v["resume_from_seq"], json!(99));
+    assert!(v.get("replay_bytes").is_none());
+}
+
+#[test]
+fn sessions_attach_result_sub_token_is_optional_on_wire() {
+    // Default-shaped result: no sub_token, no wire bytes for it.
+    let no_token = SessionsAttachResult {
+        session_id: "abc".into(),
+        snapshot_seq: 7,
+        input_acquired: true,
+        sub_token: None,
+    };
+    let s = serde_json::to_string(&no_token).unwrap();
+    assert!(
+        !s.contains("sub_token"),
+        "absent sub_token must not appear on the wire ({s})"
+    );
+
+    // Legacy result without sub_token still parses (forward-compat for the
+    // M1.x daemon, which won't emit it yet).
+    let legacy_json = r#"{"session_id":"abc","snapshot_seq":7,"input_acquired":true}"#;
+    let back: SessionsAttachResult = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(back, no_token);
+
+    // Round-trip with token populated (future M1.7+ daemon).
+    let with_token = SessionsAttachResult {
+        session_id: "abc".into(),
+        snapshot_seq: 7,
+        input_acquired: true,
+        sub_token: Some("opaque-token-bytes".into()),
+    };
+    let s = serde_json::to_string(&with_token).unwrap();
+    let back: SessionsAttachResult = serde_json::from_str(&s).unwrap();
+    assert_eq!(back, with_token);
 }
 
 #[test]

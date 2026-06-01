@@ -32,10 +32,11 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 /// Spawn a mock daemon backed by an `OutputHub`. The daemon answers
-/// `sessions.attach` (with an optional resume id smuggled in via the
-/// `replay_bytes` field — see comment at first use) and then drives the
-/// connection's writer task. Returns the publisher handle, the temp dir
-/// (to keep the socket alive), and the listener task.
+/// `sessions.attach` (using the wire-level `resume_from_seq` field to
+/// rebind a parked subscription, matching the real daemon's behaviour
+/// after WEK-49) and then drives the connection's writer task. Returns
+/// the publisher handle, the temp dir (to keep the socket alive), and
+/// the listener task.
 async fn spawn_hub_daemon(
     hub: OutputHub,
     park_after_drop: Arc<Mutex<Option<SubId>>>,
@@ -82,16 +83,14 @@ async fn handle_one_conn(
     .await
     .expect("server handshake");
 
-    // Expect exactly one sessions.attach. We piggyback "resume an existing
-    // SubId" by checking `park_after_drop` first: if it is set we resume,
-    // otherwise we subscribe fresh. This sidesteps the wire-schema change
-    // that would otherwise be required to ship an opaque resumption token
-    // in M1.2 (la-proto golden tests pin the schema).
+    // Expect exactly one sessions.attach. The wire-level `resume_from_seq`
+    // (WEK-49) carries the "since seq" for reconnects; first attaches pass
+    // `None` and we replay everything still in the ring.
     let msg = conn.recv().await.expect("io").expect("eof on attach");
     let Message::Request(req) = msg else { panic!() };
     assert_eq!(req.method, SessionsAttach::NAME);
     let p: SessionsAttachParams = req.params_as().expect("attach params");
-    let since = p.replay_bytes; // overloaded for the test: "since seq"
+    let since = p.resume_from_seq;
 
     let parked_id = park_after_drop.lock().await.take();
     let subscription = if let Some(id) = parked_id {
@@ -110,6 +109,7 @@ async fn handle_one_conn(
             session_id: hub.session_id().into(),
             snapshot_seq: since.unwrap_or(0),
             input_acquired: p.acquire_input,
+            sub_token: None,
         },
     )
     .expect("encode");
@@ -179,6 +179,7 @@ async fn kill_and_reconnect_within_grace_loses_no_bytes() {
         SessionsAttach::NAME,
         SessionsAttachParams {
             session_id: "sid".into(),
+            resume_from_seq: None,
             replay_bytes: None,
             acquire_input: false,
         },
@@ -228,14 +229,15 @@ async fn kill_and_reconnect_within_grace_loses_no_bytes() {
     let _ = client_handshake(&mut conn, "la", "0.4.1", &[PROTOCOL_VERSION])
         .await
         .unwrap();
-    // Pass last_seq as replay_bytes (test-only overload for "since seq",
-    // see daemon handler).
+    // Pass last_seq as resume_from_seq — the canonical reconnect path
+    // (WEK-49) replacing the M1.2-era replay_bytes overload.
     let req = Request::new(
         3,
         SessionsAttach::NAME,
         SessionsAttachParams {
             session_id: "sid".into(),
-            replay_bytes: Some(last_seq),
+            resume_from_seq: Some(last_seq),
+            replay_bytes: None,
             acquire_input: false,
         },
     )
@@ -304,6 +306,7 @@ async fn slow_client_gap_does_not_affect_fast_client() {
             SessionsAttach::NAME,
             SessionsAttachParams {
                 session_id: "sid".into(),
+                resume_from_seq: None,
                 replay_bytes: None,
                 acquire_input: false,
             },
@@ -354,6 +357,7 @@ async fn slow_client_gap_does_not_affect_fast_client() {
             SessionsAttach::NAME,
             SessionsAttachParams {
                 session_id: "sid".into(),
+                resume_from_seq: None,
                 replay_bytes: None,
                 acquire_input: false,
             },
@@ -461,6 +465,7 @@ async fn no_reconnect_within_grace_evicts_subscription() {
             SessionsAttach::NAME,
             SessionsAttachParams {
                 session_id: "sid".into(),
+                resume_from_seq: None,
                 replay_bytes: None,
                 acquire_input: false,
             },

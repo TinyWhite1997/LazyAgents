@@ -101,6 +101,7 @@ async fn spawn_mock_daemon(
                 session_id: session_id.clone(),
                 snapshot_seq: 0,
                 input_acquired: p.acquire_input,
+                sub_token: None,
             },
         )
         .expect("encode");
@@ -201,6 +202,7 @@ async fn five_methods_round_trip_over_uds() {
         SessionsAttach::NAME,
         SessionsAttachParams {
             session_id: session_id.clone(),
+            resume_from_seq: None,
             replay_bytes: Some(0),
             acquire_input: true,
         },

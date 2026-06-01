@@ -275,8 +275,24 @@ pub enum SessionsAttach {}
 #[schemars(rename = "SessionsAttachParams")]
 pub struct SessionsAttachParams {
     pub session_id: String,
+    /// Resume from this `seq` (inclusive lower bound for catch-up replay).
+    /// `None` on first attach ⇒ daemon replays everything still in the ring.
+    /// `Some(prev_seq)` after a reconnect ⇒ daemon replays only the gap.
+    /// This is the architecture §3 "重连一次 RPC 即可" path: a reconnecting
+    /// client carries its last observed `seq` and gets a single `attach` that
+    /// both resubscribes and catches up, with no follow-up `sessions.replay`
+    /// required as long as the bytes are still in the ring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from_seq: Option<u64>,
     /// Replay window: the daemon should resend at most this many bytes from
     /// its ring buffer before live streaming. `None` ⇒ daemon default.
+    ///
+    /// **Deprecated** (kept for wire-schema back-compat only). The daemon
+    /// no longer honours this field; reconnecting clients should pass
+    /// `resume_from_seq` instead, which expresses the same intent more
+    /// precisely (a `seq` boundary, not a byte count). New code should
+    /// omit this field. Will be removed in a future minor version once
+    /// no in-the-wild client serialises it. See WEK-49.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_bytes: Option<u64>,
     /// Request input ownership. Only one writer per session at a time
@@ -295,6 +311,13 @@ pub struct SessionsAttachResult {
     /// Whether this client acquired input ownership (might differ from
     /// `acquire_input` if another client is already the writer).
     pub input_acquired: bool,
+    /// Opaque resume token. Reserved for future use: the daemon MAY return
+    /// a token here that a reconnecting client passes back so the daemon
+    /// can rebind to the same parked subscription instead of issuing a
+    /// fresh one. M1.x does not require the daemon to emit this — the wire
+    /// layer is prepared so M1.7+ can opt in without another schema bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_token: Option<String>,
 }
 
 impl Method for SessionsAttach {

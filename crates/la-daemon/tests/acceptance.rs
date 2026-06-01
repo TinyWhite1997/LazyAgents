@@ -30,6 +30,7 @@ use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
 use la_proto::methods::{
     SessionsAttachParams, SessionsAttachResult, SessionsCreateParams, SessionsCreateResult,
+    SessionsDetachParams, SessionsDetachResult,
 };
 use la_proto::notifications::SessionOutputParams;
 use tempfile::TempDir;
@@ -188,6 +189,7 @@ async fn end_to_end_create_and_attach() {
     // sessions.attach
     let attach_params = SessionsAttachParams {
         session_id: session_id.clone(),
+        resume_from_seq: None,
         replay_bytes: None,
         acquire_input: false,
     };
@@ -410,4 +412,195 @@ fn lad_daemonize_binary_smoke() {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("socket still present 15s after SIGTERM");
+}
+
+/// WEK-49 acceptance: a reconnecting client passes `resume_from_seq` and
+/// gets a single `sessions.attach` RPC that both resubscribes and catches
+/// up — no follow-up `sessions.replay` required. This is the regression
+/// the M1.9 review (Blocker 1) called out: previously the daemon ignored
+/// the resume hint (`manager.attach(&id, None, ...)`) so a fresh attach
+/// returned all ring chunks again, double-delivering everything the
+/// client had already seen.
+///
+/// Walk:
+///   1. Start session that streams a deterministic, line-numbered output.
+///   2. Attach with `resume_from_seq=None`; drain N frames; remember
+///      `last_seq` and the bytes seen.
+///   3. Detach. Bytes keep accumulating in the hub's ring.
+///   4. Reattach on a brand-new connection with
+///      `resume_from_seq=Some(last_seq)`.
+///   5. Drain catch-up frames. Assert:
+///      - every `seq` is strictly greater than `last_seq`,
+///      - `seq` values are contiguous (no gap),
+///      - no `session.gap` notification arrives,
+///      - the catch-up bytes pick up where the first attach left off.
+#[tokio::test]
+async fn reattach_with_resume_from_seq_catches_up_without_double_delivery() {
+    let project = tempfile::tempdir().expect("project tmp");
+    // Each line is short enough that one `printf` ≈ one chunk; the
+    // 0.05 s spacing keeps the test under a few seconds while still
+    // giving the daemon time to push between us draining and reattaching.
+    // 30 lines is large enough that we will detach midstream and still
+    // have meaningful catch-up work to do on reattach.
+    let script = "for i in $(seq 1 30); do printf 'line-%02d\\n' $i; sleep 0.05; done";
+    let daemon = bootstrap_daemon(script).await;
+    let mut conn = client(&daemon.socket).await;
+
+    // sessions.create
+    let create_params = SessionsCreateParams {
+        project_dir: project.path().to_string_lossy().to_string(),
+        backend: "shtest".to_string(),
+        args: vec![],
+        prompt: None,
+        worktree: false,
+    };
+    send_request(&mut conn, 1, "sessions.create", &create_params).await;
+    let result: SessionsCreateResult =
+        serde_json::from_value(recv_response_for(&mut conn, 1).await).expect("decode create");
+    let session_id = result.session_id;
+
+    // First attach: no resume token, take whatever the daemon has so far.
+    let attach_params = SessionsAttachParams {
+        session_id: session_id.clone(),
+        resume_from_seq: None,
+        replay_bytes: None,
+        acquire_input: false,
+    };
+    send_request(&mut conn, 2, "sessions.attach", &attach_params).await;
+    let _attach: SessionsAttachResult =
+        serde_json::from_value(recv_response_for(&mut conn, 2).await).expect("decode attach");
+
+    // Drain until we've seen the marker for line 5; remember the last seq.
+    let mut first_bytes = Vec::<u8>::new();
+    let mut first_seqs = Vec::<u64>::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !contains(&first_bytes, b"line-05") {
+        let msg = match tokio::time::timeout(Duration::from_millis(200), conn.recv()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => continue,
+        };
+        if let Message::Notification(n) = msg {
+            if n.method == "session.output" {
+                if let Some(params) = n.params.as_ref() {
+                    let p: SessionOutputParams =
+                        serde_json::from_value(params.clone()).expect("decode output");
+                    first_seqs.push(p.seq);
+                    first_bytes.extend_from_slice(&p.data_bytes().expect("base64"));
+                }
+            } else if n.method == "session.gap" {
+                panic!("unexpected gap during first attach drain: {n:?}");
+            }
+        }
+    }
+    assert!(
+        contains(&first_bytes, b"line-05"),
+        "first attach never saw line 5; got {:?}",
+        String::from_utf8_lossy(&first_bytes)
+    );
+    let last_seq = *first_seqs.last().expect("first attach saw no chunks");
+
+    // sessions.detach — and drop the connection so the daemon eagerly
+    // parks the subscription. We do NOT wait for park eviction; a fresh
+    // attach creates a fresh subscription either way.
+    send_request(
+        &mut conn,
+        3,
+        "sessions.detach",
+        &SessionsDetachParams {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let _: SessionsDetachResult =
+        serde_json::from_value(recv_response_for(&mut conn, 3).await).expect("decode detach");
+    drop(conn);
+
+    // Let the script emit more lines while we're "away" so the catch-up
+    // path has real work to do. 200 ms × 20 lines-per-second ≈ 4 lines.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Reconnect on a brand-new socket. New conn, new client_id.
+    let mut conn2 = client(&daemon.socket).await;
+    let attach_resume = SessionsAttachParams {
+        session_id: session_id.clone(),
+        resume_from_seq: Some(last_seq),
+        replay_bytes: None,
+        acquire_input: false,
+    };
+    send_request(&mut conn2, 10, "sessions.attach", &attach_resume).await;
+    let resume_ack: SessionsAttachResult =
+        serde_json::from_value(recv_response_for(&mut conn2, 10).await).expect("decode reattach");
+    assert!(
+        resume_ack.snapshot_seq >= last_seq,
+        "snapshot_seq ({}) must cover at least last_seq ({last_seq})",
+        resume_ack.snapshot_seq
+    );
+
+    // Drain until we've seen the marker for line 25 (well past the
+    // detach point) or the script ends. Track every seq and the catch-up
+    // bytes; assert no gap, no replay of already-seen seqs.
+    let mut catchup_bytes = Vec::<u8>::new();
+    let mut catchup_seqs = Vec::<u64>::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline && !contains(&catchup_bytes, b"line-25") {
+        let msg = match tokio::time::timeout(Duration::from_millis(300), conn2.recv()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => continue,
+        };
+        if let Message::Notification(n) = msg {
+            if n.method == "session.output" {
+                if let Some(params) = n.params.as_ref() {
+                    let p: SessionOutputParams =
+                        serde_json::from_value(params.clone()).expect("decode output");
+                    catchup_seqs.push(p.seq);
+                    catchup_bytes.extend_from_slice(&p.data_bytes().expect("base64"));
+                }
+            } else if n.method == "session.gap" {
+                panic!("WEK-49 regression: catch-up after resume_from_seq must not emit a gap (got {n:?})");
+            }
+        }
+    }
+    assert!(
+        contains(&catchup_bytes, b"line-25"),
+        "reattach never saw line 25; catchup bytes = {:?}",
+        String::from_utf8_lossy(&catchup_bytes)
+    );
+
+    // Core regression check: every catch-up seq must be strictly greater
+    // than what the first attach already drained. If the daemon were
+    // still hardcoding `None` (the pre-WEK-49 bug) we would see
+    // `first_seqs` repeated here.
+    let first_seen: std::collections::BTreeSet<u64> = first_seqs.iter().copied().collect();
+    for s in &catchup_seqs {
+        assert!(
+            *s > last_seq,
+            "catch-up returned seq {s} which is <= last_seq {last_seq}; \
+             resume_from_seq is being ignored",
+        );
+        assert!(
+            !first_seen.contains(s),
+            "catch-up double-delivered seq {s} that the first attach already drained",
+        );
+    }
+
+    // Contiguity: seqs must increase by exactly 1 inside the catch-up
+    // window (and the first one must be last_seq + 1).
+    assert_eq!(
+        catchup_seqs.first().copied(),
+        Some(last_seq + 1),
+        "first catch-up seq must be last_seq+1 (got {:?}, last_seq={last_seq})",
+        catchup_seqs.first()
+    );
+    for w in catchup_seqs.windows(2) {
+        assert_eq!(
+            w[1],
+            w[0] + 1,
+            "catch-up seqs must be contiguous: {:?} → {:?}",
+            w[0],
+            w[1]
+        );
+    }
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
