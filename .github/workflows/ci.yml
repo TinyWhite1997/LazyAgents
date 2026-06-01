@@ -29,3 +29,22 @@ jobs:
         run: cargo test -p la-storage migrations_enable_wal_and_schema_meta
       - name: cargo test
         run: cargo test --workspace --all-targets
+
+  # WEK-51: Linux-only is the v1 verification scope, but the code must
+  # stay cross-platform compilable. This job catches things like a crate
+  # using `windows_sys::*` without declaring it in its own Cargo.toml.
+  # libsqlite3-sys (pulled via sqlx → la-storage) needs a C cross
+  # compiler to build for windows-gnu, so install mingw-w64.
+  windows-check:
+    name: cargo check (windows target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check --target x86_64-pc-windows-gnu
+        run: cargo check --workspace --lib --bins --target x86_64-pc-windows-gnu
