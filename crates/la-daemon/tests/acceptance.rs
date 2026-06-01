@@ -315,13 +315,26 @@ fn stop_child(child: &mut Child) {
 }
 
 #[cfg(unix)]
-fn kill_pid(pid: i32, signal: i32) {
-    unsafe {
-        extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-        assert_eq!(kill(pid, signal), 0, "kill({pid}, {signal}) failed");
+fn force_pid_dead(pid: i32) {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    match kill(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(err) => panic!("kill({pid}, SIGKILL) failed: {err}"),
     }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match kill(Pid::from_raw(pid), None) {
+            Err(Errno::ESRCH) => return,
+            Ok(()) | Err(Errno::EPERM) => std::thread::sleep(Duration::from_millis(25)),
+            Err(err) => panic!("kill({pid}, 0) failed: {err}"),
+        }
+    }
+
+    panic!("pid {pid} was still alive after SIGKILL");
 }
 
 #[tokio::test]
@@ -383,7 +396,7 @@ done
         &mut conn,
         3,
         "sessions.write",
-        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"hello-m1\n").unwrap(),
+        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"hello-m1\r").unwrap(),
     )
     .await;
     let echoed = drain_output_until(&mut conn, b"echo:hello-m1", Duration::from_secs(5)).await;
@@ -419,7 +432,7 @@ done
         &mut conn,
         6,
         "sessions.write",
-        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"quit\n").unwrap(),
+        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"quit\r").unwrap(),
     )
     .await;
 
@@ -563,7 +576,7 @@ async fn lad_binary_restart_reaps_orphaned_session_rows() {
 
     stop_child(&mut first);
     #[cfg(unix)]
-    kill_pid(child_pid, 9);
+    force_pid_dead(child_pid);
 
     let mut second = spawn_lad_binary(&socket, &state, "sleep 1").await;
     let mut conn = client(&socket).await;
