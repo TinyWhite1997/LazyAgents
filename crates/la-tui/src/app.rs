@@ -220,8 +220,7 @@ impl<S: SessionSource> App<S> {
             (Modal::ConfirmDelete { .. }, AppMsg::Cancel) => {
                 self.modal = None;
             }
-            (Modal::FullHints, AppMsg::Cancel)
-            | (Modal::FullHints, AppMsg::ToggleFullHints) => {
+            (Modal::FullHints, AppMsg::Cancel) | (Modal::FullHints, AppMsg::ToggleFullHints) => {
                 self.modal = None;
             }
             (Modal::NewSession { .. }, AppMsg::Confirm) => {
@@ -374,8 +373,8 @@ mod tests {
         a.handle(AppMsg::SidebarBottom); // archived header
         a.handle(AppMsg::SidebarExpand);
         a.handle(AppMsg::SidebarDown); // first archived row
-        // It may not be sid_before (sort order), but ArchiveOrRestore on
-        // any archived row should set archived=false.
+                                       // It may not be sid_before (sort order), but ArchiveOrRestore on
+                                       // any archived row should set archived=false.
         let sid_arch = a
             .sidebar
             .selection()
@@ -397,7 +396,10 @@ mod tests {
         let mut a = app();
         a.handle(AppMsg::SidebarBottom); // archived header
         a.handle(AppMsg::NewSession);
-        assert!(a.modal.is_none(), "no new-session chooser on archived bucket");
+        assert!(
+            a.modal.is_none(),
+            "no new-session chooser on archived bucket"
+        );
     }
 
     #[test]

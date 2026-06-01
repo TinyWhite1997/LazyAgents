@@ -50,7 +50,10 @@ fn full_layout_renders_without_panic() {
 fn sidebar_shows_project_groups_and_badges() {
     let buf = render_to_buffer(120, 30);
     let text = buffer_text(&buf);
-    assert!(text.contains("proj-a"), "expected proj-a group, got:\n{text}");
+    assert!(
+        text.contains("proj-a"),
+        "expected proj-a group, got:\n{text}"
+    );
     assert!(text.contains("proj-b"), "expected proj-b group");
     assert!(text.contains("Archived"), "expected Archived bucket pinned");
     assert!(text.contains("claude"), "expected backend badge");

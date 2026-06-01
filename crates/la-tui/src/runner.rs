@@ -46,13 +46,16 @@ pub fn run<S: SessionSource>(mut app: App<S>) -> io::Result<()> {
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        cursor::Hide
+    )?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
-fn restore_terminal(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-) -> io::Result<()> {
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -110,10 +113,10 @@ pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),       // tab bar
-            Constraint::Min(5),          // main area
-            Constraint::Length(2),       // status bar
-            Constraint::Length(1),       // hint bar
+            Constraint::Length(2), // tab bar
+            Constraint::Min(5),    // main area
+            Constraint::Length(2), // status bar
+            Constraint::Length(1), // hint bar
         ])
         .split(size);
 
@@ -134,7 +137,12 @@ pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
 
     match app.tab {
         Tab::Sessions => {
-            render_sidebar(frame, sidebar_area, &app.sidebar, app.focus == Focus::Sidebar);
+            render_sidebar(
+                frame,
+                sidebar_area,
+                &app.sidebar,
+                app.focus == Focus::Sidebar,
+            );
             render_content_placeholder(frame, content_area, &app.sidebar.selection());
         }
         Tab::Crons => {
@@ -153,19 +161,31 @@ pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
     let hint_text = format_hint_bar(&hints, hint_area.width as usize);
     let hint_para = Paragraph::new(Line::from(Span::styled(
         hint_text,
-        Style::default().fg(Color::White).add_modifier(Modifier::DIM),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::DIM),
     )));
     frame.render_widget(hint_para, hint_area);
 
     if let Some(modal) = &app.modal {
-        render_modal(frame, size, modal, &app.sidebar.selection(), app.tab, app.focus);
+        render_modal(
+            frame,
+            size,
+            modal,
+            &app.sidebar.selection(),
+            app.tab,
+            app.focus,
+        );
     }
 
     HitBoxes {
         tabs: tab_ranges,
         // Exclude the border so a click on the title/border row is not
         // misrouted to row 0 (review feedback from a906b484).
-        sidebar: sidebar_area.inner(Margin { vertical: 1, horizontal: 1 }),
+        sidebar: sidebar_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        }),
         // Mirror the post-render scroll offset so mouse routing stays in
         // sync with what ratatui's List widget actually drew.
         sidebar_scroll_offset: app.sidebar.scroll_offset(),
@@ -173,11 +193,7 @@ pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
     }
 }
 
-fn render_content_placeholder(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    selection: &Selection,
-) {
+fn render_content_placeholder(frame: &mut Frame<'_>, area: Rect, selection: &Selection) {
     let body = match selection {
         Selection::Empty => {
             // The daemon (M1.7) is the only authority that can create the
@@ -205,9 +221,10 @@ fn render_crons_placeholder(frame: &mut Frame<'_>, sidebar: Rect, content: Rect)
     let s = Paragraph::new("Crons land in M3.")
         .block(Block::default().borders(Borders::ALL).title("Crons"));
     frame.render_widget(s, sidebar);
-    let c = Paragraph::new("Cron scheduler is part of milestone M3 (PRD §5.4). Press Tab to return.")
-        .block(Block::default().borders(Borders::ALL).title("Detail"))
-        .wrap(Wrap { trim: false });
+    let c =
+        Paragraph::new("Cron scheduler is part of milestone M3 (PRD §5.4). Press Tab to return.")
+            .block(Block::default().borders(Borders::ALL).title("Detail"))
+            .wrap(Wrap { trim: false });
     frame.render_widget(c, content);
 }
 
@@ -243,7 +260,10 @@ fn render_modal(
                 .borders(Borders::ALL)
                 .title("Key bindings — current context")
                 .border_style(Style::default().fg(Color::Cyan));
-            let inner = area.inner(Margin { vertical: 1, horizontal: 2 });
+            let inner = area.inner(Margin {
+                vertical: 1,
+                horizontal: 2,
+            });
             frame.render_widget(block, area);
             let hints = HintRegistry::for_context(tab, focus, selection, None);
             let mut lines = Vec::new();
@@ -251,7 +271,9 @@ fn render_modal(
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{:<10}", h.key),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" "),
                     Span::raw(h.label),

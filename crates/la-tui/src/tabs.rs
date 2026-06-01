@@ -19,7 +19,11 @@ use crate::app::Tab;
 /// Note: ratatui has a built-in `Tabs` widget, but we want explicit hit
 /// boxes for mouse routing and a custom "[ active ]" visual; rolling our
 /// own paragraph keeps the code inspectable.
-pub fn render_tabs(frame: &mut Frame<'_>, area: Rect, active: Tab) -> Vec<(Tab, std::ops::Range<u16>)> {
+pub fn render_tabs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    active: Tab,
+) -> Vec<(Tab, std::ops::Range<u16>)> {
     let mut spans: Vec<Span<'_>> = Vec::new();
     let mut ranges: Vec<(Tab, std::ops::Range<u16>)> = Vec::new();
     let mut cursor = area.x + 1; // +1 for the block border padding
@@ -45,10 +49,7 @@ pub fn render_tabs(frame: &mut Frame<'_>, area: Rect, active: Tab) -> Vec<(Tab, 
 
 /// Hit-test: given a mouse-click column, return the tab whose range
 /// contains it. `None` for clicks outside any tab.
-pub fn tab_at_column(
-    column: u16,
-    ranges: &[(Tab, std::ops::Range<u16>)],
-) -> Option<Tab> {
+pub fn tab_at_column(column: u16, ranges: &[(Tab, std::ops::Range<u16>)]) -> Option<Tab> {
     ranges
         .iter()
         .find(|(_, r)| r.contains(&column))
@@ -62,10 +63,7 @@ mod tests {
     #[test]
     fn hit_test_picks_right_tab() {
         // Synthetic ranges; we don't render here.
-        let ranges = vec![
-            (Tab::Sessions, 1u16..14u16),
-            (Tab::Crons, 14u16..23u16),
-        ];
+        let ranges = vec![(Tab::Sessions, 1u16..14u16), (Tab::Crons, 14u16..23u16)];
         assert_eq!(tab_at_column(2, &ranges), Some(Tab::Sessions));
         assert_eq!(tab_at_column(14, &ranges), Some(Tab::Crons));
         assert_eq!(tab_at_column(99, &ranges), None);

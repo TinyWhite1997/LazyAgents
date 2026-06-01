@@ -34,11 +34,7 @@ pub struct HitBoxes {
 /// open (if any) and the on-screen hit boxes. Returns `None` for events
 /// the App does not care about (resize is handled by the runner directly,
 /// key releases on terminals that send them, etc.).
-pub fn translate(
-    event: Event,
-    modal: Option<&Modal>,
-    hit: &HitBoxes,
-) -> Option<AppMsg> {
+pub fn translate(event: Event, modal: Option<&Modal>, hit: &HitBoxes) -> Option<AppMsg> {
     match event {
         Event::Key(k) => {
             // Some terminals (Windows in particular) report both press and
@@ -53,11 +49,7 @@ pub fn translate(
     }
 }
 
-fn translate_key(
-    code: KeyCode,
-    mods: KeyModifiers,
-    modal: Option<&Modal>,
-) -> Option<AppMsg> {
+fn translate_key(code: KeyCode, mods: KeyModifiers, modal: Option<&Modal>) -> Option<AppMsg> {
     // Modal-context keys first; otherwise normal navigation.
     if let Some(m) = modal {
         return translate_modal_key(code, mods, m);
@@ -94,11 +86,7 @@ fn translate_key(
     })
 }
 
-fn translate_modal_key(
-    code: KeyCode,
-    mods: KeyModifiers,
-    modal: &Modal,
-) -> Option<AppMsg> {
+fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Option<AppMsg> {
     // Ctrl-C always quits, even inside a modal.
     if let KeyCode::Char('c') = code {
         if mods.contains(KeyModifiers::CONTROL) {
@@ -124,10 +112,7 @@ fn translate_modal_key(
     })
 }
 
-fn translate_mouse(
-    event: crossterm::event::MouseEvent,
-    hit: &HitBoxes,
-) -> Option<AppMsg> {
+fn translate_mouse(event: crossterm::event::MouseEvent, hit: &HitBoxes) -> Option<AppMsg> {
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // Tab bar click.
@@ -142,7 +127,10 @@ fn translate_mouse(
             // scroll offset to get the absolute index in `items` — the
             // ratatui `List` widget auto-scrolls long lists and without
             // this correction `d`/`a` would target the wrong row.
-            if hit.sidebar.contains(ratatui::layout::Position::new(event.column, event.row)) {
+            if hit
+                .sidebar
+                .contains(ratatui::layout::Position::new(event.column, event.row))
+            {
                 let inner_row = event.row.saturating_sub(hit.sidebar.y) as usize;
                 let abs_index = hit.sidebar_scroll_offset.saturating_add(inner_row);
                 return Some(AppMsg::SidebarSelect(abs_index));
@@ -160,10 +148,7 @@ mod tests {
 
     fn hit() -> HitBoxes {
         HitBoxes {
-            tabs: vec![
-                (Tab::Sessions, 0u16..10u16),
-                (Tab::Crons, 10u16..20u16),
-            ],
+            tabs: vec![(Tab::Sessions, 0u16..10u16), (Tab::Crons, 10u16..20u16)],
             // Pre-trimmed inner rect (borders already removed by the
             // renderer). y=2 ⇒ first visible row is at terminal row 2.
             sidebar: Rect::new(1, 2, 28, 8),
@@ -222,7 +207,10 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(translate(ev, None, &hit()), Some(AppMsg::SetTab(Tab::Crons)));
+        assert_eq!(
+            translate(ev, None, &hit()),
+            Some(AppMsg::SetTab(Tab::Crons))
+        );
     }
 
     #[test]
@@ -280,7 +268,10 @@ mod tests {
 
     #[test]
     fn esc_cancels_normal_context() {
-        assert_eq!(translate(key(KeyCode::Esc), None, &hit()), Some(AppMsg::Cancel));
+        assert_eq!(
+            translate(key(KeyCode::Esc), None, &hit()),
+            Some(AppMsg::Cancel)
+        );
     }
 
     #[test]

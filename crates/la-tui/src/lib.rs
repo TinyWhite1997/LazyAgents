@@ -8,6 +8,7 @@
 //!
 //! ## Layout
 //!
+//! Sessions sidebar (M1.5):
 //! - [`model`] — wire-decoupled data types used by the sidebar (project
 //!   group, session row, backend badge, run-state glyph). They mirror the
 //!   subset of [`la_proto::methods::SessionSummary`] the sidebar needs and
@@ -30,9 +31,22 @@
 //! - [`input`] — crossterm `Event` → [`app::AppMsg`] translator.
 //! - [`runner`] — minimal event loop: render → wait for event → dispatch.
 //!
+//! Conversation main area (M1.6):
+//! - [`vte_term`] — a [`vte::Perform`] implementation that folds PTY bytes
+//!   into a line-oriented buffer, silently absorbing the cursor-query and
+//!   OSC sequences ConPTY injects (architecture §6.5).
+//! - [`transcript`] — append-only ring of rendered lines + scroll state with
+//!   auto-follow (`Ctrl+u` / `Ctrl+d`, PgUp/PgDn, Home/End, G).
+//! - [`composer`] — multi-line prompt editor with `Ctrl+Enter` send and
+//!   `Up`/`Down` history recall.
+//! - [`detach_notice`] — transient "会话仍在后台运行" toast surfaced when the
+//!   user detaches from a live session.
+//!
 //! The binary entry point is in `src/bin/la.rs`.
 
 pub mod app;
+pub mod composer;
+pub mod detach_notice;
 pub mod input;
 pub mod key_hints;
 pub mod model;
@@ -41,8 +55,14 @@ pub mod sidebar;
 pub mod source;
 pub mod status;
 pub mod tabs;
+pub mod transcript;
+pub mod vte_term;
 
 pub use app::{App, AppMsg, Focus, Tab};
+pub use composer::{Composer, ComposerAction, ComposerView};
+pub use detach_notice::{DetachNotice, DetachNoticeView};
 pub use model::{Backend, ProjectGroup, RunState, SessionRow};
 pub use source::{MockSessionSource, SessionSource};
 pub use status::Status;
+pub use transcript::{ScrollAction, Transcript, TranscriptView};
+pub use vte_term::{StyledCell, TerminalLine, TerminalScreen};

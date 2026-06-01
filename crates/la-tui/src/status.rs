@@ -26,9 +26,17 @@ pub struct Status {
 
 pub fn render_status(frame: &mut Frame<'_>, area: Rect, status: &Status) {
     let badge = if status.daemon_online {
-        Span::styled("● daemon", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        Span::styled(
+            "● daemon",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        Span::styled("○ daemon", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        Span::styled(
+            "○ daemon",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
     };
 
     let mut left: Vec<Span<'_>> = vec![

@@ -88,7 +88,7 @@ impl HintRegistry {
             // keys we cannot honour yet.
             Tab::Crons => {
                 let mut out = Self::globals();
-                out.sort_by(|a, b| b.importance.cmp(&a.importance));
+                out.sort_by_key(|h| std::cmp::Reverse(h.importance));
                 out
             }
         }
@@ -142,7 +142,7 @@ impl HintRegistry {
 
         // Globals visible in any focus on the Sessions tab.
         out.extend(Self::globals());
-        out.sort_by(|a, b| b.importance.cmp(&a.importance));
+        out.sort_by_key(|h| std::cmp::Reverse(h.importance));
         out
     }
 
@@ -217,8 +217,7 @@ mod tests {
             project_id: "p1".into(),
             session_id: "s1".into(),
         };
-        let hints =
-            HintRegistry::for_context(Tab::Sessions, Focus::Sidebar, &sel, None);
+        let hints = HintRegistry::for_context(Tab::Sessions, Focus::Sidebar, &sel, None);
         assert_eq!(hints.first().unwrap().key, "⏎");
         assert_eq!(hints.first().unwrap().label, "open");
     }
@@ -228,11 +227,16 @@ mod tests {
         let sel = Selection::Group {
             project_id: crate::model::ProjectGroup::ARCHIVED_ID.into(),
         };
-        let hints =
-            HintRegistry::for_context(Tab::Sessions, Focus::Sidebar, &sel, None);
+        let hints = HintRegistry::for_context(Tab::Sessions, Focus::Sidebar, &sel, None);
         for h in &hints {
-            assert!(h.label != "delete", "archived bucket header must not advertise delete");
-            assert!(h.label != "archive", "archived bucket header must not advertise archive");
+            assert!(
+                h.label != "delete",
+                "archived bucket header must not advertise delete"
+            );
+            assert!(
+                h.label != "archive",
+                "archived bucket header must not advertise archive"
+            );
         }
     }
 
@@ -257,7 +261,9 @@ mod tests {
         // Switching from group header to session must change the primary
         // action (this is the property PRD §5.6 第 4 条: "焦点/模式/选中变化
         // 时立刻刷新" depends on).
-        let group_sel = Selection::Group { project_id: "p1".into() };
+        let group_sel = Selection::Group {
+            project_id: "p1".into(),
+        };
         let session_sel = Selection::Session {
             project_id: "p1".into(),
             session_id: "s1".into(),
@@ -309,7 +315,9 @@ mod tests {
 
         let contexts = [
             Selection::Empty,
-            Selection::Group { project_id: "p1".into() },
+            Selection::Group {
+                project_id: "p1".into(),
+            },
             Selection::Group {
                 project_id: crate::model::ProjectGroup::ARCHIVED_ID.into(),
             },
@@ -319,8 +327,7 @@ mod tests {
             },
         ];
         for sel in &contexts {
-            let hints =
-                HintRegistry::for_context(Tab::Sessions, Focus::Sidebar, sel, None);
+            let hints = HintRegistry::for_context(Tab::Sessions, Focus::Sidebar, sel, None);
             for h in &hints {
                 let Some(code) = single_char_key(h.key) else {
                     continue;
@@ -355,9 +362,13 @@ mod tests {
             tab_bar_row: 0,
         };
         let modals = [
-            Modal::ConfirmDelete { session_id: "s1".into() },
+            Modal::ConfirmDelete {
+                session_id: "s1".into(),
+            },
             Modal::FullHints,
-            Modal::NewSession { project_id: "p1".into() },
+            Modal::NewSession {
+                project_id: "p1".into(),
+            },
         ];
         for m in &modals {
             let hints = HintRegistry::for_context(

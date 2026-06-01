@@ -240,9 +240,9 @@ impl SidebarState {
             self.groups[group_index].expanded = false;
             self.rebuild();
             // After rebuild the parent header's index is the one we want.
-            self.cursor = self.items.iter().position(|it| {
-                matches!(it, Item::GroupHeader { group_index: g } if *g == group_index)
-            });
+            self.cursor = self.items.iter().position(
+                |it| matches!(it, Item::GroupHeader { group_index: g } if *g == group_index),
+            );
         }
         self.selection()
     }
@@ -259,9 +259,9 @@ impl SidebarState {
         if !self.groups[group_index].expanded {
             self.groups[group_index].expanded = true;
             self.rebuild();
-            self.cursor = self.items.iter().position(|it| {
-                matches!(it, Item::GroupHeader { group_index: g } if *g == group_index)
-            });
+            self.cursor = self.items.iter().position(
+                |it| matches!(it, Item::GroupHeader { group_index: g } if *g == group_index),
+            );
         }
         self.selection()
     }
@@ -442,8 +442,10 @@ mod tests {
             archived: false,
         };
         let mut a = ProjectGroup::new("p-a", "proj-a");
-        a.sessions
-            .extend([row("s1", "p-a", RunState::Running), row("s2", "p-a", RunState::Idle)]);
+        a.sessions.extend([
+            row("s1", "p-a", RunState::Running),
+            row("s2", "p-a", RunState::Idle),
+        ]);
         let mut b = ProjectGroup::new("p-b", "proj-b");
         b.sessions.push(row("s3", "p-b", RunState::Running));
         let mut archived = ProjectGroup::archived();
@@ -491,7 +493,9 @@ mod tests {
         let mut s = SidebarState::new();
         s.set_groups(fixture());
         s.move_bottom(); // Archived header (folded)
-        assert!(matches!(s.selection(), Selection::Group { ref project_id } if project_id == ProjectGroup::ARCHIVED_ID));
+        assert!(
+            matches!(s.selection(), Selection::Group { ref project_id } if project_id == ProjectGroup::ARCHIVED_ID)
+        );
         let sel = s.expand();
         // Still on the header (PRD: bucket expands, cursor stays).
         assert!(
@@ -511,7 +515,9 @@ mod tests {
         let top = s.move_top();
         assert!(matches!(top, Selection::Group { ref project_id } if project_id == "p-a"));
         let bottom = s.move_bottom();
-        assert!(matches!(bottom, Selection::Group { ref project_id } if project_id == ProjectGroup::ARCHIVED_ID));
+        assert!(
+            matches!(bottom, Selection::Group { ref project_id } if project_id == ProjectGroup::ARCHIVED_ID)
+        );
     }
 
     #[test]
