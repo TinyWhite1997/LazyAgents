@@ -266,6 +266,42 @@ impl<'a> SessionsRepo<'a> {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Update the OS pid recorded for a session row.
+    ///
+    /// Called by `la-core` once `la-pty` returns the spawned child's pid.
+    /// Keeping this on the repo (instead of a raw `sqlx::query` in core)
+    /// preserves the "all SQL lives in la-storage" invariant from
+    /// architecture §2.1.
+    pub async fn update_pid(&self, id: &str, pid: Option<i64>) -> Result<bool> {
+        let result = retry_busy(|| async {
+            sqlx::query("UPDATE sessions SET pid = ?2, updated_at = datetime('now') WHERE id = ?1")
+                .bind(id)
+                .bind(pid)
+                .execute(self.storage.writer_pool())
+                .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// All session rows whose state is in the "live" set
+    /// (`starting`, `running`, `waiting`). Used by the orphan reaper on
+    /// daemon startup (architecture §6.3).
+    pub async fn list_active(&self) -> Result<Vec<Session>> {
+        sqlx::query_as::<_, Session>(
+            r#"
+            SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
+                   worktree_path, worktree_branch, base_branch, spawn_args, origin,
+                   transcript_path, transcript_bytes, created_at, updated_at, archived_at
+            FROM sessions
+            WHERE state IN ('starting', 'running', 'waiting')
+            "#,
+        )
+        .fetch_all(self.storage.reader_pool())
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn archive(&self, id: &str) -> Result<bool> {
         let result = retry_busy(|| async {
             sqlx::query(

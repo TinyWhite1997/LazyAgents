@@ -6,6 +6,7 @@ members = [
     "crates/la-ipc",
     "crates/la-adapter",
     "crates/la-storage",
+    "crates/la-core",
     "integration/m0-smoke",
 ]
 

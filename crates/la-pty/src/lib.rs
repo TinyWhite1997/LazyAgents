@@ -15,6 +15,23 @@ pub use portable_pty::{CommandBuilder, ExitStatus};
 
 mod platform;
 
+/// Send a cross-platform signal to a pid that this crate previously spawned.
+///
+/// Equivalent to [`PtyChild::signal`] but addressable by pid, so a daemon
+/// can detach the child from its [`PtyChild`] handle (e.g. when the
+/// session-manager task owns the handle while a `sessions.signal` RPC is
+/// dispatched on a different task) and still target it.
+///
+/// Pid lookup is the OS's responsibility; on Unix this means the pid must
+/// still belong to a process in our process group (the child is `setsid`'d
+/// at spawn time so pgid == pid). On Windows the pid must still be a
+/// console-group leader created with `CREATE_NEW_PROCESS_GROUP` — which
+/// `portable-pty` does for us. After the child reaps, the call returns
+/// `Err(PtyError::Signal(_))` instead of silently no-op'ing.
+pub fn send_signal(pid: u32, sig: Signal) -> Result<(), PtyError> {
+    platform::send_signal(pid, sig)
+}
+
 /// Initial / resized PTY window size.
 #[derive(Debug, Clone, Copy)]
 pub struct PtySize {
@@ -147,6 +164,61 @@ impl PtyChild {
     pub fn signal(&self, sig: Signal) -> Result<(), PtyError> {
         let pid = self.pid.ok_or(PtyError::NoPid)?;
         platform::send_signal(pid, sig)
+    }
+
+    /// Wait for the child to exit. Consumes the handle.
+    pub async fn wait(mut self) -> Result<ExitStatus, PtyError> {
+        tokio::task::spawn_blocking(move || self.child.wait())
+            .await
+            .map_err(|e| PtyError::Join(e.to_string()))?
+            .map_err(|e| PtyError::Wait(e.to_string()))
+    }
+
+    /// Split into independently-owned parts so the daemon can move the
+    /// reader to one task while a second task awaits exit and a third
+    /// holds the writer.
+    ///
+    /// After this call the child can no longer be addressed through
+    /// `Self::signal` — the daemon must use [`crate::send_signal`] with
+    /// the pid returned in [`PtyChildParts::pid`].
+    pub fn into_parts(self) -> PtyChildParts {
+        PtyChildParts {
+            pid: self.pid,
+            reader: self.reader,
+            writer: self.writer,
+            waiter: ChildWaiter {
+                master: self.master,
+                child: self.child,
+            },
+        }
+    }
+}
+
+/// Result of [`PtyChild::into_parts`]; lets the caller split ownership
+/// across tasks without giving up resize / wait access.
+pub struct PtyChildParts {
+    pub pid: Option<u32>,
+    pub reader: mpsc::Receiver<Bytes>,
+    pub writer: PtyWriter,
+    pub waiter: ChildWaiter,
+}
+
+/// Independently-ownable half of [`PtyChild`] that retains resize / wait
+/// capability after the reader and writer have been moved elsewhere.
+pub struct ChildWaiter {
+    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+impl ChildWaiter {
+    /// Resize the PTY; safe to call concurrently with [`Self::wait`]
+    /// because the master is behind a `Mutex`.
+    pub fn resize(&self, size: PtySize) -> Result<(), PtyError> {
+        self.master
+            .lock()
+            .expect("master mutex poisoned")
+            .resize(size.into())
+            .map_err(|e| PtyError::Resize(e.to_string()))
     }
 
     /// Wait for the child to exit. Consumes the handle.
