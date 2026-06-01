@@ -363,6 +363,6 @@ impl AgentAdapter for DebugShellAdapter {
     }
 
     fn encode_user_input(&self, text: &str) -> bytes::Bytes {
-        bytes::Bytes::copy_from_slice(text.as_bytes())
+        bytes::Bytes::copy_from_slice(text.replace('\n', "\r").as_bytes())
     }
 }
