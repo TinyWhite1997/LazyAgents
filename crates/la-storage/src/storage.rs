@@ -4,7 +4,7 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{ConnectOptions, SqlitePool};
 
-use crate::{repos, Result, CURRENT_SCHEMA_VERSION, MIGRATOR};
+use crate::{repos, Result, StorageError, CURRENT_SCHEMA_VERSION, MIGRATOR};
 
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -53,6 +53,7 @@ impl Storage {
         }
 
         let writer = connect_pool(&config.database_path, 1, config.busy_timeout).await?;
+        reject_too_new_schema(&writer).await?;
         MIGRATOR.run(&writer).await?;
         sqlx::query("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?1)")
             .bind(CURRENT_SCHEMA_VERSION)
@@ -136,4 +137,42 @@ async fn connect_pool(
         .connect_with(options)
         .await
         .map_err(Into::into)
+}
+
+async fn reject_too_new_schema(pool: &SqlitePool) -> Result<()> {
+    let has_schema_meta: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_schema_meta == 0 {
+        return Ok(());
+    }
+
+    let Some(found) = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+    )
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(());
+    };
+
+    if version_gt(&found, CURRENT_SCHEMA_VERSION) {
+        return Err(StorageError::SchemaTooNew {
+            found,
+            supported: CURRENT_SCHEMA_VERSION.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn version_gt(found: &str, supported: &str) -> bool {
+    let found_num = found.parse::<u64>();
+    let supported_num = supported.parse::<u64>();
+    match (found_num, supported_num) {
+        (Ok(found), Ok(supported)) => found > supported,
+        _ => found > supported,
+    }
 }

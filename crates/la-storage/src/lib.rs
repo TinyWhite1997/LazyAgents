@@ -32,6 +32,8 @@ pub enum StorageError {
     MissingSession(String),
     #[error("missing project: {0}")]
     MissingProject(String),
+    #[error("schema version {found} is newer than supported version {supported}")]
+    SchemaTooNew { found: String, supported: String },
     #[error("busy after {attempts} attempts")]
     Busy { attempts: usize },
 }

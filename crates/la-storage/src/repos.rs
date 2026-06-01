@@ -5,7 +5,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use sqlx::sqlite::SqliteQueryResult;
-use sqlx::{Error as SqlxError, SqlitePool};
+use sqlx::{Error as SqlxError, Sqlite, Transaction};
 use tokio::io::AsyncWriteExt;
 
 use crate::models::{
@@ -307,51 +307,86 @@ impl<'a> ChunksRepo<'a> {
         data: impl AsRef<[u8]>,
     ) -> Result<AppendOutcome> {
         let data = data.as_ref();
-        let seq = self.next_seq(session_id).await?;
-        let session = self
-            .storage
-            .sessions()
-            .get(session_id)
+        let mut tx = self.storage.writer_pool().begin().await?;
+        let session = session_by_id(&mut tx, session_id)
             .await?
             .ok_or_else(|| StorageError::MissingSession(session_id.to_string()))?;
         let new_bytes = session.transcript_bytes + data.len() as i64;
 
         if let Some(path) = session.transcript_path {
-            self.append_spill_line(PathBuf::from(&path), session_id, seq, kind, data)
-                .await?;
-            self.bump_transcript_bytes(session_id, new_bytes).await?;
+            let path_buf = PathBuf::from(&path);
+            let seq = read_spill_lines(path_buf.clone())
+                .await?
+                .into_iter()
+                .map(|c| c.seq + 1)
+                .max()
+                .unwrap_or(1);
+            let ts = sqlite_now_tx(&mut tx).await?;
+            append_spill_line(path_buf, session_id, seq, ts, kind, data).await?;
+            update_transcript_bytes(&mut tx, session_id, new_bytes).await?;
+            tx.commit().await?;
             return Ok(AppendOutcome::SpilledToFile { seq, path });
         }
 
         if new_bytes > self.storage.transcript_spill_bytes() {
             let path = self.spill_path(session_id);
-            self.spill_existing_chunks(&path, session_id).await?;
-            self.append_spill_line(path.clone(), session_id, seq, kind, data)
-                .await?;
+            let mut chunks = sqlx::query_as::<_, SessionChunk>(
+                r#"
+                SELECT session_id, seq, ts, kind, data
+                FROM session_chunks
+                WHERE session_id = ?1
+                ORDER BY seq
+                "#,
+            )
+            .bind(session_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let seq = chunks.iter().map(|c| c.seq + 1).max().unwrap_or(1);
+            let ts = sqlite_now_tx(&mut tx).await?;
+            chunks.push(SessionChunk {
+                session_id: session_id.to_string(),
+                seq,
+                ts,
+                kind: kind.as_str().to_string(),
+                data: data.to_vec(),
+            });
+            write_spill_file(&path, chunks).await?;
             let path_str = path.to_string_lossy().into_owned();
-            self.mark_spilled(session_id, &path_str, new_bytes).await?;
+            sqlx::query("DELETE FROM session_chunks WHERE session_id = ?1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "UPDATE sessions SET transcript_path = ?2, transcript_bytes = ?3, updated_at = datetime('now') WHERE id = ?1",
+            )
+            .bind(session_id)
+            .bind(&path_str)
+            .bind(new_bytes)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
             return Ok(AppendOutcome::SpilledToFile {
                 seq,
                 path: path_str,
             });
         }
 
-        retry_busy(|| async {
-            sqlx::query(
-                r#"
-                INSERT INTO session_chunks(session_id, seq, kind, data)
-                VALUES (?1, ?2, ?3, ?4)
-                "#,
-            )
-            .bind(session_id)
-            .bind(seq)
-            .bind(kind.as_str())
-            .bind(data)
-            .execute(self.storage.writer_pool())
-            .await
-        })
+        let seq: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO session_chunks(session_id, seq, kind, data)
+            SELECT ?1, COALESCE(MAX(seq), 0) + 1, ?2, ?3
+            FROM session_chunks
+            WHERE session_id = ?1
+            RETURNING seq
+            "#,
+        )
+        .bind(session_id)
+        .bind(kind.as_str())
+        .bind(data)
+        .fetch_one(&mut *tx)
         .await?;
-        self.bump_transcript_bytes(session_id, new_bytes).await?;
+        update_transcript_bytes(&mut tx, session_id, new_bytes).await?;
+        tx.commit().await?;
         Ok(AppendOutcome::StoredInDb { seq })
     }
 
@@ -377,136 +412,6 @@ impl<'a> ChunksRepo<'a> {
         chunks.append(&mut db_chunks);
         chunks.sort_by_key(|c| c.seq);
         Ok(chunks)
-    }
-
-    async fn next_seq(&self, session_id: &str) -> Result<i64> {
-        let db_next: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(seq) + 1 FROM session_chunks WHERE session_id = ?1")
-                .bind(session_id)
-                .fetch_one(self.storage.reader_pool())
-                .await?;
-
-        let spill_next = if let Some(session) = self.storage.sessions().get(session_id).await? {
-            if let Some(path) = session.transcript_path {
-                read_spill_lines(PathBuf::from(path))
-                    .await?
-                    .into_iter()
-                    .map(|c| c.seq + 1)
-                    .max()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Ok(db_next.or(spill_next).unwrap_or(1))
-    }
-
-    async fn spill_existing_chunks(&self, path: &PathBuf, session_id: &str) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        let chunks = sqlx::query_as::<_, SessionChunk>(
-            r#"
-            SELECT session_id, seq, ts, kind, data
-            FROM session_chunks
-            WHERE session_id = ?1
-            ORDER BY seq
-            "#,
-        )
-        .bind(session_id)
-        .fetch_all(self.storage.reader_pool())
-        .await?;
-
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        for chunk in chunks {
-            let line = SpillLine {
-                session_id: chunk.session_id,
-                seq: chunk.seq,
-                ts: chunk.ts,
-                kind: chunk.kind,
-                data_base64: STANDARD.encode(chunk.data),
-            };
-            file.write_all(serde_json::to_string(&line)?.as_bytes())
-                .await?;
-            file.write_all(b"\n").await?;
-        }
-        file.flush().await?;
-
-        retry_busy(|| async {
-            sqlx::query("DELETE FROM session_chunks WHERE session_id = ?1")
-                .bind(session_id)
-                .execute(self.storage.writer_pool())
-                .await
-        })
-        .await?;
-        Ok(())
-    }
-
-    async fn append_spill_line(
-        &self,
-        path: PathBuf,
-        session_id: &str,
-        seq: i64,
-        kind: ChunkKind,
-        data: &[u8],
-    ) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let ts = sqlite_now(self.storage.reader_pool()).await?;
-        let line = SpillLine {
-            session_id: session_id.to_string(),
-            seq,
-            ts,
-            kind: kind.as_str().to_string(),
-            data_base64: STANDARD.encode(data),
-        };
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        file.write_all(serde_json::to_string(&line)?.as_bytes())
-            .await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-        Ok(())
-    }
-
-    async fn mark_spilled(&self, session_id: &str, path: &str, bytes: i64) -> Result<()> {
-        retry_busy(|| async {
-            sqlx::query(
-                "UPDATE sessions SET transcript_path = ?2, transcript_bytes = ?3, updated_at = datetime('now') WHERE id = ?1",
-            )
-            .bind(session_id)
-            .bind(path)
-            .bind(bytes)
-            .execute(self.storage.writer_pool())
-            .await
-        })
-        .await?;
-        Ok(())
-    }
-
-    async fn bump_transcript_bytes(&self, session_id: &str, bytes: i64) -> Result<()> {
-        retry_busy(|| async {
-            sqlx::query(
-                "UPDATE sessions SET transcript_bytes = ?2, updated_at = datetime('now') WHERE id = ?1",
-            )
-            .bind(session_id)
-            .bind(bytes)
-            .execute(self.storage.writer_pool())
-            .await
-        })
-        .await?;
-        Ok(())
     }
 
     fn spill_path(&self, session_id: &str) -> PathBuf {
@@ -571,6 +476,95 @@ impl<'a> SettingsRepo<'a> {
     }
 }
 
+async fn session_by_id(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<Option<Session>> {
+    sqlx::query_as::<_, Session>(
+        r#"
+        SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
+               worktree_path, worktree_branch, base_branch, spawn_args, origin,
+               transcript_path, transcript_bytes, created_at, updated_at, archived_at
+        FROM sessions
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+async fn update_transcript_bytes(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_id: &str,
+    bytes: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE sessions SET transcript_bytes = ?2, updated_at = datetime('now') WHERE id = ?1",
+    )
+    .bind(session_id)
+    .bind(bytes)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn append_spill_line(
+    path: PathBuf,
+    session_id: &str,
+    seq: i64,
+    ts: String,
+    kind: ChunkKind,
+    data: &[u8],
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let line = SpillLine {
+        session_id: session_id.to_string(),
+        seq,
+        ts,
+        kind: kind.as_str().to_string(),
+        data_base64: STANDARD.encode(data),
+    };
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(serde_json::to_string(&line)?.as_bytes())
+        .await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+async fn write_spill_file(path: &PathBuf, chunks: Vec<SessionChunk>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await?;
+    for chunk in chunks {
+        let line = SpillLine {
+            session_id: chunk.session_id,
+            seq: chunk.seq,
+            ts: chunk.ts,
+            kind: chunk.kind,
+            data_base64: STANDARD.encode(chunk.data),
+        };
+        file.write_all(serde_json::to_string(&line)?.as_bytes())
+            .await?;
+        file.write_all(b"\n").await?;
+    }
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
 async fn retry_busy<F, Fut>(mut op: F) -> Result<SqliteQueryResult>
 where
     F: FnMut() -> Fut,
@@ -605,9 +599,9 @@ fn is_busy(err: &SqlxError) -> bool {
     }
 }
 
-async fn sqlite_now(pool: &SqlitePool) -> Result<String> {
+async fn sqlite_now_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<String> {
     sqlx::query_scalar("SELECT datetime('now')")
-        .fetch_one(pool)
+        .fetch_one(&mut **tx)
         .await
         .map_err(Into::into)
 }
