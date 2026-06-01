@@ -88,7 +88,7 @@ impl HintRegistry {
             // keys we cannot honour yet.
             Tab::Crons => {
                 let mut out = Self::globals();
-                out.sort_by(|a, b| b.importance.cmp(&a.importance));
+                out.sort_by_key(|h| std::cmp::Reverse(h.importance));
                 out
             }
         }
@@ -142,7 +142,7 @@ impl HintRegistry {
 
         // Globals visible in any focus on the Sessions tab.
         out.extend(Self::globals());
-        out.sort_by(|a, b| b.importance.cmp(&a.importance));
+        out.sort_by_key(|h| std::cmp::Reverse(h.importance));
         out
     }
 
