@@ -202,4 +202,113 @@ mod tests {
         assert_eq!(&f3[..], b"ccc");
         assert!(codec.decode(&mut buf).unwrap().is_none());
     }
+
+    /// Reassembly fuzz: for every "slicing" of an encoded stream of N
+    /// frames, the decoder must yield exactly those N frames in order with
+    /// byte-identical payloads. This is the property tcp-style transport
+    /// counts on — chunks arrive in unpredictably-sized pieces and we must
+    /// never truncate, reorder, or merge them.
+    ///
+    /// We deliberately mix payload sizes (1, 2, 7, 32, 64 KiB-1, 64 KiB,
+    /// 64 KiB+1) so the test covers (a) tiny payloads where the length
+    /// prefix is most of the frame, (b) the 64 KiB SESSION_OUTPUT chunk
+    /// boundary which is the most common shape on the wire, and (c) the
+    /// kind of off-by-one that a length-prefix codec is most likely to
+    /// regress on.
+    #[test]
+    fn framing_fuzz_arbitrary_slicing_preserves_frames() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        // Build payloads with distinguishable content so a swap would
+        // be detectable.
+        let sizes = [
+            0usize,
+            1,
+            2,
+            7,
+            32,
+            1024,
+            64 * 1024 - 1,
+            64 * 1024,
+            64 * 1024 + 1,
+        ];
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(sizes.len());
+        for (i, &sz) in sizes.iter().enumerate() {
+            payloads.push((0..sz).map(|j| ((i * 31 + j) % 251) as u8).collect());
+        }
+
+        // Encode all frames into one big buffer.
+        let mut encoded = BytesMut::new();
+        {
+            let mut codec = FrameCodec::new();
+            for p in &payloads {
+                codec.encode(Bytes::from(p.clone()), &mut encoded).unwrap();
+            }
+        }
+        let encoded = encoded.freeze();
+
+        // PRNG-driven random slicings — seed is fixed so failures are
+        // reproducible. 64 iterations across the same stream is enough
+        // to exercise every interesting offset (length-prefix split mid-
+        // word, body split, multiple frames per feed, etc.) without
+        // bloating CI.
+        let mut seed: u64 = 0x00c0_ffee_1234_5678;
+        for iter in 0..64 {
+            // xorshift step.
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mut local_seed = seed.wrapping_add(iter as u64);
+
+            let mut codec = FrameCodec::new();
+            let mut decoded: Vec<Vec<u8>> = Vec::with_capacity(payloads.len());
+            let mut buf = BytesMut::new();
+            let mut offset = 0usize;
+            while offset < encoded.len() {
+                // Pick a chunk size in [1, 67] — small enough to split the
+                // 4-byte length prefix across feeds, large enough to also
+                // exercise multi-frame-per-feed paths.
+                local_seed ^= local_seed << 13;
+                local_seed ^= local_seed >> 7;
+                local_seed ^= local_seed << 17;
+                let max = encoded.len() - offset;
+                let take = 1 + (local_seed as usize) % 67;
+                let take = take.min(max);
+                buf.extend_from_slice(&encoded[offset..offset + take]);
+                offset += take;
+                // Decode greedily; multiple complete frames may now live in `buf`.
+                while let Some(frame) = codec.decode(&mut buf).expect("decode must not fail") {
+                    decoded.push(frame.to_vec());
+                }
+            }
+            // After feeding everything, no partial bytes should be left.
+            assert!(
+                buf.is_empty(),
+                "iter {iter}: trailing bytes after stream end"
+            );
+            assert_eq!(
+                decoded.len(),
+                payloads.len(),
+                "iter {iter}: wrong frame count"
+            );
+            // Each decoded frame must match its original byte-for-byte.
+            for (i, (got, want)) in decoded.iter().zip(payloads.iter()).enumerate() {
+                if got != want {
+                    // Hash mismatch for cheap diagnostic in the panic.
+                    let mut h_got = DefaultHasher::new();
+                    h_got.write(got);
+                    let mut h_want = DefaultHasher::new();
+                    h_want.write(want);
+                    panic!(
+                        "iter {iter}: frame {i} mismatch (len got={}, want={}, hash got={:x}, want={:x})",
+                        got.len(),
+                        want.len(),
+                        h_got.finish(),
+                        h_want.finish()
+                    );
+                }
+            }
+        }
+    }
 }
