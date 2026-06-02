@@ -1164,6 +1164,7 @@ impl AgentAdapter for ProbeOnlyAdapter {
 async fn bootstrap_daemon_with_adapters(
     adapters: HashMap<String, Arc<dyn AgentAdapter>>,
 ) -> TestDaemon {
+    let expected_backends = adapters.len();
     let tempdir = tempfile::tempdir().expect("tempdir");
     let runtime_dir = tempdir.path().join("runtime");
     let state_dir = tempdir.path().join("state");
@@ -1190,12 +1191,41 @@ async fn bootstrap_daemon_with_adapters(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    wait_for_health_snapshot(&socket, expected_backends).await;
     TestDaemon {
         socket,
         handle,
         join,
         _tempdir: tempdir,
     }
+}
+
+async fn wait_for_health_snapshot(socket: &std::path::Path, expected_backends: usize) {
+    use la_proto::methods::{EventTopic, EventsSubscribeParams, EventsSubscribeResult};
+    use la_proto::notifications::DaemonHealthParams;
+
+    let mut conn = client(socket).await;
+    let sub = EventsSubscribeParams {
+        topics: vec![EventTopic::DaemonHealth],
+    };
+    send_request(&mut conn, -1, "events.subscribe", &sub).await;
+    let _: EventsSubscribeResult =
+        serde_json::from_value(recv_response_for(&mut conn, -1).await).expect("decode sub");
+
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), conn.recv()).await {
+            Ok(Ok(Some(Message::Notification(n)))) if n.method == "daemon.health" => {
+                let params: DaemonHealthParams =
+                    serde_json::from_value(n.params.expect("params")).expect("decode health");
+                if params.backends.len() >= expected_backends {
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("daemon.health snapshot never populated all {expected_backends} backends");
 }
 
 async fn recv_error_for(
