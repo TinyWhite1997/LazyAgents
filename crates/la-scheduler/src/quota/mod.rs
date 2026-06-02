@@ -36,6 +36,39 @@
 //! against the per-day cap because the user-observable "this cron tried to
 //! fire just now" is one attempt — the suppressed N-1 missed fires don't
 //! get charged.
+//!
+//! ## Caller contract: serialize admit-then-insert per cron
+//!
+//! [`evaluate_admission`] is a pure function over an already-taken
+//! snapshot. It does NOT lock anything, and the daemon's
+//! `RunsRepo::create` / `RunsRepo::create_rejected` writes happen
+//! *afterwards*. A naive caller that lets two concurrent
+//! [`FireEvent`]s for the same cron race like this:
+//!
+//! ```text
+//! Tick A → snapshot { running_for_cron: 0 } → Admit
+//! Tick B → snapshot { running_for_cron: 0 } → Admit   ← both pass!
+//! Tick A → RunsRepo::create(running)
+//! Tick B → RunsRepo::create(running)                  ← max_concurrent_runs=1 violated
+//! ```
+//!
+//! ...will silently bypass `max_concurrent_runs` (and the per-day cap
+//! near its edge). The daemon **MUST** serialize the
+//! "take snapshot → evaluate_admission → insert resulting `runs` row"
+//! sequence per cron. The simplest correct implementation is one
+//! `tokio::sync::Mutex` per `cron_id` (held only across those three
+//! steps, NOT across the actual session spawn); a global admission lock
+//! also works but serialises unrelated crons unnecessarily.
+//!
+//! The `global_max_concurrent_runs` rail has the same TOCTOU shape and
+//! the same fix; in practice the per-cron mutex plus the harmless
+//! bounded over-shoot (max one extra run per concurrent admission
+//! attempt) is acceptable because the global cap is a safety belt, not
+//! a hard quota the user sees enforced to the unit.
+//!
+//! This contract cannot be enforced inside `la-scheduler` — the lock has
+//! to live where the writes happen. The la-daemon run executor wiring
+//! brief (M3.4 / M3.5) MUST encode it.
 
 pub mod backoff;
 pub mod loadavg;
