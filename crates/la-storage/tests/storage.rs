@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use la_storage::{
-    AppendOutcome, BackendUpsert, ChunkKind, NewProject, NewSession, Storage, StorageConfig,
-    StorageError, CURRENT_SCHEMA_VERSION,
+    AppendOutcome, BackendUpsert, ChunkKind, CronUpsert, NewProject, NewRun, NewSession, RunFinish,
+    RunsListFilter, Storage, StorageConfig, StorageError, CURRENT_SCHEMA_VERSION,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{Connection, Executor, SqliteConnection};
@@ -93,10 +93,7 @@ async fn migrations_enable_wal_and_schema_meta() {
         .schema_meta("migration")
         .await
         .expect("migration meta");
-    assert_eq!(
-        migration.as_deref(),
-        Some("0003_session_external_reference")
-    );
+    assert_eq!(migration.as_deref(), Some("0004_crons_runs"));
 }
 
 #[tokio::test]
@@ -122,6 +119,130 @@ async fn open_rejects_schema_newer_than_supported() {
         }
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn crons_and_runs_cover_crud_and_archive_paths() {
+    let (_dir, storage) = open_storage().await;
+    let (_backend_id, project_id, _session_id) = seed_backend_project_session(&storage).await;
+    let cron_id = la_storage::new_id();
+
+    let cron = storage
+        .crons()
+        .upsert(CronUpsert {
+            id: cron_id.clone(),
+            name: "nightly".into(),
+            enabled: true,
+            project_id: project_id.clone(),
+            backend_id: "claude".into(),
+            spawn_args: serde_json::json!({"cwd":"/tmp/lazyagents/project"}),
+            prompt: "summarize".into(),
+            cron_expr: "17 3 * * *".into(),
+            tz: "UTC".into(),
+            catchup_mode: "coalesce".into(),
+            max_concurrent_runs: 1,
+            max_runs_per_day: 24,
+            max_runtime_s: 1800,
+            cost_budget_usd_per_day: Some(1.5),
+            failure_backoff: "expo(1m,2,1h)".into(),
+            pause_on_consecutive_failures: 5,
+            consecutive_failures: 0,
+            last_fired_at: None,
+            next_fire_at: Some("2000-01-01 03:17:00".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cron.enabled, 1);
+    assert_eq!(
+        storage
+            .crons()
+            .list_enabled_due("2000-01-02")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(storage
+        .crons()
+        .mark_fired(&cron_id, "2000-01-01 03:17:00", Some("2000-01-02 03:17:00"))
+        .await
+        .unwrap());
+
+    let run = storage
+        .runs()
+        .create(NewRun {
+            id: "run-old".into(),
+            cron_id: Some(cron_id.clone()),
+            session_id: None,
+            scheduled_at: "2000-01-01 03:17:00".into(),
+            started_at: Some("2000-01-01 03:17:01".into()),
+            status: "running".into(),
+            coalesced_count: 2,
+        })
+        .await
+        .unwrap();
+    assert_eq!(run.coalesced_count, 2);
+    assert!(storage
+        .runs()
+        .attach_session("run-old", &_session_id)
+        .await
+        .unwrap());
+    assert!(storage
+        .runs()
+        .finish(
+            "run-old",
+            RunFinish {
+                finished_at: "2000-01-01 03:18:00".into(),
+                status: "completed".into(),
+                exit_code: Some(0),
+                cost_usd_est: Some(0.01),
+                error_kind: None,
+                error_detail: None,
+                tail_log: Some(vec![b'x'; 70 * 1024]),
+            },
+        )
+        .await
+        .unwrap());
+    let listed = storage
+        .runs()
+        .list(RunsListFilter {
+            cron_id: Some(&cron_id),
+            since: Some("1999-01-01"),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].tail_log.as_ref().unwrap().len(), 64 * 1024);
+
+    let outcome = storage.runs().archive_older_than_days(90).await.unwrap();
+    assert_eq!(outcome.archived_rows, 1);
+    assert_eq!(outcome.archive_files, 1);
+    assert!(storage.runs().get("run-old").await.unwrap().is_none());
+    assert!(storage
+        .data_dir()
+        .join("runs/archive/200001.jsonl.zst")
+        .exists());
+}
+
+#[tokio::test]
+async fn backup_file_can_open_as_new_storage_database() {
+    let (dir, storage) = open_storage().await;
+    let (_backend_id, project_id, _session_id) = seed_backend_project_session(&storage).await;
+    let backup_path = dir.path().join("backup.sqlite");
+    storage.backup_to(&backup_path).await.unwrap();
+    storage.close().await;
+
+    let restore_dir = TempDir::new().expect("restore dir");
+    let restored = Storage::open(StorageConfig::new(&backup_path, restore_dir.path()))
+        .await
+        .expect("open backup as storage");
+    assert!(restored
+        .projects()
+        .get(&project_id)
+        .await
+        .unwrap()
+        .is_some());
 }
 
 #[tokio::test]

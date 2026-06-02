@@ -1,3 +1,4 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -33,6 +34,145 @@ pub struct NewProject {
     pub root_path: String,
     pub display_name: String,
     pub vcs: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow)]
+pub struct Cron {
+    pub id: String,
+    pub name: String,
+    pub enabled: i64,
+    pub project_id: String,
+    pub backend_id: String,
+    pub spawn_args: String,
+    pub prompt: String,
+    pub cron_expr: String,
+    pub tz: String,
+    pub catchup_mode: String,
+    pub max_concurrent_runs: i64,
+    pub max_runs_per_day: i64,
+    pub max_runtime_s: i64,
+    pub cost_budget_usd_per_day: Option<f64>,
+    pub failure_backoff: String,
+    pub pause_on_consecutive_failures: i64,
+    pub consecutive_failures: i64,
+    pub last_fired_at: Option<String>,
+    pub next_fire_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CronUpsert {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub project_id: String,
+    pub backend_id: String,
+    pub spawn_args: serde_json::Value,
+    pub prompt: String,
+    pub cron_expr: String,
+    pub tz: String,
+    pub catchup_mode: String,
+    pub max_concurrent_runs: i64,
+    pub max_runs_per_day: i64,
+    pub max_runtime_s: i64,
+    pub cost_budget_usd_per_day: Option<f64>,
+    pub failure_backoff: String,
+    pub pause_on_consecutive_failures: i64,
+    pub consecutive_failures: i64,
+    pub last_fired_at: Option<String>,
+    pub next_fire_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow)]
+pub struct RunRecord {
+    pub id: String,
+    pub cron_id: Option<String>,
+    pub session_id: Option<String>,
+    pub scheduled_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub coalesced_count: i64,
+    pub cost_usd_est: Option<f64>,
+    pub error_kind: Option<String>,
+    pub error_detail: Option<String>,
+    pub tail_log: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRun {
+    pub id: String,
+    pub cron_id: Option<String>,
+    pub session_id: Option<String>,
+    pub scheduled_at: String,
+    pub started_at: Option<String>,
+    pub status: String,
+    pub coalesced_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunFinish {
+    pub finished_at: String,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub cost_usd_est: Option<f64>,
+    pub error_kind: Option<String>,
+    pub error_detail: Option<String>,
+    pub tail_log: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunsListFilter<'a> {
+    pub cron_id: Option<&'a str>,
+    pub since: Option<&'a str>,
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunsArchiveOutcome {
+    pub archived_rows: u64,
+    pub archive_files: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RunArchiveLine {
+    pub id: String,
+    pub cron_id: Option<String>,
+    pub session_id: Option<String>,
+    pub scheduled_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub coalesced_count: i64,
+    pub cost_usd_est: Option<f64>,
+    pub error_kind: Option<String>,
+    pub error_detail: Option<String>,
+    pub tail_log_base64: Option<String>,
+}
+
+impl From<RunRecord> for RunArchiveLine {
+    fn from(run: RunRecord) -> Self {
+        Self {
+            id: run.id,
+            cron_id: run.cron_id,
+            session_id: run.session_id,
+            scheduled_at: run.scheduled_at,
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            status: run.status,
+            exit_code: run.exit_code,
+            coalesced_count: run.coalesced_count,
+            cost_usd_est: run.cost_usd_est,
+            error_kind: run.error_kind,
+            error_detail: run.error_detail,
+            tail_log_base64: run
+                .tail_log
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]

@@ -41,6 +41,7 @@ impl StorageConfig {
 pub struct Storage {
     writer: SqlitePool,
     reader: SqlitePool,
+    database_path: PathBuf,
     data_dir: PathBuf,
     transcript_spill_bytes: i64,
 }
@@ -70,6 +71,7 @@ impl Storage {
         Ok(Self {
             writer,
             reader,
+            database_path: config.database_path,
             data_dir: config.data_dir,
             transcript_spill_bytes: config.transcript_spill_bytes,
         })
@@ -85,6 +87,10 @@ impl Storage {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
     }
 
     pub fn transcript_spill_bytes(&self) -> i64 {
@@ -103,6 +109,14 @@ impl Storage {
         repos::SessionsRepo::new(self)
     }
 
+    pub fn crons(&self) -> repos::CronsRepo<'_> {
+        repos::CronsRepo::new(self)
+    }
+
+    pub fn runs(&self) -> repos::RunsRepo<'_> {
+        repos::RunsRepo::new(self)
+    }
+
     pub fn chunks(&self) -> repos::ChunksRepo<'_> {
         repos::ChunksRepo::new(self)
     }
@@ -114,6 +128,28 @@ impl Storage {
     pub async fn close(&self) {
         self.reader.close().await;
         self.writer.close().await;
+    }
+
+    /// Create a consistent SQLite snapshot with the Online Backup API.
+    ///
+    /// This deliberately does not copy the WAL/SHM sidecars; SQLite
+    /// materializes a standalone destination database that can be used as a
+    /// fresh `lad.sqlite` in another state directory.
+    pub async fn backup_to(&self, output: impl Into<PathBuf>) -> Result<()> {
+        let source = self.database_path.clone();
+        let output = output.into();
+        if let Some(parent) = output.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let source = rusqlite::Connection::open(source)?;
+            let mut destination = rusqlite::Connection::open(output)?;
+            let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
+            backup.run_to_completion(64, std::time::Duration::from_millis(10), None)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
     }
 }
 

@@ -12,9 +12,11 @@ base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
+rusqlite = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

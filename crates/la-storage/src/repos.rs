@@ -1,5 +1,6 @@
+use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
@@ -9,8 +10,9 @@ use sqlx::{Error as SqlxError, Sqlite, Transaction};
 use tokio::io::AsyncWriteExt;
 
 use crate::models::{
-    AppendOutcome, Backend, BackendUpsert, ChunkKind, NewProject, NewSession, Project, Session,
-    SessionChunk, SpillLine,
+    AppendOutcome, Backend, BackendUpsert, ChunkKind, Cron, CronUpsert, NewProject, NewRun,
+    NewSession, Project, RunArchiveLine, RunFinish, RunRecord, RunsArchiveOutcome, RunsListFilter,
+    Session, SessionChunk, SpillLine,
 };
 use crate::{Result, Storage, StorageError};
 
@@ -147,6 +149,400 @@ impl<'a> ProjectsRepo<'a> {
         })
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+}
+
+pub struct CronsRepo<'a> {
+    storage: &'a Storage,
+}
+
+impl<'a> CronsRepo<'a> {
+    pub(crate) fn new(storage: &'a Storage) -> Self {
+        Self { storage }
+    }
+
+    pub async fn upsert(&self, cron: CronUpsert) -> Result<Cron> {
+        let spawn_args = serde_json::to_string(&cron.spawn_args)?;
+        retry_busy(|| async {
+            sqlx::query(
+                r#"
+                INSERT INTO crons(
+                    id, name, enabled, project_id, backend_id, spawn_args, prompt,
+                    cron_expr, tz, catchup_mode, max_concurrent_runs, max_runs_per_day,
+                    max_runtime_s, cost_budget_usd_per_day, failure_backoff,
+                    pause_on_consecutive_failures, consecutive_failures, last_fired_at,
+                    next_fire_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    enabled = excluded.enabled,
+                    project_id = excluded.project_id,
+                    backend_id = excluded.backend_id,
+                    spawn_args = excluded.spawn_args,
+                    prompt = excluded.prompt,
+                    cron_expr = excluded.cron_expr,
+                    tz = excluded.tz,
+                    catchup_mode = excluded.catchup_mode,
+                    max_concurrent_runs = excluded.max_concurrent_runs,
+                    max_runs_per_day = excluded.max_runs_per_day,
+                    max_runtime_s = excluded.max_runtime_s,
+                    cost_budget_usd_per_day = excluded.cost_budget_usd_per_day,
+                    failure_backoff = excluded.failure_backoff,
+                    pause_on_consecutive_failures = excluded.pause_on_consecutive_failures,
+                    consecutive_failures = excluded.consecutive_failures,
+                    last_fired_at = excluded.last_fired_at,
+                    next_fire_at = excluded.next_fire_at,
+                    updated_at = datetime('now')
+                "#,
+            )
+            .bind(&cron.id)
+            .bind(&cron.name)
+            .bind(if cron.enabled { 1_i64 } else { 0_i64 })
+            .bind(&cron.project_id)
+            .bind(&cron.backend_id)
+            .bind(&spawn_args)
+            .bind(&cron.prompt)
+            .bind(&cron.cron_expr)
+            .bind(&cron.tz)
+            .bind(&cron.catchup_mode)
+            .bind(cron.max_concurrent_runs)
+            .bind(cron.max_runs_per_day)
+            .bind(cron.max_runtime_s)
+            .bind(cron.cost_budget_usd_per_day)
+            .bind(&cron.failure_backoff)
+            .bind(cron.pause_on_consecutive_failures)
+            .bind(cron.consecutive_failures)
+            .bind(&cron.last_fired_at)
+            .bind(&cron.next_fire_at)
+            .execute(self.storage.writer_pool())
+            .await
+        })
+        .await?;
+        self.get(&cron.id)
+            .await?
+            .ok_or(StorageError::MissingCron(cron.id))
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Option<Cron>> {
+        sqlx::query_as::<_, Cron>(CRON_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(self.storage.reader_pool())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list(&self) -> Result<Vec<Cron>> {
+        sqlx::query_as::<_, Cron>(
+            r#"
+            SELECT id, name, enabled, project_id, backend_id, spawn_args, prompt,
+                   cron_expr, tz, catchup_mode, max_concurrent_runs, max_runs_per_day,
+                   max_runtime_s, cost_budget_usd_per_day, failure_backoff,
+                   pause_on_consecutive_failures, consecutive_failures, last_fired_at,
+                   next_fire_at, created_at, updated_at
+            FROM crons
+            ORDER BY name, id
+            "#,
+        )
+        .fetch_all(self.storage.reader_pool())
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn list_enabled_due(&self, now: &str) -> Result<Vec<Cron>> {
+        sqlx::query_as::<_, Cron>(
+            r#"
+            SELECT id, name, enabled, project_id, backend_id, spawn_args, prompt,
+                   cron_expr, tz, catchup_mode, max_concurrent_runs, max_runs_per_day,
+                   max_runtime_s, cost_budget_usd_per_day, failure_backoff,
+                   pause_on_consecutive_failures, consecutive_failures, last_fired_at,
+                   next_fire_at, created_at, updated_at
+            FROM crons
+            WHERE enabled = 1 AND next_fire_at IS NOT NULL AND next_fire_at <= ?1
+            ORDER BY next_fire_at, id
+            "#,
+        )
+        .bind(now)
+        .fetch_all(self.storage.reader_pool())
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn mark_fired(
+        &self,
+        id: &str,
+        last_fired_at: &str,
+        next_fire_at: Option<&str>,
+    ) -> Result<bool> {
+        let result = retry_busy(|| async {
+            sqlx::query(
+                r#"
+                UPDATE crons
+                SET last_fired_at = ?2, next_fire_at = ?3, updated_at = datetime('now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(id)
+            .bind(last_fired_at)
+            .bind(next_fire_at)
+            .execute(self.storage.writer_pool())
+            .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = retry_busy(|| async {
+            sqlx::query("UPDATE crons SET enabled = ?2, updated_at = datetime('now') WHERE id = ?1")
+                .bind(id)
+                .bind(if enabled { 1_i64 } else { 0_i64 })
+                .execute(self.storage.writer_pool())
+                .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete(&self, id: &str) -> Result<bool> {
+        let result = retry_busy(|| async {
+            sqlx::query("DELETE FROM crons WHERE id = ?1")
+                .bind(id)
+                .execute(self.storage.writer_pool())
+                .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+pub struct RunsRepo<'a> {
+    storage: &'a Storage,
+}
+
+impl<'a> RunsRepo<'a> {
+    pub(crate) fn new(storage: &'a Storage) -> Self {
+        Self { storage }
+    }
+
+    pub async fn create(&self, run: NewRun) -> Result<RunRecord> {
+        retry_busy(|| async {
+            sqlx::query(
+                r#"
+                INSERT INTO runs(
+                    id, cron_id, session_id, scheduled_at, started_at, status,
+                    coalesced_count
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+            )
+            .bind(&run.id)
+            .bind(&run.cron_id)
+            .bind(&run.session_id)
+            .bind(&run.scheduled_at)
+            .bind(&run.started_at)
+            .bind(&run.status)
+            .bind(run.coalesced_count)
+            .execute(self.storage.writer_pool())
+            .await
+        })
+        .await?;
+        self.get(&run.id)
+            .await?
+            .ok_or(StorageError::MissingRun(run.id))
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Option<RunRecord>> {
+        sqlx::query_as::<_, RunRecord>(RUN_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(self.storage.reader_pool())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list(&self, filter: RunsListFilter<'_>) -> Result<Vec<RunRecord>> {
+        let limit = filter.limit.clamp(1, 500);
+        match (filter.cron_id, filter.since) {
+            (Some(cron_id), Some(since)) => sqlx::query_as::<_, RunRecord>(
+                r#"
+                    SELECT id, cron_id, session_id, scheduled_at, started_at, finished_at,
+                           status, exit_code, coalesced_count, cost_usd_est, error_kind,
+                           error_detail, tail_log
+                    FROM runs
+                    WHERE cron_id = ?1 AND scheduled_at >= ?2
+                    ORDER BY scheduled_at DESC, id DESC
+                    LIMIT ?3
+                    "#,
+            )
+            .bind(cron_id)
+            .bind(since)
+            .bind(limit)
+            .fetch_all(self.storage.reader_pool())
+            .await
+            .map_err(Into::into),
+            (Some(cron_id), None) => sqlx::query_as::<_, RunRecord>(
+                r#"
+                    SELECT id, cron_id, session_id, scheduled_at, started_at, finished_at,
+                           status, exit_code, coalesced_count, cost_usd_est, error_kind,
+                           error_detail, tail_log
+                    FROM runs
+                    WHERE cron_id = ?1
+                    ORDER BY scheduled_at DESC, id DESC
+                    LIMIT ?2
+                    "#,
+            )
+            .bind(cron_id)
+            .bind(limit)
+            .fetch_all(self.storage.reader_pool())
+            .await
+            .map_err(Into::into),
+            (None, Some(since)) => sqlx::query_as::<_, RunRecord>(
+                r#"
+                    SELECT id, cron_id, session_id, scheduled_at, started_at, finished_at,
+                           status, exit_code, coalesced_count, cost_usd_est, error_kind,
+                           error_detail, tail_log
+                    FROM runs
+                    WHERE scheduled_at >= ?1
+                    ORDER BY scheduled_at DESC, id DESC
+                    LIMIT ?2
+                    "#,
+            )
+            .bind(since)
+            .bind(limit)
+            .fetch_all(self.storage.reader_pool())
+            .await
+            .map_err(Into::into),
+            (None, None) => sqlx::query_as::<_, RunRecord>(
+                r#"
+                    SELECT id, cron_id, session_id, scheduled_at, started_at, finished_at,
+                           status, exit_code, coalesced_count, cost_usd_est, error_kind,
+                           error_detail, tail_log
+                    FROM runs
+                    ORDER BY scheduled_at DESC, id DESC
+                    LIMIT ?1
+                    "#,
+            )
+            .bind(limit)
+            .fetch_all(self.storage.reader_pool())
+            .await
+            .map_err(Into::into),
+        }
+    }
+
+    pub async fn attach_session(&self, id: &str, session_id: &str) -> Result<bool> {
+        let result = retry_busy(|| async {
+            sqlx::query("UPDATE runs SET session_id = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(session_id)
+                .execute(self.storage.writer_pool())
+                .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_status(&self, id: &str, status: &str) -> Result<bool> {
+        let result = retry_busy(|| async {
+            sqlx::query("UPDATE runs SET status = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(status)
+                .execute(self.storage.writer_pool())
+                .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn finish(&self, id: &str, finish: RunFinish) -> Result<bool> {
+        let tail_log = finish.tail_log.map(|mut bytes| {
+            if bytes.len() > 64 * 1024 {
+                bytes = bytes.split_off(bytes.len() - 64 * 1024);
+            }
+            bytes
+        });
+        let result = retry_busy(|| async {
+            sqlx::query(
+                r#"
+                UPDATE runs
+                SET finished_at = ?2,
+                    status = ?3,
+                    exit_code = ?4,
+                    cost_usd_est = ?5,
+                    error_kind = ?6,
+                    error_detail = ?7,
+                    tail_log = ?8
+                WHERE id = ?1
+                "#,
+            )
+            .bind(id)
+            .bind(&finish.finished_at)
+            .bind(&finish.status)
+            .bind(finish.exit_code)
+            .bind(finish.cost_usd_est)
+            .bind(&finish.error_kind)
+            .bind(&finish.error_detail)
+            .bind(&tail_log)
+            .execute(self.storage.writer_pool())
+            .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn archive_older_than_days(&self, retention_days: i64) -> Result<RunsArchiveOutcome> {
+        let modifier = format!("-{} days", retention_days.max(1));
+        let rows = sqlx::query_as::<_, RunRecord>(
+            r#"
+            SELECT id, cron_id, session_id, scheduled_at, started_at, finished_at,
+                   status, exit_code, coalesced_count, cost_usd_est, error_kind,
+                   error_detail, tail_log
+            FROM runs
+            WHERE scheduled_at < datetime('now', ?1)
+            ORDER BY scheduled_at, id
+            "#,
+        )
+        .bind(&modifier)
+        .fetch_all(self.storage.reader_pool())
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(RunsArchiveOutcome {
+                archived_rows: 0,
+                archive_files: 0,
+            });
+        }
+
+        let mut by_month: BTreeMap<String, Vec<RunRecord>> = BTreeMap::new();
+        for row in rows {
+            by_month
+                .entry(archive_month_key(&row.scheduled_at))
+                .or_default()
+                .push(row);
+        }
+
+        let archive_dir = self.storage.data_dir().join("runs").join("archive");
+        tokio::fs::create_dir_all(&archive_dir).await?;
+
+        let mut archived_ids = Vec::new();
+        for (month, rows) in by_month.iter() {
+            let path = archive_dir.join(format!("{month}.jsonl.zst"));
+            append_runs_archive(&path, rows).await?;
+            archived_ids.extend(rows.iter().map(|row| row.id.clone()));
+        }
+
+        let mut tx = self.storage.writer_pool().begin().await?;
+        for id in &archived_ids {
+            sqlx::query("DELETE FROM runs WHERE id = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        Ok(RunsArchiveOutcome {
+            archived_rows: archived_ids.len() as u64,
+            archive_files: by_month.len(),
+        })
     }
 }
 
@@ -677,6 +1073,62 @@ async fn session_by_id(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<Opt
     .fetch_optional(&mut **tx)
     .await
     .map_err(Into::into)
+}
+
+const CRON_SELECT_BY_ID: &str = r#"
+SELECT id, name, enabled, project_id, backend_id, spawn_args, prompt,
+       cron_expr, tz, catchup_mode, max_concurrent_runs, max_runs_per_day,
+       max_runtime_s, cost_budget_usd_per_day, failure_backoff,
+       pause_on_consecutive_failures, consecutive_failures, last_fired_at,
+       next_fire_at, created_at, updated_at
+FROM crons
+WHERE id = ?1
+"#;
+
+const RUN_SELECT_BY_ID: &str = r#"
+SELECT id, cron_id, session_id, scheduled_at, started_at, finished_at,
+       status, exit_code, coalesced_count, cost_usd_est, error_kind,
+       error_detail, tail_log
+FROM runs
+WHERE id = ?1
+"#;
+
+fn archive_month_key(scheduled_at: &str) -> String {
+    let digits: String = scheduled_at
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .take(6)
+        .collect();
+    if digits.len() == 6 {
+        digits
+    } else {
+        "unknown".to_string()
+    }
+}
+
+async fn append_runs_archive(path: &Path, rows: &[RunRecord]) -> Result<()> {
+    let path = path.to_path_buf();
+    let lines = rows
+        .iter()
+        .cloned()
+        .map(|row| serde_json::to_string(&RunArchiveLine::from(row)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let mut encoder = zstd::stream::write::Encoder::new(file, 0)?;
+        for line in lines {
+            use std::io::Write;
+            encoder.write_all(line.as_bytes())?;
+            encoder.write_all(b"\n")?;
+        }
+        encoder.finish()?;
+        Ok(())
+    })
+    .await??;
+    Ok(())
 }
 
 async fn update_transcript_bytes(

@@ -35,6 +35,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 schemars = { version = "0.8", features = ["preserve_order"] }
 base64 = "0.22"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive"] }
+rusqlite = { version = "0.32", features = ["backup"] }
 uuid = { version = "1", features = ["v7"] }
 nix = { version = "0.29", default-features = false, features = ["signal"] }
 windows-sys = { version = "0.59", features = [
@@ -46,6 +47,7 @@ tempfile = "3"
 cron = "0.16"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
+zstd = "0.13"
 la-pty = { path = "crates/la-pty" }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events", "event-stream", "windows"] }
