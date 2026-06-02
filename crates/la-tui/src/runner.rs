@@ -8,7 +8,7 @@
 //! crossterm I/O to those layers.
 
 use std::io;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use crossterm::event::{
@@ -98,13 +98,8 @@ fn event_loop<S: SessionSource>(
         // Drain any pending health events between renders so a fresh
         // `daemon.health` snapshot is reflected on the very next frame.
         if let Some(rx) = health_rx.as_ref() {
-            loop {
-                match rx.try_recv() {
-                    Ok(HealthEvent::Backends(badges)) => {
-                        let _ = app.handle(AppMsg::BackendsUpdate(badges));
-                    }
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-                }
+            while let Ok(HealthEvent::Backends(badges)) = rx.try_recv() {
+                let _ = app.handle(AppMsg::BackendsUpdate(badges));
             }
         }
         // Poll so the screen refreshes periodically; the 250ms cap also
