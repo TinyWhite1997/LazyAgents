@@ -373,6 +373,14 @@ impl EditField {
         let i = EditField::ALL.iter().position(|f| *f == self).unwrap_or(0);
         EditField::ALL[(i + EditField::ALL.len() - 1) % EditField::ALL.len()]
     }
+    /// Whether this field's buffer is allowed to contain `\n`. The
+    /// runner uses it to decide whether `Enter` inserts a newline
+    /// (multi-line fields) or saves the draft (single-line fields), and
+    /// [`CronsState::field_input`] uses it to drop stray
+    /// [`FieldEdit::InsertNewline`] on the wrong field.
+    pub fn is_multiline(self) -> bool {
+        matches!(self, EditField::SpawnArgs | EditField::Prompt)
+    }
 }
 
 /// State for the Crons tab. Owns the list cursor, the in-progress edit
@@ -594,6 +602,13 @@ impl CronsState {
     /// is char-grained on purpose — we never want to re-tokenise the
     /// whole buffer per keystroke just because the preview wants to
     /// refresh. Returns `true` if the buffer was modified.
+    ///
+    /// `FieldEdit::InsertNewline` is only honoured on the multi-line
+    /// fields ([`EditField::SpawnArgs`] / [`EditField::Prompt`]); on
+    /// the single-line fields it is silently ignored so a stray `Enter`
+    /// in `name` / `cron_expr` / `tz` / `budget` neither saves the draft
+    /// (the runner already ate that case) nor smuggles a `\n` into a
+    /// field the daemon will reject.
     pub fn field_input(&mut self, edit: FieldEdit) -> bool {
         if self.draft.is_none() {
             // First keystroke on the editor: clone the selected row into
@@ -603,6 +618,12 @@ impl CronsState {
                 return false;
             };
             self.draft = Some(seed);
+        }
+        // Drop newlines on single-line fields up front — keeps the
+        // per-field branch arms uniform and makes "is this field
+        // multi-line?" the single source of truth.
+        if matches!(edit, FieldEdit::InsertNewline) && !self.field.is_multiline() {
+            return false;
         }
         let draft = self
             .draft
@@ -695,6 +716,13 @@ impl Default for CronsState {
 pub enum FieldEdit {
     /// Append a printable char.
     Insert(char),
+    /// Append a literal newline. Only meaningful on the multi-line
+    /// fields ([`EditField::SpawnArgs`], [`EditField::Prompt`]); the
+    /// other single-line fields drop it on the floor in
+    /// [`apply_to_line`]. The runner produces this when the user
+    /// presses `Enter` inside one of those fields, leaving `Ctrl+S` as
+    /// the unambiguous "save now" gesture (WEK-35 review fix).
+    InsertNewline,
     /// Backspace.
     Backspace,
     /// Replace the whole buffer (used by the runner to seed/replace, and
@@ -706,6 +734,10 @@ fn apply_to_line(buf: &mut String, edit: &FieldEdit) -> bool {
     match edit {
         FieldEdit::Insert(c) => {
             buf.push(*c);
+            true
+        }
+        FieldEdit::InsertNewline => {
+            buf.push('\n');
             true
         }
         FieldEdit::Backspace => buf.pop().is_some(),

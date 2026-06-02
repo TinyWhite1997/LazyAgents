@@ -170,8 +170,13 @@ pub enum AppMsg {
     CronFieldPrev,
     /// One keystroke into the active field.
     CronFieldEdit(FieldEdit),
-    /// `Ctrl+S` / `Enter` from list — commit the in-flight draft.
+    /// `Ctrl+S` from list or editor — commit the in-flight draft.
     CronSaveDraft,
+    /// `Enter` from the editor pane. The App decides at dispatch time
+    /// whether to insert a newline (multi-line field) or save the draft
+    /// (single-line field) — that keeps the policy in one place instead
+    /// of forcing the input layer to know the active field.
+    CronEditorEnter,
     /// `Esc` from the editor with a draft open — discard it.
     CronCancelDraft,
 }
@@ -372,6 +377,18 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 self.crons.field_input(edit);
             }
             AppMsg::CronSaveDraft => self.on_cron_save(),
+            AppMsg::CronEditorEnter => {
+                // Multi-line field → insert a newline so prompts and
+                // arg lists actually accept multiple rows. Single-line
+                // field → save, matching the muscle memory the user
+                // already has from the list pane's "Enter = primary".
+                if self.crons.field().is_multiline() {
+                    self.crons
+                        .field_input(crate::crons::FieldEdit::InsertNewline);
+                } else {
+                    self.on_cron_save();
+                }
+            }
             AppMsg::CronCancelDraft => {
                 if self.crons.cancel_edit() {
                     self.last_toast = Some("draft discarded".into());
@@ -655,6 +672,14 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             .crons
             .commit_draft()
             .expect("draft was Some moments ago");
+        // TODO(M3.5): `CronSource::upsert` will become an IPC round-trip
+        // that returns the daemon-assigned UUID — `commit_draft`'s
+        // optimistic local push uses a `draft-N` placeholder id, so
+        // `set_crons` (via `refresh_crons`) loses the cursor on insert
+        // because the post-save snapshot keys the row under a new id.
+        // Plan for M3.5: make the trait return `Cron`, reseed the cursor
+        // from the response. Mock today preserves the id so the unit
+        // tests stay deterministic.
         self.cron_source.upsert(committed);
         self.refresh_crons();
         self.focus = Focus::Sidebar;

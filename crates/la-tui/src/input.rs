@@ -156,12 +156,15 @@ fn translate_crons_key(code: KeyCode, mods: KeyModifiers, focus: Focus) -> Optio
         });
     }
     // Editor pane: printable chars → field edit; only structural keys
-    // are reserved.
+    // are reserved. `Enter` does NOT save unconditionally — the App
+    // decides (CronEditorEnter inserts a newline on multi-line fields,
+    // saves on single-line). Explicit "save now" stays on Ctrl+S so the
+    // multi-line fields are still typable.
     Some(match code {
         KeyCode::Esc => AppMsg::CronCancelDraft,
         KeyCode::Tab => AppMsg::CronFieldNext,
         KeyCode::BackTab => AppMsg::CronFieldPrev,
-        KeyCode::Enter => AppMsg::CronSaveDraft,
+        KeyCode::Enter => AppMsg::CronEditorEnter,
         KeyCode::Backspace => AppMsg::CronFieldEdit(FieldEdit::Backspace),
         KeyCode::Char(c) => AppMsg::CronFieldEdit(FieldEdit::Insert(c)),
         _ => return None,

@@ -281,3 +281,96 @@ fn editor_pane_invalid_expr_renders_error_marker() {
         "invalid-expression marker rendered:\n{text}"
     );
 }
+
+/// WEK-35 architect review (must-fix): the brief calls out "prompt（多行）"
+/// and "args (one per line)". `Enter` inside those fields must insert a
+/// newline, not save the draft. Conversely, on a single-line field
+/// (Name / CronExpr / Tz / Budget / Backend), `Enter` still saves.
+/// Both paths are routed through the App via `CronEditorEnter` so the
+/// per-field behaviour stays in one place.
+#[test]
+fn enter_on_prompt_inserts_newline_then_ctrl_s_saves_multi_line_value() {
+    let mut a = app();
+    a.handle(AppMsg::SetTab(Tab::Crons));
+    a.handle(AppMsg::CronNew);
+    // Walk to the Prompt field.
+    while a.crons.field() != EditField::Prompt {
+        a.handle(AppMsg::CronFieldNext);
+    }
+    // Replace whatever the skeleton seeded with a deterministic value.
+    a.handle(AppMsg::CronFieldEdit(FieldEdit::SetAll("line1".into())));
+    // Press Enter. Because the field is multi-line, this MUST insert a
+    // `\n` and MUST NOT save the draft.
+    a.handle(AppMsg::CronEditorEnter);
+    assert!(
+        a.crons.draft().is_some(),
+        "Enter on a multi-line field does not save"
+    );
+    // Type the second line.
+    for ch in "line2".chars() {
+        a.handle(AppMsg::CronFieldEdit(FieldEdit::Insert(ch)));
+    }
+    let draft = a.crons.draft().expect("draft still open");
+    assert_eq!(
+        draft.prompt, "line1\nline2",
+        "prompt buffer holds the literal newline"
+    );
+    // Save is now an unambiguous Ctrl+S (the input layer maps Ctrl+S
+    // to `CronSaveDraft` from either focus); the App handler is the
+    // same one Enter would have called on a single-line field.
+    a.handle(AppMsg::CronSaveDraft);
+    let saved = a
+        .crons
+        .crons()
+        .iter()
+        .find(|c| c.prompt == "line1\nline2")
+        .expect("multi-line prompt persisted on save");
+    assert_eq!(saved.prompt, "line1\nline2");
+}
+
+#[test]
+fn enter_on_spawn_args_inserts_newline_so_args_can_be_one_per_line() {
+    let mut a = app();
+    a.handle(AppMsg::SetTab(Tab::Crons));
+    a.handle(AppMsg::CronNew);
+    while a.crons.field() != EditField::SpawnArgs {
+        a.handle(AppMsg::CronFieldNext);
+    }
+    a.handle(AppMsg::CronFieldEdit(FieldEdit::SetAll(
+        "--read-only".into(),
+    )));
+    a.handle(AppMsg::CronEditorEnter);
+    for ch in "--max-tokens=4000".chars() {
+        a.handle(AppMsg::CronFieldEdit(FieldEdit::Insert(ch)));
+    }
+    let draft = a.crons.draft().expect("draft still open after newline");
+    assert_eq!(
+        draft.spawn_args,
+        vec!["--read-only".to_string(), "--max-tokens=4000".to_string()],
+        "spawn_args splits on \\n so the editor's joined buffer round-trips"
+    );
+}
+
+#[test]
+fn enter_on_single_line_field_still_saves_the_draft() {
+    // Counter-test: a single-line field (Name) must NOT silently insert
+    // a newline. Pressing Enter there commits, matching the muscle
+    // memory the user already has from the list pane.
+    let mut a = app();
+    a.handle(AppMsg::SetTab(Tab::Crons));
+    a.handle(AppMsg::CronNew);
+    // Stay on the default Name field.
+    assert_eq!(a.crons.field(), EditField::Name);
+    a.handle(AppMsg::CronFieldEdit(FieldEdit::SetAll(
+        "single-liner".into(),
+    )));
+    a.handle(AppMsg::CronEditorEnter);
+    assert!(
+        a.crons.draft().is_none(),
+        "Enter on a single-line field saved the draft"
+    );
+    assert!(
+        a.crons.crons().iter().any(|c| c.name == "single-liner"),
+        "the saved row is in the list"
+    );
+}

@@ -210,11 +210,18 @@ impl HintRegistry {
             // Ctrl-C is still an unconditional escape — we omit it from
             // the bar because it's standard and listing every modifier
             // shortcut would crowd out the field-relevant keys.
+            //
+            // `Enter` is intentionally NOT advertised as "save" because
+            // its behaviour is field-dependent (newline on multi-line
+            // fields, save on single-line). `Ctrl+S` is the
+            // field-independent save so users always have one
+            // unambiguous gesture.
             Focus::Main => {
                 let mut out = vec![
-                    Hint::new("⏎", "save", Importance::Primary),
+                    Hint::new("Ctrl+S", "save", Importance::Primary),
                     Hint::new("Esc", "discard draft", Importance::High),
                     Hint::new("Tab", "next field", Importance::High),
+                    Hint::new("⏎", "newline / save", Importance::Medium),
                 ];
                 out.sort_by_key(|h| std::cmp::Reverse(h.importance));
                 out
@@ -491,12 +498,7 @@ mod tests {
             tab: Tab::Crons,
             focus: Focus::Main,
         };
-        let hints = HintRegistry::for_context(
-            Tab::Crons,
-            Focus::Main,
-            &Selection::Empty,
-            None,
-        );
+        let hints = HintRegistry::for_context(Tab::Crons, Focus::Main, &Selection::Empty, None);
         // Negative: no hint should resolve to a field-edit. This is the
         // exact failure mode the reviewer caught — `q quit` advertised
         // in the bar but the keystroke ended up in the prompt buffer.
