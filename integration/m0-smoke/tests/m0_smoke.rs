@@ -169,6 +169,7 @@ async fn m0_end_to_end_initialize_create_attach_write_detach() {
         3,
         SessionsAttachParams {
             session_id: sid.clone(),
+            resume_from_seq: None,
             replay_bytes: None,
             acquire_input: true,
         },
@@ -408,6 +409,7 @@ async fn dispatch(
                     session_id: p.session_id,
                     snapshot_seq: 0,
                     input_acquired: true,
+                    sub_token: None,
                 },
             )
             .expect("encode"))

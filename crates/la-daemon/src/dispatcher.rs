@@ -573,9 +573,15 @@ async fn handle_sessions_attach(
     params: SessionsAttachParams,
 ) -> Result<serde_json::Value, RpcError> {
     let id = SessionId(params.session_id.clone());
+    // `resume_from_seq` is the architecture §3 "重连一次 RPC 即可" path. The
+    // semantics mirror `OutputHub::subscribe`:
+    //   * `None`            ⇒ start fresh / live-only, no catch-up replay.
+    //   * `Some(prev_seq)`  ⇒ replay only ring chunks with `seq > prev_seq`,
+    //                          then continue live.
+    // First-time attachers that want the full ring content can pass `Some(0)`.
     let outcome = state
         .manager
-        .attach(&id, None, params.acquire_input)
+        .attach(&id, params.resume_from_seq, params.acquire_input)
         .await
         .map_err(core_to_rpc)?;
 
@@ -596,6 +602,10 @@ async fn handle_sessions_attach(
         session_id: params.session_id,
         snapshot_seq: outcome.snapshot_seq,
         input_acquired: outcome.input_acquired,
+        // Reserved field. M1.x daemon does not mint opaque sub_tokens — the
+        // client rebinds with `resume_from_seq` directly, which is sufficient
+        // for the single-daemon transport. See la-proto SessionsAttachResult.
+        sub_token: None,
     })
 }
 

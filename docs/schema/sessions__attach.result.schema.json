@@ -20,6 +20,13 @@
     "input_acquired": {
       "description": "Whether this client acquired input ownership (might differ from `acquire_input` if another client is already the writer).",
       "type": "boolean"
+    },
+    "sub_token": {
+      "description": "Opaque resume token. Reserved for future use: the daemon MAY return a token here that a reconnecting client passes back so the daemon can rebind to the same parked subscription instead of issuing a fresh one. M1.x does not require the daemon to emit this — the wire layer is prepared so M1.7+ can opt in without another schema bump.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   }
 }
