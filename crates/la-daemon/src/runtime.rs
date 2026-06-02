@@ -334,6 +334,24 @@ impl Daemon {
         // Tell connections to wind down; they observe `ctx.shutdown.notified()`.
         ctx.shutdown.notify_waiters();
 
+        // Stop the non-critical background loops *before* we start the
+        // §6.4 10 s countdown. Their `.await` could otherwise add real
+        // wall time on a CI box mid-tick (a sweep iteration that's
+        // chained 2–3 git invocations can take ~1 s before reaching
+        // an abort-point), and §6.4's shutdown ceiling applies only to
+        // the SIGTERM → SIGKILL escalation — not to bookkeeping tasks.
+        // Each `.await` is bounded so a pathologically slow unwind
+        // never blocks shutdown either.
+        const BACKGROUND_LOOP_JOIN_BUDGET: Duration = Duration::from_millis(200);
+        if let Some(h) = health_loop {
+            h.abort();
+            let _ = tokio::time::timeout(BACKGROUND_LOOP_JOIN_BUDGET, h).await;
+        }
+        if let Some(h) = worktree_sweep_loop {
+            h.abort();
+            let _ = tokio::time::timeout(BACKGROUND_LOOP_JOIN_BUDGET, h).await;
+        }
+
         // Best-effort: SIGTERM live sessions so PTY children get a chance
         // to clean up. The session manager's per-session pump observes
         // child exit and persists state; we just initiate the request.
@@ -418,26 +436,10 @@ impl Daemon {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // Health probe loop watches the same `shutdown` Notify, but
-        // `Notify::notify_waiters` doesn't latch — a notification that
-        // fires before the loop reaches `notified().await` is lost. We
-        // therefore abort the join handle explicitly and then `.await`
-        // it so the task actually unwinds before we close storage.
-        // The loop has no critical mid-step state (every step is a
-        // single SQLite upsert + a broadcast publish), so abort-at-an-
-        // .await-point is graceful enough.
-        if let Some(h) = health_loop {
-            h.abort();
-            let _ = h.await;
-        }
-
-        // Same shutdown discipline for the sweep loop — abort at an
-        // .await point so a tick in progress can unwind before we
-        // close storage.
-        if let Some(h) = worktree_sweep_loop {
-            h.abort();
-            let _ = h.await;
-        }
+        // Health probe loop + worktree sweep loop were already torn
+        // down at the top of the shutdown sequence (before the §6.4
+        // 10 s countdown started) so they don't eat into the SIGKILL
+        // budget. Nothing more to do here besides closing storage.
 
         manager.storage().close().await;
         // Drop the listener to remove the socket file; the la-ipc Listener
