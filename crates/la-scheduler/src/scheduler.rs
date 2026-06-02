@@ -337,8 +337,15 @@ impl Scheduler {
         last_fired_at: Option<DateTime<Utc>>,
     ) -> Result<u64, Error> {
         let now = self.clock.wall_now();
-        if let Some(last) = last_fired_at {
-            if last < now {
+        // Run the §5.3 catch-up and, crucially, advance the persisted
+        // watermark to `now` so a subsequent skew-recompute or starvation
+        // pass cannot rewalk the same gap and double-fire. (The first
+        // version of this code stored the raw `last_fired_at` we were
+        // handed, which let `recompute_all_after_skew` replay every fire
+        // install had just emitted — see the
+        // `install_then_skew_does_not_double_fire_catchup` regression test.)
+        let watermark_after_catchup = match last_fired_at {
+            Some(last) if last < now => {
                 self.process_missed_fires(MissedFireInputs {
                     id: &id,
                     spec: &spec,
@@ -349,8 +356,10 @@ impl Scheduler {
                     fired_at: now,
                 })
                 .await?;
+                Some(now)
             }
-        }
+            other => other,
+        };
         let next = spec.next_after(now);
         let mut guard = self.table.lock().await;
         let version = guard.upsert(
@@ -358,7 +367,7 @@ impl Scheduler {
             spec,
             catchup_mode,
             min_replay_interval,
-            last_fired_at.or(Some(now)),
+            watermark_after_catchup.or(Some(now)),
             next,
         )?;
         Ok(version)
@@ -445,10 +454,15 @@ impl Scheduler {
 
             // Next natural fire is computed from `now`: anything between
             // `top.fire_at` and `now` has already been resolved above, so
-            // walking from `top.fire_at` would replay them again.
+            // walking from `top.fire_at` would replay them again. For the
+            // same reason the persisted watermark is advanced to `now` when
+            // catch-up ran — leaving it at `top.fire_at` would let a
+            // subsequent skew-recompute rewalk the same gap and double-fire
+            // every emission this starvation pass just produced.
             let next = spec.next_after(now);
+            let new_last = if top.fire_at < now { now } else { top.fire_at };
             let mut guard = self.table.lock().await;
-            guard.refresh_next_fire(&top.id, next, Some(top.fire_at));
+            guard.refresh_next_fire(&top.id, next, Some(new_last));
         }
     }
 

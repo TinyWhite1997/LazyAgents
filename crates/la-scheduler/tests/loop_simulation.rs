@@ -647,3 +647,67 @@ async fn starved_loop_runs_catchup_policy() {
 
     ch.handle.shutdown().await.unwrap();
 }
+
+/// Watermark regression: install runs catch-up for a `last_fired_at = 5h ago`
+/// coalesce cron (emitting one merged fire), then a clock skew trips the
+/// 60s tick. The shared catch-up resolver would replay the same gap if
+/// install left `last_fired_at` at the *original* 5h-ago value — Code
+/// Reviewer noted the pre-fix `last_fired_at.or(Some(now))` did exactly
+/// that, double-firing every coalesce/replay user whenever the laptop woke
+/// up shortly after daemon restart. This test pins the fix: install must
+/// advance the watermark to `now` so the skew pass sees no gap.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn install_then_skew_does_not_double_fire_catchup() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (clock, mut ch) = start_at(wall);
+
+    // Install at 12:00 with last_fired_at = 7:00 — 5 missed hourlies.
+    let last = Utc.with_ymd_and_hms(2026, 1, 1, 7, 0, 0).unwrap();
+    let spec = CronSpec::parse("0 * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "restart-coalesce",
+            spec,
+            CatchupMode::Coalesce,
+            Duration::zero(),
+            Some(last),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    let install_fires = drain_fires(&mut ch.fires).await;
+    assert_eq!(
+        install_fires.len(),
+        1,
+        "install must emit exactly one merged catch-up fire",
+    );
+    assert_eq!(install_fires[0].coalesced_count, 5);
+
+    // Inject a +60s wall skew (above the > 30s threshold) and let the 60s
+    // skew tick observe it. The cron's next natural fire is 13:00, still
+    // ~1h away — so the only thing that can produce a fire in this window
+    // is the skew-recompute path replaying install's gap. With the fix,
+    // install advanced last_fired_at to `now` (12:00), so the skew pass
+    // sees `last == now` (modulo the 60s skew itself, which is itself
+    // short of any hourly boundary) and emits zero catch-up fires.
+    clock.inject_wall_skew(Duration::seconds(60));
+    advance_in_steps(StdDuration::from_secs(120), StdDuration::from_secs(30)).await;
+
+    let post = drain_fires(&mut ch.fires).await;
+    assert!(
+        post.is_empty(),
+        "skew after install must not replay install's catch-up: {post:#?}",
+    );
+
+    // Sanity: the skew tick *did* fire its diagnostic, so we know the
+    // recompute path actually ran.
+    let diag = timeout(StdDuration::from_millis(50), ch.diagnostics.recv()).await;
+    assert!(
+        matches!(diag, Ok(Some(SchedulerEvent::ClockSkewDetected { .. }))),
+        "expected ClockSkewDetected diagnostic to confirm skew path ran, got {diag:?}",
+    );
+
+    ch.handle.shutdown().await.unwrap();
+}
