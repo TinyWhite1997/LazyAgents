@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeCommitParams",
+  "type": "object",
+  "required": [
+    "message",
+    "session_id"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "allow_empty": {
+      "description": "`true` ⇒ pass `--allow-empty`. Default `false`. Lets `git commit` land a no-op commit (e.g. to record a checkpoint after a revert).",
+      "default": false,
+      "type": "boolean"
+    }
+  }
+}

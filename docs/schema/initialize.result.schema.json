@@ -52,6 +52,11 @@
           "default": false,
           "type": "boolean"
         },
+        "diff": {
+          "description": "True once the `worktree.*` diff review surface (status / diff / stage / unstage / discard / commit / open_in_editor) is wired up. Added in M2.5 (WEK-28). Old clients ignore the field; new clients hide the diff view when the daemon does not advertise this bit.",
+          "default": false,
+          "type": "boolean"
+        },
         "events": {
           "description": "True once `events.subscribe` is honoured by the daemon (M1+).",
           "default": false,

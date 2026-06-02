@@ -41,8 +41,10 @@ pub use event_bus::{BusEvent, EventBus, Topic};
 pub use manager::{ManagerConfig, SessionManager, SpawnedSession};
 pub use session::{SessionId, SessionStateChange};
 pub use worktree::{
-    CleanupMode, HookStatus, WorktreeHandle, WorktreeManager, WorktreePlan,
-    POST_CREATE_HOOK_TIMEOUT,
+    CleanupMode, CommitOutcome, DiffEngine, DiffLine, DiffOutcome, FileEntry, FileKind,
+    FileStatus, HookStatus, Hunk, HunkReject, LaunchOutcome, LineOrigin, MutationOutcome,
+    StatusSnapshot, TruncationOutcome, WorktreeHandle, WorktreeLocks, WorktreeManager,
+    WorktreePlan, MAX_INLINE_DIFF_BYTES, POST_CREATE_HOOK_TIMEOUT,
 };
 
 /// Default idle threshold after which a `Running` session is reported as

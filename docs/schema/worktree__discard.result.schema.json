@@ -1,0 +1,164 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeMutationResult",
+  "description": "Shared response shape for stage / unstage / discard. `status` carries the post-mutation [`FileEntry`] for every file touched so the TUI can refresh badges in one round trip.",
+  "type": "object",
+  "required": [
+    "applied",
+    "rejected",
+    "status"
+  ],
+  "properties": {
+    "applied": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "rejected": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WorktreeHunkReject"
+      }
+    },
+    "status": {
+      "description": "`FileEntry` snapshot for every file referenced by the mutation (whether or not its hunk(s) succeeded). Order matches `files` in the most-recent `worktree.status`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WorktreeFileEntry"
+      }
+    }
+  },
+  "definitions": {
+    "WorktreeHunkReject": {
+      "description": "Per-hunk rejection emitted by `worktree.stage` / `unstage` / `discard` when an id no longer matches a live hunk.",
+      "type": "object",
+      "required": [
+        "hunk_id",
+        "reason"
+      ],
+      "properties": {
+        "hunk_id": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "One of: `\"stale\"` (id no longer present), `\"binary\"` (per-hunk op not supported on binary file), `\"conflict\"` (file has unresolved merge markers), `\"unknown\"` (other classified failure).",
+          "type": "string"
+        }
+      }
+    },
+    "WorktreeFileEntry": {
+      "description": "Lightweight per-file summary returned by `worktree.status`. The `staged_hunks` / `unstaged_hunks` counters let the TUI render fold badges without a follow-up `worktree.diff` per file.",
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "size_bytes",
+        "staged_hunks",
+        "status",
+        "unstaged_hunks"
+      ],
+      "properties": {
+        "path": {
+          "description": "Path relative to the worktree root, forward-slash separated.",
+          "type": "string"
+        },
+        "old_path": {
+          "description": "Source path when `status == Renamed | Copied`; `None` otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/WorktreeFileStatus"
+        },
+        "kind": {
+          "$ref": "#/definitions/WorktreeFileKind"
+        },
+        "staged_hunks": {
+          "description": "Number of hunks currently in the index for this file. `0` for purely unstaged changes.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "unstaged_hunks": {
+          "description": "Number of hunks currently in the working tree but not the index.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "size_bytes": {
+          "description": "On-disk size of the working-tree copy (0 for `Deleted`). Lets the TUI render a size hint and pre-empts loading the diff on huge files.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "mode_change": {
+          "description": "`(old_mode, new_mode)` octal — only set when the file's mode bits changed across the diff (chmod +x). `None` otherwise.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorktreeModeChange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "WorktreeFileStatus": {
+      "description": "On-disk classification for a single file in a `worktree.status` result. Matches the standard git porcelain v2 vocabulary minus `Unknown`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed",
+            "copied",
+            "untracked"
+          ]
+        },
+        {
+          "description": "Either side of an unresolved merge conflict.",
+          "type": "string",
+          "enum": [
+            "conflicted"
+          ]
+        }
+      ]
+    },
+    "WorktreeFileKind": {
+      "description": "What kind of payload a file carries. The TUI renders binaries / submodules differently and refuses hunk-level operations on them.",
+      "type": "string",
+      "enum": [
+        "text",
+        "binary",
+        "submodule",
+        "symlink"
+      ]
+    },
+    "WorktreeModeChange": {
+      "description": "Octal mode pair carried on [`FileEntry::mode_change`].",
+      "type": "object",
+      "required": [
+        "new_mode",
+        "old_mode"
+      ],
+      "properties": {
+        "old_mode": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "new_mode": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    }
+  }
+}

@@ -38,6 +38,7 @@ async fn health_sub_forwards_daemon_health_notification_to_runner_channel() {
             adapters: vec!["codex".into()],
             cron: false,
             worktree: false,
+            diff: false,
             events: true,
         };
         server_handshake(

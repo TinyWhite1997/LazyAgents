@@ -28,19 +28,40 @@ const GIT_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum bytes of git stderr we surface to the user when classifying
 /// generic provisioning failures. Matches the contract documented on
 /// [`crate::CoreError::WorktreeProvision`].
-const MAX_STDERR_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_STDERR_BYTES: usize = 4 * 1024;
 
-struct GitOutput {
-    stdout: String,
-    stderr: String,
-    success: bool,
+pub(crate) struct GitOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+    /// Raw stdout bytes — preserved because the diff parser slices the
+    /// hunk body out of the *raw* `git diff` stream rather than
+    /// re-stringifying parsed lines.
+    pub stdout_bytes: Vec<u8>,
+    /// Exit status code, if the child terminated normally. `None` when
+    /// the process was killed by a signal.
+    pub exit_code: Option<i32>,
 }
 
 /// Run `git -C <repo_root> <args>` with the standard 30 s timeout.
 /// Returns the combined output; the caller decides what to do with
 /// non-zero exit. Translates "git binary missing" into a typed
 /// [`CoreError::GitUnavailable`] so the user sees an actionable hint.
-async fn run_git(repo_root: &Path, args: &[&str]) -> CoreResult<GitOutput> {
+pub(crate) async fn run_git(repo_root: &Path, args: &[&str]) -> CoreResult<GitOutput> {
+    run_git_with_stdin(repo_root, args, None).await
+}
+
+/// Same as [`run_git`] but writes `stdin_bytes` to the child's stdin
+/// before reading output. Used by `git apply --cached -` and
+/// `git commit -F -` so we never have to shell-escape patch text or
+/// commit messages.
+pub(crate) async fn run_git_with_stdin(
+    repo_root: &Path,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+) -> CoreResult<GitOutput> {
+    use tokio::io::AsyncWriteExt;
+
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo_root);
     for a in args {
@@ -51,16 +72,34 @@ async fn run_git(repo_root: &Path, args: &[&str]) -> CoreResult<GitOutput> {
     cmd.env("LC_ALL", "C");
     cmd.env("LANG", "C");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    if stdin_bytes.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    } else {
+        cmd.stdin(std::process::Stdio::null());
+    }
 
-    let output_future = cmd.output();
-    let output = match timeout(GIT_CMD_TIMEOUT, output_future).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+    let spawn = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(CoreError::GitUnavailable {
                 hint: "the `git` binary was not found on $PATH".to_string(),
             });
         }
+        Err(err) => return Err(CoreError::WorktreeIo(err)),
+    };
+    let mut child = spawn;
+    if let (Some(bytes), Some(mut stdin)) = (stdin_bytes, child.stdin.take()) {
+        if let Err(err) = stdin.write_all(bytes).await {
+            return Err(CoreError::WorktreeIo(err));
+        }
+        drop(stdin);
+    }
+
+    let output_future = child.wait_with_output();
+    let output = match timeout(GIT_CMD_TIMEOUT, output_future).await {
+        Ok(Ok(out)) => out,
         Ok(Err(err)) => return Err(CoreError::WorktreeIo(err)),
         Err(_elapsed) => {
             return Err(CoreError::WorktreeProvision {
@@ -73,6 +112,8 @@ async fn run_git(repo_root: &Path, args: &[&str]) -> CoreResult<GitOutput> {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout_bytes: output.stdout,
     })
 }
 
@@ -310,7 +351,7 @@ fn stderr_means_already_gone(stderr: &str) -> bool {
         || s.contains("does not exist")
 }
 
-fn trim_stderr(stderr: &str) -> String {
+pub(crate) fn trim_stderr(stderr: &str) -> String {
     let trimmed = stderr.trim();
     if trimmed.len() <= MAX_STDERR_BYTES {
         trimmed.to_string()

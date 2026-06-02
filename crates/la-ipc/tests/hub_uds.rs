@@ -77,6 +77,7 @@ async fn handle_one_conn(
             adapters: vec!["claude".into()],
             cron: false,
             worktree: false,
+            diff: false,
             events: false,
         },
     )

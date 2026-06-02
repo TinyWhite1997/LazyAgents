@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeCommitResult",
+  "type": "object",
+  "required": [
+    "commit_sha",
+    "files_changed",
+    "summary"
+  ],
+  "properties": {
+    "commit_sha": {
+      "description": "40-char hex SHA of the new commit.",
+      "type": "string"
+    },
+    "summary": {
+      "description": "First line of the commit message (the \"subject\"). Echoed so the TUI can render a toast without re-parsing the input.",
+      "type": "string"
+    },
+    "files_changed": {
+      "description": "Number of files in the commit. Pre-computed by `git diff-tree --name-only HEAD~..HEAD | wc -l` so the TUI doesn't need to round-trip.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  }
+}

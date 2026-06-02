@@ -29,6 +29,8 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     SessionGap::NAME,
     CronFired::NAME,
     DaemonHealth::NAME,
+    WorktreeChanged::NAME,
+    WorktreeCommitCreated::NAME,
 ];
 
 /// Trait mirroring [`crate::methods::Method`] but for one-way notifications
@@ -261,4 +263,63 @@ pub enum BackendHealthStatus {
 impl NotificationMethod for DaemonHealth {
     const NAME: &'static str = "daemon.health";
     type Params = DaemonHealthParams;
+}
+
+// ---------- worktree.changed ----------
+
+/// Per-worktree mutation notice (M2.5 / WEK-28). Pushed to every client
+/// subscribed via [`crate::methods::EventTopic::WorktreeChanged`] after
+/// `worktree.stage` / `worktree.unstage` / `worktree.discard` /
+/// `worktree.commit` succeeds, OR after the agent process itself writes
+/// to the worktree (the `External` kind — currently delivered on a
+/// best-effort polled cadence; a true fs watcher is M3 work).
+///
+/// Carries only `affected_files` (paths) so the TUI can re-pull
+/// `worktree.diff` for the ones it has expanded. No diff bytes ride the
+/// notification.
+pub enum WorktreeChanged {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeChangedParams")]
+pub struct WorktreeChangedParams {
+    pub session_id: String,
+    /// `"stage" | "unstage" | "discard" | "commit" | "external"`.
+    pub kind: String,
+    /// Paths relative to the worktree root. Empty when the mutation
+    /// scope is the entire worktree (`commit` returns the post-commit
+    /// dirty set, which is usually short or empty).
+    pub affected_files: Vec<String>,
+    /// RFC3339 timestamp of the mutation.
+    pub generated_at: String,
+}
+
+impl NotificationMethod for WorktreeChanged {
+    const NAME: &'static str = "worktree.changed";
+    type Params = WorktreeChangedParams;
+}
+
+// ---------- worktree.commit_created ----------
+
+/// Notification fired when a `worktree.commit` succeeds. Sibling of
+/// [`WorktreeChanged`] — emitted on the same mutation, but on a
+/// dedicated topic so a client interested only in commit pulses
+/// (toast, "shipped 3 commits" badge) doesn't have to filter `kind`.
+pub enum WorktreeCommitCreated {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeCommitCreatedParams")]
+pub struct WorktreeCommitCreatedParams {
+    pub session_id: String,
+    /// 40-char hex SHA of the new commit.
+    pub commit_sha: String,
+    /// First line of the commit message.
+    pub summary: String,
+    pub files_changed: u32,
+    /// RFC3339 timestamp of the commit.
+    pub generated_at: String,
+}
+
+impl NotificationMethod for WorktreeCommitCreated {
+    const NAME: &'static str = "worktree.commit_created";
+    type Params = WorktreeCommitCreatedParams;
 }

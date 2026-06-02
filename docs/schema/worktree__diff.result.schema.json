@@ -1,0 +1,276 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeDiffResult",
+  "type": "object",
+  "required": [
+    "file",
+    "hunks"
+  ],
+  "properties": {
+    "file": {
+      "$ref": "#/definitions/WorktreeFileEntry"
+    },
+    "hunks": {
+      "description": "Empty when [`truncated`](Self::truncated) is `Some`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WorktreeHunk"
+      }
+    },
+    "truncated": {
+      "description": "Populated when the file exceeds the inline-diff cap (brief §3.6: 5 MiB) or is binary / a submodule. `hunks` is then empty.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WorktreeTruncationMarker"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "WorktreeFileEntry": {
+      "description": "Lightweight per-file summary returned by `worktree.status`. The `staged_hunks` / `unstaged_hunks` counters let the TUI render fold badges without a follow-up `worktree.diff` per file.",
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "size_bytes",
+        "staged_hunks",
+        "status",
+        "unstaged_hunks"
+      ],
+      "properties": {
+        "path": {
+          "description": "Path relative to the worktree root, forward-slash separated.",
+          "type": "string"
+        },
+        "old_path": {
+          "description": "Source path when `status == Renamed | Copied`; `None` otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/WorktreeFileStatus"
+        },
+        "kind": {
+          "$ref": "#/definitions/WorktreeFileKind"
+        },
+        "staged_hunks": {
+          "description": "Number of hunks currently in the index for this file. `0` for purely unstaged changes.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "unstaged_hunks": {
+          "description": "Number of hunks currently in the working tree but not the index.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "size_bytes": {
+          "description": "On-disk size of the working-tree copy (0 for `Deleted`). Lets the TUI render a size hint and pre-empts loading the diff on huge files.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "mode_change": {
+          "description": "`(old_mode, new_mode)` octal — only set when the file's mode bits changed across the diff (chmod +x). `None` otherwise.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorktreeModeChange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "WorktreeFileStatus": {
+      "description": "On-disk classification for a single file in a `worktree.status` result. Matches the standard git porcelain v2 vocabulary minus `Unknown`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed",
+            "copied",
+            "untracked"
+          ]
+        },
+        {
+          "description": "Either side of an unresolved merge conflict.",
+          "type": "string",
+          "enum": [
+            "conflicted"
+          ]
+        }
+      ]
+    },
+    "WorktreeFileKind": {
+      "description": "What kind of payload a file carries. The TUI renders binaries / submodules differently and refuses hunk-level operations on them.",
+      "type": "string",
+      "enum": [
+        "text",
+        "binary",
+        "submodule",
+        "symlink"
+      ]
+    },
+    "WorktreeModeChange": {
+      "description": "Octal mode pair carried on [`FileEntry::mode_change`].",
+      "type": "object",
+      "required": [
+        "new_mode",
+        "old_mode"
+      ],
+      "properties": {
+        "old_mode": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "new_mode": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "WorktreeHunk": {
+      "description": "One hunk inside a `worktree.diff` response. `hunk_id` is a stable fingerprint (brief §3.3) so stage / unstage are idempotent under concurrent TUIs.",
+      "type": "object",
+      "required": [
+        "header",
+        "hunk_id",
+        "lines",
+        "new_range",
+        "old_range",
+        "staged"
+      ],
+      "properties": {
+        "hunk_id": {
+          "description": "Hex string, 16 chars. Computed as a sha256 of `path | old_range | hunk_body_bytes`; see [`crate::methods::compute_hunk_id`] in la-core. Stable across re-reads as long as the underlying bytes don't shift.",
+          "type": "string"
+        },
+        "staged": {
+          "description": "`true` when this hunk is in the index (returned by a `staged: true` diff); `false` when it lives only in the working tree.",
+          "type": "boolean"
+        },
+        "old_range": {
+          "$ref": "#/definitions/WorktreeLineRange"
+        },
+        "new_range": {
+          "$ref": "#/definitions/WorktreeLineRange"
+        },
+        "header": {
+          "description": "Raw hunk header from git, e.g. `\"@@ -12,7 +12,9 @@ fn foo()\"`.",
+          "type": "string"
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorktreeDiffLine"
+          }
+        }
+      }
+    },
+    "WorktreeLineRange": {
+      "description": "`(start_line, line_count)` on either side of a hunk.",
+      "type": "object",
+      "required": [
+        "count",
+        "start"
+      ],
+      "properties": {
+        "start": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "WorktreeDiffLine": {
+      "description": "One line inside a [`Hunk`].",
+      "type": "object",
+      "required": [
+        "content",
+        "origin"
+      ],
+      "properties": {
+        "origin": {
+          "$ref": "#/definitions/WorktreeDiffOrigin"
+        },
+        "content": {
+          "description": "Line content without the leading origin byte and trailing `\\n`.",
+          "type": "string"
+        },
+        "no_newline": {
+          "description": "`true` when the file is missing the trailing newline at EOF and git emitted `\\ No newline at end of file` after this line.",
+          "type": "boolean"
+        }
+      }
+    },
+    "WorktreeDiffOrigin": {
+      "description": "Single line inside a hunk. Mirrors the unified-diff origin character.",
+      "oneOf": [
+        {
+          "description": "Unchanged context line.",
+          "type": "string",
+          "enum": [
+            "context"
+          ]
+        },
+        {
+          "description": "`+` line (added).",
+          "type": "string",
+          "enum": [
+            "add"
+          ]
+        },
+        {
+          "description": "`-` line (removed).",
+          "type": "string",
+          "enum": [
+            "delete"
+          ]
+        }
+      ]
+    },
+    "WorktreeTruncationMarker": {
+      "description": "Returned in place of `hunks` when the file is too large or otherwise unsuitable for inline rendering.",
+      "type": "object",
+      "required": [
+        "hint",
+        "reason",
+        "size_bytes"
+      ],
+      "properties": {
+        "reason": {
+          "description": "Machine-readable reason: `\"too_large\" | \"binary\" | \"submodule\"`.",
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hint": {
+          "description": "Hint string surfaced to the TUI: `\"open_in_editor\"`.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

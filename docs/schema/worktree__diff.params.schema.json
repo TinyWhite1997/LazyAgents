@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeDiffParams",
+  "type": "object",
+  "required": [
+    "path",
+    "session_id",
+    "staged"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "path": {
+      "description": "File path relative to the worktree root, forward-slash separated.",
+      "type": "string"
+    },
+    "staged": {
+      "description": "`true` ⇒ diff between index and HEAD; `false` ⇒ working tree vs index.",
+      "type": "boolean"
+    },
+    "context_lines": {
+      "description": "Number of context lines around each hunk. Defaults to git's stock 3 when omitted.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  }
+}

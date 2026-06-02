@@ -88,6 +88,49 @@ pub enum CoreError {
     /// stderr so the user can self-diagnose without daemon log access.
     #[error("worktree provision failed: {stderr}")]
     WorktreeProvision { stderr: String },
+
+    // ---------- Worktree diff review (M2.5 / WEK-28) ----------
+    //
+    // Failures from the seven `worktree.*` diff RPCs. Each one maps
+    // to a `-33120..-33127` JSON-RPC code via [`Self::kind`]. New
+    // variants must update both ends.
+    /// Session has no `worktree_path` recorded (or the session id
+    /// doesn't exist). Returned by every `worktree.*` method before
+    /// any git invocation.
+    #[error("worktree unavailable for session {session_id}")]
+    WorktreeUnavailable { session_id: String },
+    /// `worktree.diff` was asked for a file that exceeds the inline
+    /// cap. The dispatcher should return a `TruncationMarker` instead
+    /// of raising — this variant is reserved for future
+    /// "force_full = true" overrides.
+    #[error("diff too large: {size_bytes} bytes")]
+    WorktreeDiffTooLarge { size_bytes: u64 },
+    /// Every `hunk_id` in a stage / unstage / discard request is
+    /// stale. Partial staleness goes in the result's `rejected` array
+    /// instead.
+    #[error("all hunk ids are stale")]
+    WorktreeHunkStale,
+    /// A pre-commit hook returned non-zero. `stderr` is the trimmed
+    /// hook output.
+    #[error("commit hook failed: {stderr}")]
+    WorktreeCommitHookFailed { stderr: String },
+    /// `git commit` reported "nothing to commit" without
+    /// `--allow-empty`.
+    #[error("nothing to commit")]
+    WorktreeCommitEmpty,
+    /// `git apply --cached` (or `--reverse`) rejected the synthesised
+    /// patch — typically index drift between the diff read and the
+    /// apply. `stderr` carries git's reason.
+    #[error("patch rejected: {stderr}")]
+    WorktreePatchRejected { stderr: String },
+    /// `worktree.open_in_editor` could not resolve any editor (no
+    /// override, no `$VISUAL`, no `$EDITOR`, no `code` on `$PATH`).
+    #[error("no editor configured; set $VISUAL or $EDITOR")]
+    WorktreeEditorUnavailable,
+    /// `worktree.discard` called without `confirmed: true`. The TUI
+    /// must go through the 二次确认 modal before re-issuing.
+    #[error("discard requires confirmed: true")]
+    WorktreeDiscardUnconfirmed,
 }
 
 impl CoreError {
@@ -121,6 +164,14 @@ impl CoreError {
             CoreError::WorktreeIo(_) => K::WorktreeIo,
             CoreError::GitUnavailable { .. } => K::WorktreeGitUnavailable,
             CoreError::WorktreeProvision { .. } => K::WorktreeProvisionFailed,
+            CoreError::WorktreeUnavailable { .. } => K::WorktreeUnavailable,
+            CoreError::WorktreeDiffTooLarge { .. } => K::WorktreeDiffTooLarge,
+            CoreError::WorktreeHunkStale => K::WorktreeHunkStale,
+            CoreError::WorktreeCommitHookFailed { .. } => K::WorktreeCommitHookFailed,
+            CoreError::WorktreeCommitEmpty => K::WorktreeCommitEmpty,
+            CoreError::WorktreePatchRejected { .. } => K::WorktreePatchRejected,
+            CoreError::WorktreeEditorUnavailable => K::WorktreeEditorUnavailable,
+            CoreError::WorktreeDiscardUnconfirmed => K::WorktreeDiscardUnconfirmed,
         }
     }
 }

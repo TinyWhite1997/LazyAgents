@@ -60,6 +60,7 @@ async fn spawn_mock_daemon(
                 adapters: vec!["claude".into()],
                 cron: false,
                 worktree: false,
+                diff: false,
                 events: false,
             },
         )
