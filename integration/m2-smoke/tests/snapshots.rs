@@ -11,11 +11,13 @@ use la_proto::methods::{
     SessionsCreateParams, SessionsCreateResult, WorktreeDiffParams, WorktreeDiffResult,
     WorktreeStatusParams, WorktreeStatusResult,
 };
+use la_tui::{DiffPayload, DiffView, DiffViewWidget};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::widgets::Widget;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn diff_payload_buffer_snapshot_is_written_as_artifact_input() {
+async fn diff_panel_widget_snapshot_is_written_as_artifact_input() {
     let daemon = bootstrap_daemon(standard_backends()).await;
     let (_project, repo) = make_bare_project_repo().await;
     let mut conn = client(&daemon.socket).await;
@@ -56,54 +58,34 @@ async fn diff_payload_buffer_snapshot_is_written_as_artifact_input() {
     )
     .await;
 
-    let snapshot = render_diff_payload_snapshot_text(&status, &diff);
+    let snapshot = render_diff_panel_widget_snapshot_text(status, diff);
     assert!(snapshot.contains("claude"));
     assert!(snapshot.contains("unstaged"));
 
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/m2-smoke/snapshots");
     tokio::fs::create_dir_all(&out_dir).await.unwrap();
-    tokio::fs::write(out_dir.join("diff-payload.txt"), snapshot)
+    tokio::fs::write(out_dir.join("diff-panel.txt"), snapshot)
         .await
         .unwrap();
 }
 
-fn render_diff_payload_snapshot_text(
-    status: &WorktreeStatusResult,
-    diff: &WorktreeDiffResult,
+fn render_diff_panel_widget_snapshot_text(
+    status: WorktreeStatusResult,
+    diff: WorktreeDiffResult,
 ) -> String {
+    let mut view = DiffView::new();
+    view.apply_status(status.files);
+    let _ = view.toggle_expand();
+    view.apply_diff(DiffPayload {
+        file: diff.file,
+        hunks: diff.hunks,
+        truncated: diff.truncated,
+    });
+
     let area = Rect::new(0, 0, 100, 12);
     let mut buf = Buffer::empty(area);
-    put(&mut buf, 0, 0, &format!("branch: {}", status.branch));
-    put(&mut buf, 0, 1, &format!("file: {}", diff.file.path));
-    put(
-        &mut buf,
-        0,
-        2,
-        &format!(
-            "staged: {} unstaged: {}",
-            diff.file.staged_hunks, diff.file.unstaged_hunks
-        ),
-    );
-    for (idx, hunk) in diff.hunks.iter().take(3).enumerate() {
-        put(&mut buf, 0, 4 + idx as u16 * 2, &hunk.header);
-        let preview = hunk
-            .lines
-            .iter()
-            .find(|line| line.content.contains("claude"))
-            .map(|line| line.content.as_str())
-            .unwrap_or("");
-        put(&mut buf, 2, 5 + idx as u16 * 2, preview);
-    }
+    DiffViewWidget::new(&view).render(area, &mut buf);
     buffer_text(&buf)
-}
-
-fn put(buf: &mut Buffer, x: u16, y: u16, text: &str) {
-    for (offset, ch) in text.chars().enumerate() {
-        let x = x + offset as u16;
-        if x < buf.area().width && y < buf.area().height {
-            buf[(x, y)].set_symbol(&ch.to_string());
-        }
-    }
 }
 
 fn buffer_text(buf: &Buffer) -> String {

@@ -19,7 +19,12 @@
 //! [`DiffSource`] is implemented in the daemon-backed binary; tests use
 //! the in-memory [`MockDiffSource`].
 
-use la_proto::methods::{FileEntry, Hunk, TruncationMarker};
+use la_proto::methods::{DiffOrigin, FileEntry, Hunk, TruncationMarker};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Widget, Wrap};
 
 /// Pluggable data source for the diff view. The production impl in
 /// `crates/la-tui/src/bin/la.rs` (or wherever the daemon-backed source
@@ -122,6 +127,127 @@ pub struct DiffView {
     /// Banner shown in the status bar after the last RPC outcome — set
     /// by [`Self::push_toast`], cleared by [`Self::clear_toast`].
     pub toast: Option<String>,
+}
+
+pub struct DiffViewWidget<'a> {
+    view: &'a DiffView,
+}
+
+impl<'a> DiffViewWidget<'a> {
+    pub fn new(view: &'a DiffView) -> Self {
+        Self { view }
+    }
+}
+
+impl Widget for DiffViewWidget<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default().borders(Borders::ALL).title("Diff");
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        if inner.width < 8 || inner.height < 3 {
+            return;
+        }
+
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+            .split(inner);
+
+        let file_items: Vec<ListItem<'_>> = self
+            .view
+            .files
+            .iter()
+            .enumerate()
+            .map(|(idx, file)| {
+                let marker = if idx == self.view.file_cursor {
+                    ">"
+                } else {
+                    " "
+                };
+                let fold = if file.expanded { "v" } else { ">" };
+                let line = Line::from(vec![
+                    Span::raw(format!("{marker} {fold} ")),
+                    Span::styled(
+                        file.entry.path.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(
+                        " +{} ~{} {:?}",
+                        file.entry.staged_hunks, file.entry.unstaged_hunks, file.entry.status
+                    )),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
+        List::new(file_items)
+            .block(Block::default().borders(Borders::RIGHT).title("Files"))
+            .render(chunks[0], buf);
+
+        let detail = self
+            .view
+            .files
+            .get(self.view.file_cursor)
+            .map(render_file_detail)
+            .unwrap_or_else(|| vec![Line::from("No changes")]);
+        Paragraph::new(detail)
+            .block(Block::default().title("Hunks"))
+            .wrap(Wrap { trim: false })
+            .render(chunks[1], buf);
+    }
+}
+
+fn render_file_detail(file: &DiffFileState) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            file.entry.path.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            " staged={} unstaged={}",
+            file.entry.staged_hunks, file.entry.unstaged_hunks
+        )),
+    ])];
+
+    if let Some(truncated) = &file.truncated {
+        lines.push(Line::from(format!(
+            "truncated: {} {} bytes ({})",
+            truncated.reason, truncated.size_bytes, truncated.hint
+        )));
+        return lines;
+    }
+
+    if file.hunks.is_empty() {
+        lines.push(Line::from(if file.loaded {
+            "No hunks"
+        } else {
+            "Expand a file to load hunks"
+        }));
+        return lines;
+    }
+
+    for hunk in &file.hunks {
+        lines.push(Line::from(Span::styled(
+            hunk.header.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for line in hunk.lines.iter().take(8) {
+            lines.push(Line::from(format!(
+                "{}{}",
+                diff_origin_prefix(line.origin),
+                line.content
+            )));
+        }
+    }
+    lines
+}
+
+fn diff_origin_prefix(origin: DiffOrigin) -> &'static str {
+    match origin {
+        DiffOrigin::Context => " ",
+        DiffOrigin::Add => "+",
+        DiffOrigin::Delete => "-",
+    }
 }
 
 impl Default for DiffView {
