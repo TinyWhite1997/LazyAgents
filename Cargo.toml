@@ -10,6 +10,7 @@ members = [
     "crates/la-daemon",
     "crates/la-tui",
     "integration/m0-smoke",
+    "integration/m2-multi-backend",
 ]
 
 [workspace.package]

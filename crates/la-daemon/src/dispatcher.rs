@@ -714,7 +714,7 @@ async fn ensure_project(state: &ConnState, dir: &str) -> Result<String, RpcError
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.to_string());
-    storage
+    let created = storage
         .projects()
         .create(la_storage::NewProject {
             id: id.clone(),
@@ -722,9 +722,27 @@ async fn ensure_project(state: &ConnState, dir: &str) -> Result<String, RpcError
             display_name: display,
             vcs: None,
         })
-        .await
-        .map_err(storage_to_rpc)?;
-    Ok(id)
+        .await;
+    match created {
+        Ok(project) => Ok(project.id),
+        Err(err) if is_project_root_unique_violation(&err) => {
+            let existing = storage
+                .projects()
+                .get_by_root_path(dir)
+                .await
+                .map_err(storage_to_rpc)?
+                .ok_or_else(|| storage_to_rpc(err))?;
+            Ok(existing.id)
+        }
+        Err(err) => Err(storage_to_rpc(err)),
+    }
+}
+
+fn is_project_root_unique_violation(err: &la_storage::StorageError) -> bool {
+    let msg = err.to_string();
+    msg.contains("code: 2067")
+        && msg.contains("UNIQUE constraint failed")
+        && msg.contains("projects.root_path")
 }
 
 async fn handle_sessions_attach(

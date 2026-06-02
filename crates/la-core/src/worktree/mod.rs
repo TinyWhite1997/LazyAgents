@@ -29,8 +29,9 @@
 //! - `project_slug = sanitize(basename(repo_root)) + "-" + sha[..8]`.
 //!   The 8-char hash disambiguates same-name roots (multiple
 //!   `~/code/api/` checkouts) without depending on cwd ordering.
-//! - `short_sid = first 16 hex chars of the session UUID v7`. v7's
-//!   timestamp prefix keeps `ls` chronological.
+//! - `short_sid = first 12 + last 8 hex chars of the session UUID v7`.
+//!   The prefix keeps `ls` roughly chronological; the tail keeps concurrent
+//!   sessions created in the same timestamp bucket distinct.
 //! - The branch name is `la/session-<short_sid>` — the `la/` namespace
 //!   makes `git branch --list 'la/session-*'` a one-liner for ops.
 //!

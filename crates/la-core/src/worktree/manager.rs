@@ -604,14 +604,15 @@ pub fn project_slug(repo_root: &Path) -> String {
     format!("{cleaned}-{suffix}")
 }
 
-/// First 16 hex chars of `sid` (a UUID v7 string with `-` separators) —
-/// keeps directory names short while staying sortable, since the v7
-/// prefix is timestamp-derived.
+/// Short, branch-safe session id. Keep the v7 timestamp prefix for roughly
+/// sortable directories, but include the random tail so same-tick concurrent
+/// sessions do not collide on worktree path or `la/session-*` branch name.
 pub fn short_sid(sid: &str) -> String {
-    sid.chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .take(16)
-        .collect()
+    let hex: String = sid.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() <= 20 {
+        return hex;
+    }
+    format!("{}{}", &hex[..12], &hex[hex.len() - 8..])
 }
 
 /// Branch naming convention pinned by the brief: `la/session-<short_sid>`.
