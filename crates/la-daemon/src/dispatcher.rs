@@ -782,6 +782,16 @@ async fn handle_adapters_discover(
 ) -> Result<serde_json::Value, RpcError> {
     let mut out: Vec<ProtoDiscoveredSession> = Vec::new();
 
+    // `source_path` is per-adapter — every backend has its own on-disk
+    // layout, so transparently forwarding one override to every
+    // registered adapter would have unpredictable semantics. Require
+    // the caller to also pin `backend` when overriding the root.
+    if params.source_path.is_some() && params.backend.is_none() {
+        return Err(RpcError::invalid_params(
+            "source_path requires backend to be set — every adapter has its own root",
+        ));
+    }
+
     let targets: Vec<(String, Arc<dyn AgentAdapter>)> = match params.backend.as_deref() {
         Some(name) => {
             let adapter = ctx.adapters.get(name).ok_or_else(|| {
@@ -856,7 +866,12 @@ async fn handle_sessions_import(
             }
         }
 
-        // Idempotency: same (backend, external_id) ⇒ same row.
+        // Idempotency: same (backend, external_id) ⇒ same row. We
+        // intentionally return the SQLite snapshot verbatim (not a
+        // merge of fresh discover-time metadata) so a re-import never
+        // returns a `created_at` that disagrees with `sessions.list`
+        // when the backend has rewritten the on-disk payload since
+        // the original import.
         if let Some(existing) = storage
             .sessions()
             .find_by_backend_external_id(&params.backend, &d.external_id)
@@ -868,23 +883,29 @@ async fn handle_sessions_import(
                 external_id: d.external_id.clone(),
                 backend: params.backend.clone(),
                 project_hint: d.project_hint.as_ref().map(|p| p.display().to_string()),
-                created_at: d.created_at.clone().unwrap_or(existing.created_at),
-                title_hint: d.title_hint.clone(),
+                created_at: existing.created_at,
+                title_hint: existing.title.or_else(|| d.title_hint.clone()),
                 external_path: existing.external_path,
                 already_existed: true,
             });
             continue;
         }
 
-        // Sessions need a project. Reuse the row for `project_hint` when
-        // present, otherwise fall back to an `unknown` placeholder so
-        // the FK isn't violated — the user can re-bucket the imported
-        // session into the right project later from the TUI.
-        let project_dir = d
-            .project_hint
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Sessions need a project (FK constraint). Reuse the
+        // backend's `project_hint` when present; otherwise mint a
+        // synthetic per-(backend, external_id) project root using the
+        // `__discovered__/...` sentinel scheme. Encoding the backend
+        // + external id in the path keeps each orphan import on its
+        // own row so the sidebar doesn't end up with a single
+        // "unknown" bucket that grows forever, and the leading
+        // sentinel is clearly not a real cwd so a future "open in
+        // shell" affordance won't try to `cd` into it. Schema-level
+        // NULL project_id is the cleaner long-term move (tracked as
+        // follow-up before M2.4 resume lands).
+        let project_dir = match d.project_hint.as_ref() {
+            Some(p) => p.display().to_string(),
+            None => format!("__discovered__/{}/{}", params.backend, d.external_id),
+        };
         let project_id = ensure_project(state, &project_dir).await?;
 
         let id = la_storage::new_id();
