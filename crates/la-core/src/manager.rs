@@ -209,7 +209,13 @@ impl SessionManager {
         &self,
         id: &SessionId,
     ) -> Option<(std::path::PathBuf, std::path::PathBuf, Option<String>)> {
-        let row = self.inner.storage.sessions().get(id.as_str()).await.ok()??;
+        let row = self
+            .inner
+            .storage
+            .sessions()
+            .get(id.as_str())
+            .await
+            .ok()??;
         let wt = row.worktree_path?;
         let project = self
             .inner
@@ -226,7 +232,10 @@ impl SessionManager {
     }
 
     /// Build a [`DiffEngine`] bound to a session. Returns `None` under
-    /// the same conditions as [`Self::worktree_for`].
+    /// the same conditions as [`Self::worktree_for`]. The session's
+    /// recorded base branch (if any) is threaded into the engine so
+    /// `worktree.status` returns real ahead/behind counters instead of
+    /// `(0, 0)`.
     pub async fn diff_engine_for(&self, id: &SessionId) -> Option<(DiffEngine, Option<String>)> {
         let (repo_root, worktree_path, base) = self.worktree_for(id).await?;
         Some((
@@ -235,6 +244,7 @@ impl SessionManager {
                 worktree_path,
                 id.clone(),
                 self.inner.worktree_locks.clone(),
+                base.clone(),
             ),
             base,
         ))

@@ -60,19 +60,19 @@
 //!   on demand; a real watcher is M3 work.
 //! - No config-driven hook path override. That's WEK-31 / M3.
 
+pub mod diff;
 mod git;
 pub mod manager;
-pub mod diff;
 pub mod parser;
 
-pub use git::classify_add_error;
 pub use diff::{
     CommitOutcome, DiffEngine, DiffLine, DiffOutcome, FileEntry, FileKind, FileStatus, Hunk,
     HunkReject, LaunchOutcome, MutationOutcome, StatusSnapshot, TruncationOutcome, WorktreeLocks,
     MAX_INLINE_DIFF_BYTES,
 };
-pub use parser::{compute_hunk_id, LineOrigin, ParsedDiff, ParsedFile, ParsedHunk, ParsedLine};
+pub use git::classify_add_error;
 pub use manager::{
     branch_name_for, project_slug, short_sid, CleanupMode, HookStatus, WorktreeHandle,
     WorktreeManager, WorktreePlan, HOOK_RELATIVE_PATH, POST_CREATE_HOOK_TIMEOUT,
 };
+pub use parser::{compute_hunk_id, LineOrigin, ParsedDiff, ParsedFile, ParsedHunk, ParsedLine};

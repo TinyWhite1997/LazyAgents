@@ -39,11 +39,11 @@ use la_proto::methods::{
     SessionsAttachParams, SessionsAttachResult, SessionsCreateParams, SessionsCreateResult,
     SessionsDetachParams, SessionsDetachResult, SessionsImportParams, SessionsImportResult,
     SessionsListParams, SessionsListResult, SessionsSignalParams, SessionsSignalResult,
-    SessionsWriteParams, SessionsWriteResult,
-    WorktreeCommit, WorktreeCommitParams, WorktreeCommitResult, WorktreeDiff, WorktreeDiffParams,
-    WorktreeDiffResult, WorktreeDiscard, WorktreeMutationParams, WorktreeMutationResult,
-    WorktreeOpenInEditor, WorktreeOpenInEditorParams, WorktreeOpenInEditorResult, WorktreeStage,
-    WorktreeStatus, WorktreeStatusParams, WorktreeStatusResult, WorktreeUnstage,
+    SessionsWriteParams, SessionsWriteResult, WorktreeCommit, WorktreeCommitParams,
+    WorktreeCommitResult, WorktreeDiff, WorktreeDiffParams, WorktreeDiffResult, WorktreeDiscard,
+    WorktreeMutationParams, WorktreeMutationResult, WorktreeOpenInEditor,
+    WorktreeOpenInEditorParams, WorktreeOpenInEditorResult, WorktreeStage, WorktreeStatus,
+    WorktreeStatusParams, WorktreeStatusResult, WorktreeUnstage,
 };
 use la_proto::notifications::{
     DaemonHealth, NotificationMethod, SessionGap, SessionOutput, SessionStateNotice,

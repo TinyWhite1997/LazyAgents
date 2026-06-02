@@ -44,7 +44,9 @@ async fn make_repo() -> (TempDir, PathBuf) {
     run_git(&repo, &["config", "user.email", "t@e.com"]).await;
     run_git(&repo, &["config", "user.name", "t"]).await;
     run_git(&repo, &["config", "commit.gpgsign", "false"]).await;
-    tokio::fs::write(repo.join("README.md"), "hi\n").await.unwrap();
+    tokio::fs::write(repo.join("README.md"), "hi\n")
+        .await
+        .unwrap();
     run_git(&repo, &["add", "README.md"]).await;
     run_git(&repo, &["commit", "-q", "-m", "init"]).await;
     (td, repo)
@@ -56,6 +58,7 @@ fn engine(repo: &std::path::Path) -> DiffEngine {
         repo.to_path_buf(),
         SessionId("session-test".to_string()),
         WorktreeLocks::new(),
+        None,
     )
 }
 
@@ -65,7 +68,9 @@ async fn status_reports_modified_and_untracked() {
     tokio::fs::write(repo.join("README.md"), "hi\nmodified\n")
         .await
         .unwrap();
-    tokio::fs::write(repo.join("new.txt"), "fresh\n").await.unwrap();
+    tokio::fs::write(repo.join("new.txt"), "fresh\n")
+        .await
+        .unwrap();
     let eng = engine(&repo);
     let s = eng.status().await.expect("status");
     let by_path: std::collections::HashMap<_, _> =
@@ -115,13 +120,18 @@ async fn stage_then_unstage_returns_index_to_clean() {
     assert!(un.applied.len() == 1 || un.rejected.is_empty());
     let snap2 = eng.status().await.unwrap();
     let entry2 = snap2.files.iter().find(|f| f.path == "README.md").unwrap();
-    assert_eq!(entry2.staged_hunks, 0, "index should be clean after unstage");
+    assert_eq!(
+        entry2.staged_hunks, 0,
+        "index should be clean after unstage"
+    );
 }
 
 #[tokio::test]
 async fn stale_hunk_ids_are_rejected_not_errored() {
     let (_td, repo) = make_repo().await;
-    tokio::fs::write(repo.join("README.md"), "hi\nmod\n").await.unwrap();
+    tokio::fs::write(repo.join("README.md"), "hi\nmod\n")
+        .await
+        .unwrap();
     let eng = engine(&repo);
     // Random fake id.
     let outcome = eng
@@ -167,7 +177,9 @@ async fn discard_reverts_working_tree() {
 #[tokio::test]
 async fn untracked_file_can_be_staged() {
     let (_td, repo) = make_repo().await;
-    tokio::fs::write(repo.join("new.txt"), "fresh\nbody\n").await.unwrap();
+    tokio::fs::write(repo.join("new.txt"), "fresh\nbody\n")
+        .await
+        .unwrap();
     let eng = engine(&repo);
     let diff = eng.diff_file("new.txt", false, None).await.unwrap();
     assert_eq!(diff.hunks.len(), 1);

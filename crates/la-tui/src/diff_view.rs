@@ -73,12 +73,8 @@ pub enum DiffFocus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffModal {
     None,
-    Commit {
-        draft: String,
-    },
-    ConfirmDiscard {
-        scope: DiscardScope,
-    },
+    Commit { draft: String },
+    ConfirmDiscard { scope: DiscardScope },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,7 +173,11 @@ impl DiffView {
 
     /// Land a `worktree.diff` payload on the matching file.
     pub fn apply_diff(&mut self, payload: DiffPayload) {
-        if let Some(file) = self.files.iter_mut().find(|f| f.entry.path == payload.file.path) {
+        if let Some(file) = self
+            .files
+            .iter_mut()
+            .find(|f| f.entry.path == payload.file.path)
+        {
             file.entry = payload.file;
             file.hunks = payload.hunks;
             file.truncated = payload.truncated;
@@ -358,10 +358,7 @@ pub enum DiffEvent {
     /// `worktree.diff` came back.
     Diff(DiffPayload),
     /// `worktree.commit` succeeded.
-    CommitOk {
-        commit_sha: String,
-        summary: String,
-    },
+    CommitOk { commit_sha: String, summary: String },
     /// `worktree.changed` notification arrived from the daemon.
     Changed,
 }
@@ -391,12 +388,22 @@ pub enum DiffAction {
     /// Nothing for the runner to do.
     None,
     /// Fetch hunks for this path (`worktree.diff`).
-    FetchDiff { path: String, staged: bool },
+    FetchDiff {
+        path: String,
+        staged: bool,
+    },
     /// Stage / unstage the given hunk.
-    Stage { hunk_id: String },
-    Unstage { hunk_id: String },
+    Stage {
+        hunk_id: String,
+    },
+    Unstage {
+        hunk_id: String,
+    },
     /// Open editor at this path.
-    OpenEditor { path: String, line: Option<u32> },
+    OpenEditor {
+        path: String,
+        line: Option<u32>,
+    },
     /// Discard hunks (called only after the modal confirmation).
     Discard {
         hunk_ids: Vec<String>,
@@ -404,7 +411,9 @@ pub enum DiffAction {
     },
     /// Commit the given message (called from the Commit modal after
     /// the user pressed Enter).
-    Commit { message: String },
+    Commit {
+        message: String,
+    },
     /// Pop back to the previous main view.
     Exit,
 }
@@ -569,11 +578,7 @@ impl DiffSource for MockDiffSource {
     }
 
     fn commit(&self, message: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .commits
-            .push(message.to_string());
+        self.inner.lock().unwrap().commits.push(message.to_string());
     }
 
     fn open_in_editor(&self, path: &str, _line: Option<u32>) {
@@ -668,7 +673,12 @@ mod tests {
         });
         v.cycle_focus();
         let act = v.handle_key(DiffKey::Stage);
-        assert_eq!(act, DiffAction::Stage { hunk_id: "h1".into() });
+        assert_eq!(
+            act,
+            DiffAction::Stage {
+                hunk_id: "h1".into()
+            }
+        );
     }
 
     #[test]

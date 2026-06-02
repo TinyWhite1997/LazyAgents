@@ -202,6 +202,12 @@ pub struct DiffEngine {
     worktree_path: PathBuf,
     session_id: SessionId,
     locks: WorktreeLocks,
+    /// Base branch recorded on the session row at create time. Used to
+    /// compute ahead/behind in [`Self::status`]. `None` means the
+    /// session row didn't capture one (e.g. older daemons or worktrees
+    /// created outside the M2.4 path) — ahead/behind then degrade to
+    /// `(0, 0)` rather than report a meaningless rev-list range.
+    base_branch: Option<String>,
 }
 
 impl DiffEngine {
@@ -210,11 +216,13 @@ impl DiffEngine {
         worktree_path: PathBuf,
         session_id: SessionId,
         locks: WorktreeLocks,
+        base_branch: Option<String>,
     ) -> Self {
         Self {
             worktree_path,
             session_id,
             locks,
+            base_branch,
         }
     }
 
@@ -263,12 +271,12 @@ impl DiffEngine {
             });
         }
 
-        let (ahead, behind) = if let Some(base) = self.recorded_base_branch().await {
-            self.ahead_behind(&branch, &base).await.unwrap_or((0, 0))
+        let (ahead, behind) = if let Some(base) = self.base_branch.as_deref() {
+            self.ahead_behind(&branch, base).await.unwrap_or((0, 0))
         } else {
             (0, 0)
         };
-        let base_branch = self.recorded_base_branch().await;
+        let base_branch = self.base_branch.clone();
 
         Ok(StatusSnapshot {
             branch,
@@ -435,8 +443,11 @@ impl DiffEngine {
             _ => match std::env::var("VISUAL")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
-            {
+                .or_else(|| {
+                    std::env::var("EDITOR")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                }) {
                 Some(e) => e,
                 None => {
                     if which_in_path("code").is_some() {
@@ -495,8 +506,7 @@ impl DiffEngine {
             });
         }
 
-        let id_set: std::collections::HashSet<&str> =
-            hunk_ids.iter().map(String::as_str).collect();
+        let id_set: std::collections::HashSet<&str> = hunk_ids.iter().map(String::as_str).collect();
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
         let mut affected = Vec::new();
@@ -506,11 +516,8 @@ impl DiffEngine {
         // has shifted under it. We group by file to build one patch
         // per file, applied under the single lock we already hold.
         let snapshot = self.status().await?;
-        let candidate_files: BTreeMap<String, &FileEntry> = snapshot
-            .files
-            .iter()
-            .map(|f| (f.path.clone(), f))
-            .collect();
+        let candidate_files: BTreeMap<String, &FileEntry> =
+            snapshot.files.iter().map(|f| (f.path.clone(), f)).collect();
 
         for (path, entry) in candidate_files {
             if matches!(entry.kind, FileKind::Binary | FileKind::Submodule) {
@@ -557,8 +564,7 @@ impl DiffEngine {
             // Build a patch fragment: file header + selected hunk
             // bodies, byte-spliced from the source.
             let mut patch: Vec<u8> = Vec::new();
-            let hdr =
-                &diff_buf[parsed_file.header_range.0..parsed_file.header_range.1];
+            let hdr = &diff_buf[parsed_file.header_range.0..parsed_file.header_range.1];
             patch.extend_from_slice(hdr);
             // For untracked-staged paths git emits `new file mode` /
             // empty `---`; trust the parsed header.
@@ -595,9 +601,7 @@ impl DiffEngine {
                     && matches!(entry.status, FileStatus::Added)
                     && selected.len() == parsed_file.hunks.len()
                 {
-                    let _ =
-                        run_git(&self.worktree_path, &["rm", "--cached", "--", &path])
-                            .await;
+                    let _ = run_git(&self.worktree_path, &["rm", "--cached", "--", &path]).await;
                 }
                 // Discard of an untracked file: also `rm` it from disk
                 // (the patch only reverses content, not file
@@ -609,10 +613,30 @@ impl DiffEngine {
                 }
                 let _ = staged_flag;
             } else {
+                // `git apply` refused. Two distinct failure modes; the
+                // wire-level reason has to reflect which one:
+                //   - "patch does not apply" / "corrupt patch" → the
+                //     index moved beneath us between read and write.
+                //     Surface as `patch_rejected` so the TUI can show
+                //     git's stderr and prompt a refresh.
+                //   - anything else (locked index, IO error mid-apply,
+                //     unknown) → fall back to `stale` so the TUI
+                //     defaults to "re-pull status and retry", which is
+                //     the safer recovery path.
+                //
+                // The wire-side code `-33125 WORKTREE_PATCH_REJECTED` is
+                // reserved for a future "force_full = true" override
+                // that would `Err` the whole call; the per-hunk reason
+                // above is what reaches a normal TUI mutation.
+                let reason = if stderr_means_patch_rejected(&out.stderr) {
+                    "patch_rejected"
+                } else {
+                    "stale"
+                };
                 for (_, id) in &selected {
                     rejected.push(HunkReject {
                         hunk_id: id.clone(),
-                        reason: "stale",
+                        reason,
                     });
                 }
             }
@@ -766,24 +790,11 @@ impl DiffEngine {
     }
 
     async fn current_branch(&self) -> CoreResult<String> {
-        let out = run_git(
-            &self.worktree_path,
-            &["rev-parse", "--abbrev-ref", "HEAD"],
-        )
-        .await?;
+        let out = run_git(&self.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
         if !out.success {
             return Ok(String::from("HEAD"));
         }
         Ok(out.stdout.trim().to_string())
-    }
-
-    async fn recorded_base_branch(&self) -> Option<String> {
-        // We don't carry the base branch on the engine; the dispatcher
-        // can attach it from the session row before returning to the
-        // wire. Returning `None` here keeps `la-core` agnostic of the
-        // storage shape. The TUI doesn't depend on this for diff
-        // rendering — only the ahead/behind counters use it.
-        None
     }
 
     async fn ahead_behind(&self, branch: &str, base: &str) -> Option<(u32, u32)> {
@@ -797,11 +808,24 @@ impl DiffEngine {
         if !out.success {
             return None;
         }
-        let mut parts = out.stdout.trim().split_whitespace();
+        let mut parts = out.stdout.split_whitespace();
         let behind = parts.next()?.parse().ok()?;
         let ahead = parts.next()?.parse().ok()?;
         Some((ahead, behind))
     }
+}
+
+/// `true` when git's stderr from a failed `git apply --cached` /
+/// `--reverse` invocation indicates the patch itself was rejected
+/// against the current index, as opposed to a transient IO / lock
+/// error. The TUI uses this to choose between `patch_rejected`
+/// (refresh + surface git's reason) and `stale` (refresh + retry).
+fn stderr_means_patch_rejected(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("patch does not apply")
+        || s.contains("corrupt patch")
+        || s.contains("error while searching for")
+        || s.contains("patch failed")
 }
 
 fn classify_commit_error(stderr: &str, exit_code: Option<i32>) -> CoreError {
@@ -1001,10 +1025,7 @@ fn parse_change_v2(rest: &str, is_rename: bool) -> Option<PorcelainEntry> {
             .map(|t| {
                 let bytes = t.as_bytes();
                 (bytes.first() == Some(&b'R') || bytes.first() == Some(&b'C'))
-                    && bytes
-                        .iter()
-                        .skip(1)
-                        .all(|c| c.is_ascii_digit())
+                    && bytes.iter().skip(1).all(|c| c.is_ascii_digit())
             })
             .unwrap_or(false)
     {
@@ -1157,12 +1178,7 @@ mod tests {
 
     #[test]
     fn editor_argv_handles_vscode() {
-        let argv = editor_argv(
-            "code",
-            Path::new("/tmp/foo.rs"),
-            Some(12),
-            Some(4),
-        );
+        let argv = editor_argv("code", Path::new("/tmp/foo.rs"), Some(12), Some(4));
         assert_eq!(argv, vec!["code", "--goto", "/tmp/foo.rs:12:4"]);
     }
 
@@ -1181,10 +1197,7 @@ mod tests {
     #[test]
     fn editor_argv_respects_extra_args() {
         let argv = editor_argv("code --wait", Path::new("/tmp/foo.rs"), None, None);
-        assert_eq!(
-            argv,
-            vec!["code", "--wait", "--goto", "/tmp/foo.rs"]
-        );
+        assert_eq!(argv, vec!["code", "--wait", "--goto", "/tmp/foo.rs"]);
     }
 
     #[test]
@@ -1204,5 +1217,21 @@ mod tests {
         );
         assert_eq!(parse_mode_change("100644", "100644"), None);
         assert_eq!(parse_mode_change("100644", "000000"), None);
+    }
+
+    #[test]
+    fn stderr_means_patch_rejected_detects_real_failures() {
+        assert!(stderr_means_patch_rejected(
+            "error: patch failed: src/foo.rs:12\nerror: src/foo.rs: patch does not apply\n"
+        ));
+        assert!(stderr_means_patch_rejected(
+            "fatal: corrupt patch at line 5"
+        ));
+        // Non-patch-rejection errors must not match — they fall back
+        // to the "stale, refresh + retry" path.
+        assert!(!stderr_means_patch_rejected(
+            "fatal: Unable to create '/repo/.git/index.lock': File exists.\n"
+        ));
+        assert!(!stderr_means_patch_rejected(""));
     }
 }

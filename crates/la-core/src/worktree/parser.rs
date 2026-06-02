@@ -121,23 +121,12 @@ pub fn parse(buf: &[u8]) -> ParsedDiff {
             let (old_path, new_path) = parse_diff_header(line_str);
             current_file = Some(ParsedFile {
                 new_path,
-                old_path: if let Some(op) = &old_path {
-                    if Some(op.as_str()) == current_file.as_ref().map(|_| op.as_str()) {
-                        None
-                    } else {
-                        Some(op.clone())
-                    }
-                } else {
-                    None
-                },
+                old_path,
                 is_binary: false,
                 hunks: Vec::new(),
                 header_range: (cursor, cursor),
                 mode_change: None,
             });
-            if let Some(f) = current_file.as_mut() {
-                f.old_path = old_path;
-            }
             cursor = next_cursor;
             continue;
         }
@@ -244,8 +233,7 @@ pub fn parse(buf: &[u8]) -> ParsedDiff {
     }
 
     // Flush trailing hunk + file.
-    if let (Some(file), Some((mut hunk, body_start))) =
-        (current_file.as_mut(), current_hunk.take())
+    if let (Some(file), Some((mut hunk, body_start))) = (current_file.as_mut(), current_hunk.take())
     {
         hunk.body_range = (body_start, cursor);
         file.hunks.push(hunk);
@@ -340,7 +328,10 @@ fn parse_diff_header(line: &str) -> (Option<String>, String) {
 }
 
 fn memchr_newline(buf: &[u8], from: usize) -> Option<usize> {
-    buf[from..].iter().position(|b| *b == b'\n').map(|i| from + i)
+    buf[from..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|i| from + i)
 }
 
 #[cfg(test)]

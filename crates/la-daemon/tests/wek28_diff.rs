@@ -263,7 +263,9 @@ async fn wek28_full_diff_review_round_trip() {
             .unwrap();
     }
     // Plus one brand-new file.
-    tokio::fs::write(wt.join("new.txt"), "fresh\n").await.unwrap();
+    tokio::fs::write(wt.join("new.txt"), "fresh\n")
+        .await
+        .unwrap();
 
     // worktree.status surfaces all 11 changes.
     let status: WorktreeStatusResult = call(
