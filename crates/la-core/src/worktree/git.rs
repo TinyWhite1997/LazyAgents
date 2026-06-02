@@ -222,10 +222,11 @@ pub(super) async fn branch_delete(repo_root: &Path, branch: &str, force: bool) -
 
 /// `true` if `branch` carries any commits not reachable from
 /// `base_branch`. Used by `cleanup(_, KeepBranchIfDirty)` to decide
-/// whether the branch is safe to drop. Defaults to `false` on git
-/// failure — the safer default for "preserve user's work?" is **yes**,
-/// so the caller (`cleanup`) flips the default at its own site
-/// (`unwrap_or(false)`) to mean "preserve".
+/// whether the branch is safe to drop. Returns the typed `Err` on git
+/// failure so the caller can choose its own conservative default —
+/// `cleanup` treats `Err` as "keep the branch" so a transient git
+/// failure (renamed/deleted base ref, locked repo) never erases work
+/// the user might still want to recover.
 pub(super) async fn branch_has_commits_beyond(
     repo_root: &Path,
     branch: &str,

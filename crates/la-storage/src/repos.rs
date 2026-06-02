@@ -329,6 +329,38 @@ impl<'a> SessionsRepo<'a> {
         .map_err(Into::into)
     }
 
+    /// Archived rows that still own a worktree directory and whose
+    /// `archived_at` is older than `ttl_seconds` ago, computed inside
+    /// SQLite so callers don't need a wall-clock library. Used by
+    /// `la_core::worktree::WorktreeManager::sweep_expired` — narrower
+    /// than [`list_archived_older_than`] so we don't reconstruct
+    /// handles for rows whose worktree is already gone.
+    pub async fn list_archived_with_worktree_older_than_seconds(
+        &self,
+        ttl_seconds: i64,
+    ) -> Result<Vec<Session>> {
+        // SQLite `datetime('now', '-N seconds')` returns the same
+        // `YYYY-MM-DD HH:MM:SS` format that archive() writes, so a
+        // plain lexicographic `<` comparison is correct.
+        let modifier = format!("-{ttl_seconds} seconds");
+        sqlx::query_as::<_, Session>(
+            r#"
+            SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
+                   worktree_path, worktree_branch, base_branch, spawn_args, origin,
+                   transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+                   post_create_hook_status
+            FROM sessions
+            WHERE archived_at IS NOT NULL
+              AND worktree_path IS NOT NULL
+              AND archived_at < datetime('now', ?1)
+            "#,
+        )
+        .bind(modifier)
+        .fetch_all(self.storage.reader_pool())
+        .await
+        .map_err(Into::into)
+    }
+
     /// All non-archived sessions belonging to `project_id` that still
     /// own a worktree path. Helps the diff panel and prune logic find
     /// every live worktree under a given project without scanning all

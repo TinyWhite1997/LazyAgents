@@ -598,26 +598,34 @@ impl SessionManager {
                 if let Some(repo_root) = repo_root {
                     let handle =
                         WorktreeManager::handle_from_row(repo_root, wt_path, branch, base_branch);
-                    if let Err(err) = wt_mgr
+                    match wt_mgr
                         .cleanup(&handle, crate::worktree::CleanupMode::KeepBranchIfDirty)
                         .await
                     {
-                        tracing::warn!(
-                            session = %id.0,
-                            %err,
-                            "worktree cleanup on archive failed (best-effort)"
-                        );
+                        Ok(()) => {
+                            // Clear the path only after the worktree
+                            // is actually gone. On failure we keep the
+                            // triple so a future `sweep_expired` /
+                            // operator retry can reconstruct the
+                            // handle from the row instead of fishing
+                            // the path out of the warning log.
+                            let _ = self
+                                .inner
+                                .storage
+                                .sessions()
+                                .clear_worktree(id.as_str())
+                                .await;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                session = %id.0,
+                                %err,
+                                "worktree cleanup on archive failed; \
+                                 keeping worktree triple on row so a \
+                                 future sweep can retry"
+                            );
+                        }
                     }
-                    // Clear the path so future `sessions.list` rows
-                    // don't claim a worktree that's been deleted. The
-                    // branch column is intentionally preserved when we
-                    // chose to keep it.
-                    let _ = self
-                        .inner
-                        .storage
-                        .sessions()
-                        .clear_worktree(id.as_str())
-                        .await;
                 }
             }
         }

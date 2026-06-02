@@ -423,3 +423,229 @@ fn hook_status_string_values_match_migration_check_constraint() {
     assert_eq!(HookStatus::Timeout.as_str(), "timeout");
     assert_eq!(HookStatus::Skipped.as_str(), "skipped");
 }
+
+// --- Regression coverage for the WEK-27 v2 review ----------------
+
+/// `KeepBranchIfDirty` MUST preserve a session branch that carries
+/// commits beyond `base_branch`, even on cleanup paths driven by
+/// `sessions.archive`. The pre-fix behaviour deleted it because the
+/// dirty-check fallback was `unwrap_or(false)`.
+#[tokio::test]
+async fn keep_branch_if_dirty_preserves_branch_with_extra_commits() {
+    let project_tmp = TempDir::new().expect("project dir");
+    let repo_root = project_tmp.path().join("repo");
+    init_repo_with_seed(&repo_root).await;
+
+    let state = TempDir::new().expect("state");
+    let wm = WorktreeManager::for_state_dir(state.path());
+    let base = wm
+        .resolve_base_branch(&repo_root)
+        .await
+        .expect("resolve base");
+
+    let plan = wm
+        .create(&repo_root, "fixture", &fake_sid(), base.clone())
+        .await
+        .expect("create");
+
+    // Commit something on the session branch so `rev-list base..branch`
+    // returns > 0 and KeepBranchIfDirty MUST keep the branch.
+    tokio::fs::write(plan.path.join("agent.txt"), b"work\n")
+        .await
+        .unwrap();
+    run(&plan.path, &["git", "add", "agent.txt"]).await;
+    run(&plan.path, &["git", "commit", "-q", "-m", "agent commit"]).await;
+
+    let handle = WorktreeHandle {
+        repo_root: repo_root.clone(),
+        worktree_path: plan.path.clone(),
+        branch: plan.branch.clone(),
+        base_branch: plan.base_branch.clone(),
+    };
+    wm.cleanup(&handle, CleanupMode::KeepBranchIfDirty)
+        .await
+        .expect("cleanup");
+
+    assert!(!plan.path.exists(), "worktree dir should be gone");
+    assert!(
+        branch_exists(&repo_root, &plan.branch).await,
+        "session branch {} must be preserved when it has commits beyond {}",
+        plan.branch,
+        plan.base_branch,
+    );
+}
+
+/// When `git rev-list base..branch` can't run (base ref renamed/deleted,
+/// git temporarily flaky), `KeepBranchIfDirty` MUST conservatively keep
+/// the branch — the user's only path back to committed work.
+#[tokio::test]
+async fn keep_branch_if_dirty_preserves_branch_when_dirty_check_fails() {
+    let project_tmp = TempDir::new().expect("project dir");
+    let repo_root = project_tmp.path().join("repo");
+    init_repo_with_seed(&repo_root).await;
+
+    let state = TempDir::new().expect("state");
+    let wm = WorktreeManager::for_state_dir(state.path());
+    let base = wm
+        .resolve_base_branch(&repo_root)
+        .await
+        .expect("resolve base");
+
+    let plan = wm
+        .create(&repo_root, "fixture", &fake_sid(), base.clone())
+        .await
+        .expect("create");
+
+    // Commit on the session branch so there's user work to protect.
+    tokio::fs::write(plan.path.join("agent.txt"), b"work\n")
+        .await
+        .unwrap();
+    run(&plan.path, &["git", "add", "agent.txt"]).await;
+    run(&plan.path, &["git", "commit", "-q", "-m", "agent commit"]).await;
+
+    // Drive the dirty-check into a guaranteed git error by pointing it
+    // at a base ref that doesn't exist. WorktreeHandle is plain data,
+    // so we construct it with a bogus base_branch directly.
+    let handle = WorktreeHandle {
+        repo_root: repo_root.clone(),
+        worktree_path: plan.path.clone(),
+        branch: plan.branch.clone(),
+        base_branch: "no/such/base".to_string(),
+    };
+    wm.cleanup(&handle, CleanupMode::KeepBranchIfDirty)
+        .await
+        .expect("cleanup");
+
+    assert!(!plan.path.exists(), "worktree dir should be gone");
+    assert!(
+        branch_exists(&repo_root, &plan.branch).await,
+        "branch {} must be preserved when dirty-check fails (base ref unknown)",
+        plan.branch,
+    );
+}
+
+/// `sweep_expired` MUST reap archived worktrees whose `archived_at`
+/// crossed the TTL boundary, clear their `worktree_path` column, and
+/// leave fresh archives alone.
+#[tokio::test]
+async fn sweep_expired_reaps_old_archived_worktrees() {
+    let project_tmp = TempDir::new().expect("project dir");
+    let repo_root = project_tmp.path().join("repo");
+    init_repo_with_seed(&repo_root).await;
+
+    let h = harness_with_worktree(&repo_root).await;
+    let wm = h.worktree_manager.clone().expect("wm");
+
+    // Two sessions: one we'll archive + age out, one we'll just archive
+    // (still fresh — sweep with a 1h TTL must skip it).
+    let aged = spawn_and_archive(&h, &repo_root).await;
+    let fresh = spawn_and_archive(&h, &repo_root).await;
+
+    // Backdate the aged row's archived_at so it predates a 10s TTL.
+    sqlx::query("UPDATE sessions SET archived_at = datetime('now', '-1 hour') WHERE id = ?1")
+        .bind(aged.session_id.as_str())
+        .execute(h.storage.writer_pool())
+        .await
+        .expect("backdate aged");
+
+    // Sweep with a 10s TTL — aged > 10s, fresh < 10s.
+    let (ok, err) = wm.sweep_expired(&h.storage, Duration::from_secs(10)).await;
+    assert_eq!(err, 0, "no per-row errors expected");
+    assert_eq!(ok, 1, "only the aged session should have been swept");
+
+    assert!(
+        !aged.worktree_path.exists(),
+        "aged worktree should be gone after sweep: {}",
+        aged.worktree_path.display()
+    );
+    assert!(
+        fresh.worktree_path.exists(),
+        "fresh worktree must NOT be touched by sweep: {}",
+        fresh.worktree_path.display()
+    );
+
+    // Row hygiene: aged row has worktree_path cleared; fresh row keeps
+    // its path until its own TTL elapses.
+    let aged_row = h
+        .storage
+        .sessions()
+        .get(aged.session_id.as_str())
+        .await
+        .expect("get aged")
+        .expect("aged row");
+    assert!(
+        aged_row.worktree_path.is_none(),
+        "swept row.worktree_path must be cleared"
+    );
+    let fresh_row = h
+        .storage
+        .sessions()
+        .get(fresh.session_id.as_str())
+        .await
+        .expect("get fresh")
+        .expect("fresh row");
+    assert!(
+        fresh_row.worktree_path.is_some(),
+        "fresh row keeps its worktree_path before its TTL elapses"
+    );
+}
+
+/// Bundle returned by [`spawn_and_archive`] so a sweep test can
+/// reach the worktree path and session id without re-querying.
+struct ArchivedFixture {
+    session_id: SessionId,
+    worktree_path: PathBuf,
+}
+
+/// Spawn a session with a worktree, wait for the child to exit, then
+/// `archive` it. The archive path leaves the worktree on disk because
+/// the v2 fix only clears `worktree_path` on cleanup success — but for
+/// tests we want the directory present so the sweep has something to
+/// reap. The cheapest way: skip archive's own cleanup by archiving the
+/// session row directly via storage. That mirrors the production
+/// "cleanup failed, retry later via sweep" path.
+async fn spawn_and_archive(h: &support::TestHarness, repo_root: &Path) -> ArchivedFixture {
+    let adapter = ShellAdapter::new("true");
+    let spawned = h
+        .manager
+        .spawn_with_options(
+            &adapter,
+            h.project_id.clone(),
+            la_adapter::SpawnRequest::new(repo_root.to_path_buf()),
+            Some(WorktreeSpawnOptions {
+                repo_root: repo_root.to_path_buf(),
+            }),
+        )
+        .await
+        .expect("spawn");
+    let path = spawned.worktree_path.clone().expect("path");
+    wait_for_exit(&h.manager, &spawned.id).await;
+    // Mark the row archived without driving the WorktreeManager
+    // cleanup branch — that's exactly the "cleanup deferred to sweep"
+    // case we want to exercise.
+    h.storage
+        .sessions()
+        .archive(spawned.id.as_str())
+        .await
+        .expect("archive row");
+    ArchivedFixture {
+        session_id: spawned.id,
+        worktree_path: path,
+    }
+}
+
+/// Helper: `git -C <repo_root> branch --list <branch>` is non-empty.
+async fn branch_exists(repo_root: &Path, branch: &str) -> bool {
+    let out = Command::new("git")
+        .args([
+            "-C",
+            repo_root.to_str().unwrap(),
+            "branch",
+            "--list",
+            branch,
+        ])
+        .output()
+        .await
+        .expect("branch list");
+    std::str::from_utf8(&out.stdout).unwrap().contains(branch)
+}

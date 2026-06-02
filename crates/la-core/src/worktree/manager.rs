@@ -294,13 +294,34 @@ impl WorktreeManager {
         }
 
         let keep_branch = match mode {
-            CleanupMode::KeepBranchIfDirty => git::branch_has_commits_beyond(
-                &handle.repo_root,
-                &handle.branch,
-                &handle.base_branch,
-            )
-            .await
-            .unwrap_or(false),
+            CleanupMode::KeepBranchIfDirty => {
+                match git::branch_has_commits_beyond(
+                    &handle.repo_root,
+                    &handle.branch,
+                    &handle.base_branch,
+                )
+                .await
+                {
+                    Ok(has_extra) => has_extra,
+                    Err(err) => {
+                        // Can't tell whether the branch carries
+                        // un-merged commits — base ref renamed/deleted,
+                        // git temporarily flaky, etc. The contract is
+                        // "keep the branch when in doubt" so a user/
+                        // agent's committed work isn't silently lost;
+                        // operators can always `git branch -D` it later.
+                        tracing::warn!(
+                            repo = %handle.repo_root.display(),
+                            branch = %handle.branch,
+                            base = %handle.base_branch,
+                            %err,
+                            "branch_has_commits_beyond failed; preserving \
+                             branch conservatively (KeepBranchIfDirty)"
+                        );
+                        true
+                    }
+                }
+            }
             CleanupMode::Remove | CleanupMode::Force => false,
         };
 
@@ -324,6 +345,94 @@ impl WorktreeManager {
                 "worktree prune failed (ignored)"
             );
         }
+    }
+
+    /// Reap worktree directories belonging to archived sessions whose
+    /// `archived_at` is older than `ttl`. Defaults to the 7-day window
+    /// pinned by the WEK-27 issue body.
+    ///
+    /// For each matched row:
+    ///
+    /// 1. Reconstruct a [`WorktreeHandle`] using the project root
+    ///    looked up from `projects`.
+    /// 2. Call [`cleanup`](Self::cleanup) with [`CleanupMode::Force`] —
+    ///    archived rows are past the point where the user is editing
+    ///    the worktree, so `--force` is safe and avoids leaking
+    ///    directories git left locked on the previous attempt.
+    /// 3. Clear the row's `worktree_path` / `worktree_branch` on
+    ///    success so the next sweep skips it.
+    ///
+    /// Never returns `Err` — a single bad row should not abort the
+    /// whole sweep. Returns `(swept_ok, swept_err)` so the daemon can
+    /// log a one-liner. Designed to be called from
+    /// [`Daemon::bind`](../../../la_daemon/runtime/struct.Daemon.html#method.bind)
+    /// on startup and from a periodic tick thereafter.
+    pub async fn sweep_expired(
+        &self,
+        storage: &la_storage::Storage,
+        ttl: Duration,
+    ) -> (usize, usize) {
+        let ttl_seconds = ttl.as_secs().min(i64::MAX as u64) as i64;
+        let rows = match storage
+            .sessions()
+            .list_archived_with_worktree_older_than_seconds(ttl_seconds)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, "sweep_expired: list query failed");
+                return (0, 0);
+            }
+        };
+        if rows.is_empty() {
+            return (0, 0);
+        }
+
+        let mut ok = 0usize;
+        let mut err_count = 0usize;
+        for row in rows {
+            let (Some(wt_path), Some(branch), Some(base_branch)) = (
+                row.worktree_path.as_deref(),
+                row.worktree_branch.as_deref(),
+                row.base_branch.as_deref(),
+            ) else {
+                // Row was filtered for worktree_path NOT NULL above, so
+                // a missing branch/base column is a schema drift that
+                // we can't reconstruct a handle from. Clear the path so
+                // the next sweep doesn't pick it up forever.
+                let _ = storage.sessions().clear_worktree(&row.id).await;
+                continue;
+            };
+            let repo_root = match storage.projects().get(&row.project_id).await {
+                Ok(Some(p)) => PathBuf::from(p.root_path),
+                _ => {
+                    // Project gone — clear the row so future sweeps
+                    // don't keep retrying a path we can't drive git
+                    // against. The on-disk directory becomes pure
+                    // garbage that `git worktree prune` won't see, but
+                    // that's an operator-cleanup edge case.
+                    let _ = storage.sessions().clear_worktree(&row.id).await;
+                    continue;
+                }
+            };
+            let handle = Self::handle_from_row(repo_root, wt_path, branch, base_branch);
+            match self.cleanup(&handle, CleanupMode::Force).await {
+                Ok(()) => {
+                    let _ = storage.sessions().clear_worktree(&row.id).await;
+                    ok += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session = %row.id,
+                        path = %handle.worktree_path.display(),
+                        %e,
+                        "sweep_expired: cleanup failed; row kept for next pass"
+                    );
+                    err_count += 1;
+                }
+            }
+        }
+        (ok, err_count)
     }
 
     /// Compute the canonical worktree path for `(project_slug,
