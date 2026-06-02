@@ -431,11 +431,19 @@ impl<'a> RunsRepo<'a> {
 
     pub async fn attach_session(&self, id: &str, session_id: &str) -> Result<bool> {
         let result = retry_busy(|| async {
-            sqlx::query("UPDATE runs SET session_id = ?2 WHERE id = ?1")
-                .bind(id)
-                .bind(session_id)
-                .execute(self.storage.writer_pool())
-                .await
+            sqlx::query(
+                r#"
+                UPDATE runs
+                SET session_id = ?2
+                WHERE id = ?1
+                  AND finished_at IS NULL
+                  AND (session_id IS NULL OR session_id = ?2)
+                "#,
+            )
+            .bind(id)
+            .bind(session_id)
+            .execute(self.storage.writer_pool())
+            .await
         })
         .await?;
         Ok(result.rows_affected() > 0)
@@ -443,7 +451,7 @@ impl<'a> RunsRepo<'a> {
 
     pub async fn update_status(&self, id: &str, status: &str) -> Result<bool> {
         let result = retry_busy(|| async {
-            sqlx::query("UPDATE runs SET status = ?2 WHERE id = ?1")
+            sqlx::query("UPDATE runs SET status = ?2 WHERE id = ?1 AND finished_at IS NULL")
                 .bind(id)
                 .bind(status)
                 .execute(self.storage.writer_pool())
@@ -472,6 +480,7 @@ impl<'a> RunsRepo<'a> {
                     error_detail = ?7,
                     tail_log = ?8
                 WHERE id = ?1
+                  AND (finished_at IS NULL OR (finished_at = ?2 AND status = ?3))
                 "#,
             )
             .bind(id)

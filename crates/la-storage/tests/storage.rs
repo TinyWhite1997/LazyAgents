@@ -203,6 +203,43 @@ async fn crons_and_runs_cover_crud_and_archive_paths() {
         )
         .await
         .unwrap());
+    assert!(storage
+        .runs()
+        .finish(
+            "run-old",
+            RunFinish {
+                finished_at: "2000-01-01 03:18:00".into(),
+                status: "completed".into(),
+                exit_code: Some(0),
+                cost_usd_est: Some(0.01),
+                error_kind: None,
+                error_detail: None,
+                tail_log: Some(vec![b'x'; 70 * 1024]),
+            },
+        )
+        .await
+        .unwrap());
+    assert!(!storage
+        .runs()
+        .finish(
+            "run-old",
+            RunFinish {
+                finished_at: "2000-01-01 03:19:00".into(),
+                status: "failed".into(),
+                exit_code: Some(1),
+                cost_usd_est: None,
+                error_kind: Some("adapter".into()),
+                error_detail: Some("late duplicate".into()),
+                tail_log: None,
+            },
+        )
+        .await
+        .unwrap());
+    assert!(!storage
+        .runs()
+        .update_status("run-old", "running")
+        .await
+        .unwrap());
     let listed = storage
         .runs()
         .list(RunsListFilter {
@@ -213,6 +250,7 @@ async fn crons_and_runs_cover_crud_and_archive_paths() {
         .await
         .unwrap();
     assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].status, "completed");
     assert_eq!(listed[0].tail_log.as_ref().unwrap().len(), 64 * 1024);
 
     let outcome = storage.runs().archive_older_than_days(90).await.unwrap();
@@ -243,6 +281,54 @@ async fn backup_file_can_open_as_new_storage_database() {
         .await
         .unwrap()
         .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_is_consistent_while_writes_continue() {
+    let (dir, storage) = open_storage().await;
+    let (_backend_id, project_id, session_id) = seed_backend_project_session(&storage).await;
+    let backup_path = dir.path().join("live-backup.sqlite");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let writer_storage = storage.clone();
+    let writer_session_id = session_id.clone();
+    let writer = tokio::spawn(async move {
+        let mut started_tx = Some(started_tx);
+        for i in 0..200 {
+            writer_storage
+                .chunks()
+                .append(
+                    &writer_session_id,
+                    ChunkKind::Stdout,
+                    format!("live-write-{i}").as_bytes(),
+                )
+                .await
+                .expect("append during backup");
+            if let Some(tx) = started_tx.take() {
+                let _ = tx.send(());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    started_rx.await.expect("writer started");
+    storage.backup_to(&backup_path).await.unwrap();
+    writer.await.expect("writer task");
+
+    let restore_dir = TempDir::new().expect("restore dir");
+    let restored = Storage::open(StorageConfig::new(&backup_path, restore_dir.path()))
+        .await
+        .expect("open live backup as storage");
+    assert!(restored
+        .projects()
+        .get(&project_id)
+        .await
+        .unwrap()
+        .is_some());
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(restored.reader_pool())
+        .await
+        .unwrap();
+    assert_eq!(integrity, "ok");
 }
 
 #[tokio::test]
