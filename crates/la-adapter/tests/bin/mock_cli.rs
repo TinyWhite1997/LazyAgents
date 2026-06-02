@@ -21,6 +21,13 @@
 //! mock-cli --version --mode garbage # unrelated text,                exit 0
 //! mock-cli login status             # honours mode (exit 1 if unauth)
 //! mock-cli exec --json <prompt>     # JSONL events,                  exit 0
+//!
+//! # Opencode flavor (MOCK_CLI_FLAVOR=opencode)
+//! mock-cli --version                # "1.2.15\n",                    exit 0
+//! mock-cli --version --mode unauth  # stderr unauth message,         exit 1
+//! mock-cli --version --mode garbage # unrelated text,                exit 0
+//! mock-cli auth list                # honours mode (prints "0 credentials" for unauth)
+//! mock-cli run --format json <prompt> # JSONL events,                exit 0
 //! ```
 //!
 //! Mode can also be supplied via env var `MOCK_CLI_MODE=ok|unauth|garbage`.
@@ -33,11 +40,13 @@ use std::process::ExitCode;
 enum Flavor {
     Claude,
     Codex,
+    Opencode,
 }
 
 fn flavor() -> Flavor {
     match env::var("MOCK_CLI_FLAVOR").as_deref() {
         Ok("codex") => Flavor::Codex,
+        Ok("opencode") => Flavor::Opencode,
         _ => Flavor::Claude,
     }
 }
@@ -55,6 +64,8 @@ fn main() -> ExitCode {
         (Flavor::Claude, Some("--print")) => print_prompt(&args),
         (Flavor::Codex, Some("login")) => codex_login(&args, &mode),
         (Flavor::Codex, Some("exec")) => codex_exec(&args),
+        (Flavor::Opencode, Some("auth")) => opencode_auth(&args, &mode),
+        (Flavor::Opencode, Some("run")) => opencode_run(&args),
         _ => {
             let _ = writeln!(
                 std::io::stderr(),
@@ -112,6 +123,25 @@ fn version(flavor: Flavor, mode: &str) -> ExitCode {
             ExitCode::from(1)
         }
         (Flavor::Codex, "garbage") => {
+            println!("welcome to nothing");
+            ExitCode::SUCCESS
+        }
+        (Flavor::Opencode, "ok") | (Flavor::Opencode, "auth_unsupported") => {
+            // `auth_unsupported` is an `auth list`-only switch; for
+            // `--version` it behaves identically to `ok` so the
+            // adapter's secondary auth probe is exercised against a
+            // valid version line.
+            println!("1.2.15");
+            ExitCode::SUCCESS
+        }
+        (Flavor::Opencode, "unauth") => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Error: please run `opencode auth login`."
+            );
+            ExitCode::from(1)
+        }
+        (Flavor::Opencode, "garbage") => {
             println!("welcome to nothing");
             ExitCode::SUCCESS
         }
@@ -187,6 +217,70 @@ fn codex_exec(args: &[String]) -> ExitCode {
     println!("{{\"type\":\"task_started\"}}");
     println!(
         "{{\"type\":\"task_completed\",\"reply\":\"MOCK_REPLY: {}\"}}",
+        prompt.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    ExitCode::SUCCESS
+}
+
+fn opencode_auth(args: &[String], mode: &str) -> ExitCode {
+    // Only `auth list` is exercised by the adapter's secondary auth
+    // probe; reject anything else loudly so test gaps surface.
+    let sub = args.iter().skip_while(|a| *a != "auth").nth(1).cloned();
+    if sub.as_deref() != Some("list") {
+        let _ = writeln!(
+            std::io::stderr(),
+            "mock-cli: unsupported `auth` subcommand: {sub:?}"
+        );
+        return ExitCode::from(2);
+    }
+    match mode {
+        "ok" => {
+            println!("Credentials");
+            println!("GitHub Copilot  oauth");
+            println!("1 credentials");
+            ExitCode::SUCCESS
+        }
+        "unauth" => {
+            // Empty list — opencode prints a "0 credentials" footer.
+            println!("Credentials");
+            println!("0 credentials");
+            ExitCode::SUCCESS
+        }
+        // Simulates an older / newer opencode that doesn't recognise
+        // `auth list`: non-zero exit with NO unauth keyword. The
+        // adapter must NOT misclassify this as Unauthenticated.
+        "auth_unsupported" => {
+            let _ = writeln!(std::io::stderr(), "error: unrecognized subcommand 'list'");
+            ExitCode::from(2)
+        }
+        other => {
+            let _ = writeln!(std::io::stderr(), "mock-cli: unknown mode: {other}");
+            ExitCode::from(3)
+        }
+    }
+}
+
+fn opencode_run(args: &[String]) -> ExitCode {
+    // The prompt is the last positional argument after the flag block.
+    // We tolerate (and ignore) `--format json` / `--dir <dir>` /
+    // `--session <id>` etc.
+    let mut prompt: Option<String> = None;
+    let mut iter = args.iter().skip_while(|a| *a != "run").skip(1);
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--format" | "--dir" | "--session" | "-s" | "-m" | "--model" | "--title" => {
+                let _ = iter.next();
+            }
+            "--continue" | "-c" | "--share" | "--fork" | "--thinking" => {}
+            other => {
+                prompt = Some(other.to_string());
+            }
+        }
+    }
+    let prompt = prompt.unwrap_or_default();
+    println!("{{\"type\":\"start\"}}");
+    println!(
+        "{{\"type\":\"done\",\"reply\":\"MOCK_REPLY: {}\"}}",
         prompt.replace('\\', "\\\\").replace('"', "\\\"")
     );
     ExitCode::SUCCESS
