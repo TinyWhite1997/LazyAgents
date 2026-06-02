@@ -6,6 +6,7 @@ members = [
     "crates/la-ipc",
     "crates/la-adapter",
     "crates/la-storage",
+    "crates/la-scheduler",
     "crates/la-core",
     "crates/la-daemon",
     "crates/la-tui",
@@ -42,6 +43,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
 ] }
 tempfile = "3"
+cron = "0.16"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
 la-pty = { path = "crates/la-pty" }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events", "event-stream", "windows"] }
