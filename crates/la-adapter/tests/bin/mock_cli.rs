@@ -1,16 +1,26 @@
-//! `mock-cli` — a deterministic stand-in for `claude` used by
-//! `la-adapter` tests. Lives under `tests/bin/` so it ships as a
+//! `mock-cli` — a deterministic stand-in for `claude` and `codex` used
+//! by `la-adapter` tests. Lives under `tests/bin/` so it ships as a
 //! crate-internal binary that integration tests can locate via the
 //! Cargo `CARGO_BIN_EXE_<name>` env var.
+//!
+//! Behaviour is keyed on `MOCK_CLI_FLAVOR` (default `claude` for
+//! backwards compatibility with the WEK-13 integration tests).
 //!
 //! Supported invocations (only those the adapter tests need today):
 //!
 //! ```text
-//! mock-cli --version                # prints "2.1.158 (Claude Code)\n", exits 0
-//! mock-cli --version --mode unauth  # prints unauth message to stderr, exits 1
-//! mock-cli --version --mode missing # exits 127 with empty output
-//! mock-cli --version --mode garbage # prints unrelated text, exits 0
-//! mock-cli --print <prompt>         # echoes the prompt, exits 0
+//! # Claude flavor (default)
+//! mock-cli --version                # "2.1.158 (Claude Code)\n", exit 0
+//! mock-cli --version --mode unauth  # stderr unauth message,        exit 1
+//! mock-cli --version --mode garbage # unrelated text,                exit 0
+//! mock-cli --print <prompt>         # echoes the prompt,             exit 0
+//!
+//! # Codex flavor (MOCK_CLI_FLAVOR=codex)
+//! mock-cli --version                # "codex-cli 0.135.0\n",         exit 0
+//! mock-cli --version --mode unauth  # stderr unauth message,         exit 1
+//! mock-cli --version --mode garbage # unrelated text,                exit 0
+//! mock-cli login status             # honours mode (exit 1 if unauth)
+//! mock-cli exec --json <prompt>     # JSONL events,                  exit 0
 //! ```
 //!
 //! Mode can also be supplied via env var `MOCK_CLI_MODE=ok|unauth|garbage`.
@@ -19,16 +29,32 @@ use std::env;
 use std::io::Write;
 use std::process::ExitCode;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flavor {
+    Claude,
+    Codex,
+}
+
+fn flavor() -> Flavor {
+    match env::var("MOCK_CLI_FLAVOR").as_deref() {
+        Ok("codex") => Flavor::Codex,
+        _ => Flavor::Claude,
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mode = pick_mode(&args)
         .unwrap_or_else(|| env::var("MOCK_CLI_MODE").unwrap_or_else(|_| "ok".into()));
 
     let subcmd = args.iter().find(|a| !a.starts_with("--mode")).cloned();
+    let flavor = flavor();
 
-    match subcmd.as_deref() {
-        Some("--version") => version(&mode),
-        Some("--print") => print_prompt(&args),
+    match (flavor, subcmd.as_deref()) {
+        (_, Some("--version")) => version(flavor, &mode),
+        (Flavor::Claude, Some("--print")) => print_prompt(&args),
+        (Flavor::Codex, Some("login")) => codex_login(&args, &mode),
+        (Flavor::Codex, Some("exec")) => codex_exec(&args),
         _ => {
             let _ = writeln!(
                 std::io::stderr(),
@@ -53,24 +79,39 @@ fn pick_mode(args: &[String]) -> Option<String> {
     None
 }
 
-fn version(mode: &str) -> ExitCode {
-    match mode {
-        "ok" => {
+fn version(flavor: Flavor, mode: &str) -> ExitCode {
+    match (flavor, mode) {
+        (Flavor::Claude, "ok") => {
             println!("2.1.158 (Claude Code)");
             ExitCode::SUCCESS
         }
-        "unauth" => {
+        (Flavor::Claude, "unauth") => {
             let _ = writeln!(
                 std::io::stderr(),
                 "Error: not logged in. Run `claude login` to authenticate."
             );
             ExitCode::from(1)
         }
-        "garbage" => {
+        (Flavor::Claude, "garbage") => {
             println!("welcome to nothing in particular");
             ExitCode::SUCCESS
         }
-        other => {
+        (Flavor::Codex, "ok") => {
+            println!("codex-cli 0.135.0");
+            ExitCode::SUCCESS
+        }
+        (Flavor::Codex, "unauth") => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Error: not logged in. Please run codex login."
+            );
+            ExitCode::from(1)
+        }
+        (Flavor::Codex, "garbage") => {
+            println!("welcome to nothing");
+            ExitCode::SUCCESS
+        }
+        (_, other) => {
             let _ = writeln!(std::io::stderr(), "mock-cli: unknown mode: {other}");
             ExitCode::from(3)
         }
@@ -85,5 +126,57 @@ fn print_prompt(args: &[String]) -> ExitCode {
         .cloned()
         .unwrap_or_default();
     println!("MOCK_REPLY: {prompt}");
+    ExitCode::SUCCESS
+}
+
+fn codex_login(args: &[String], mode: &str) -> ExitCode {
+    // Only `login status` is exercised by the adapter's secondary
+    // auth probe; reject anything else loudly so test gaps surface.
+    let sub = args.iter().skip_while(|a| *a != "login").nth(1).cloned();
+    if sub.as_deref() != Some("status") {
+        let _ = writeln!(
+            std::io::stderr(),
+            "mock-cli: unsupported `login` subcommand: {sub:?}"
+        );
+        return ExitCode::from(2);
+    }
+    match mode {
+        "ok" => {
+            println!("Logged in as mock@example.com");
+            ExitCode::SUCCESS
+        }
+        "unauth" => {
+            println!("Not logged in");
+            ExitCode::from(1)
+        }
+        other => {
+            let _ = writeln!(std::io::stderr(), "mock-cli: unknown mode: {other}");
+            ExitCode::from(3)
+        }
+    }
+}
+
+fn codex_exec(args: &[String]) -> ExitCode {
+    // The prompt is the last positional argument after the flag block.
+    // We tolerate (and ignore) `--json` / `--cd <dir>` / `-o <file>`.
+    let mut prompt: Option<String> = None;
+    let mut iter = args.iter().skip_while(|a| *a != "exec").skip(1);
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--json" => {}
+            "--cd" | "-o" => {
+                let _ = iter.next();
+            }
+            other => {
+                prompt = Some(other.to_string());
+            }
+        }
+    }
+    let prompt = prompt.unwrap_or_default();
+    println!("{{\"type\":\"task_started\"}}");
+    println!(
+        "{{\"type\":\"task_completed\",\"reply\":\"MOCK_REPLY: {}\"}}",
+        prompt.replace('\\', "\\\\").replace('"', "\\\"")
+    );
     ExitCode::SUCCESS
 }
