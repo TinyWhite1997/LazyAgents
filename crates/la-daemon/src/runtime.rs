@@ -630,6 +630,10 @@ fn delay_until_next_runs_archive_tick() -> Duration {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    delay_until_next_runs_archive_tick_from(now_secs)
+}
+
+fn delay_until_next_runs_archive_tick_from(now_secs: u64) -> Duration {
     let day_pos = now_secs % RUNS_ARCHIVE_INTERVAL.as_secs();
     let wait_secs = if day_pos < RUNS_ARCHIVE_UTC_SECONDS {
         RUNS_ARCHIVE_UTC_SECONDS - day_pos
@@ -741,5 +745,60 @@ mod tests {
 
         shutdown.notify_waiters();
         handle.await.expect("archive loop joins");
+    }
+
+    #[tokio::test]
+    async fn runs_archive_loop_second_tick_does_not_duplicate_after_delete() {
+        let (_dir, storage, shutdown) = archive_loop_storage().await;
+        tokio::time::pause();
+        let handle = spawn_runs_archive_loop(RunsArchiveLoopConfig {
+            storage: storage.clone(),
+            retention_days: 90,
+            initial_delay: Duration::ZERO,
+            interval: Duration::from_secs(24 * 60 * 60),
+            shutdown: shutdown.clone(),
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+        tokio::time::resume();
+        for _ in 0..20 {
+            if storage.runs().get("run-old").await.unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let archive = storage.data_dir().join("runs/archive/200001.jsonl.zst");
+        let first_len = tokio::fs::metadata(&archive).await.unwrap().len();
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second_len = tokio::fs::metadata(&archive).await.unwrap().len();
+        assert_eq!(first_len, second_len);
+
+        shutdown.notify_waiters();
+        handle.await.expect("archive loop joins");
+    }
+
+    #[test]
+    fn runs_archive_delay_realigns_to_next_0317_utc_from_wall_clock() {
+        assert_eq!(
+            delay_until_next_runs_archive_tick_from(3 * 60 * 60 + 16 * 60 + 59),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            delay_until_next_runs_archive_tick_from(RUNS_ARCHIVE_UTC_SECONDS),
+            RUNS_ARCHIVE_INTERVAL
+        );
+        assert_eq!(
+            delay_until_next_runs_archive_tick_from(RUNS_ARCHIVE_UTC_SECONDS + 1),
+            RUNS_ARCHIVE_INTERVAL - Duration::from_secs(1)
+        );
+        assert_eq!(
+            delay_until_next_runs_archive_tick_from(2 * RUNS_ARCHIVE_INTERVAL.as_secs() + 60),
+            Duration::from_secs(RUNS_ARCHIVE_UTC_SECONDS - 60)
+        );
     }
 }

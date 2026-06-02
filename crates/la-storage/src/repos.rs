@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -280,6 +280,11 @@ impl<'a> CronsRepo<'a> {
                 UPDATE crons
                 SET last_fired_at = ?2, next_fire_at = ?3, updated_at = datetime('now')
                 WHERE id = ?1
+                  AND (
+                    last_fired_at IS NULL
+                    OR last_fired_at < ?2
+                    OR (last_fired_at = ?2 AND next_fire_at IS ?3)
+                  )
                 "#,
             )
             .bind(id)
@@ -462,12 +467,7 @@ impl<'a> RunsRepo<'a> {
     }
 
     pub async fn finish(&self, id: &str, finish: RunFinish) -> Result<bool> {
-        let tail_log = finish.tail_log.map(|mut bytes| {
-            if bytes.len() > 64 * 1024 {
-                bytes = bytes.split_off(bytes.len() - 64 * 1024);
-            }
-            bytes
-        });
+        let tail_log = truncate_tail_log(finish.tail_log.clone());
         let result = retry_busy(|| async {
             sqlx::query(
                 r#"
@@ -480,7 +480,7 @@ impl<'a> RunsRepo<'a> {
                     error_detail = ?7,
                     tail_log = ?8
                 WHERE id = ?1
-                  AND (finished_at IS NULL OR (finished_at = ?2 AND status = ?3))
+                  AND finished_at IS NULL
                 "#,
             )
             .bind(id)
@@ -495,11 +495,30 @@ impl<'a> RunsRepo<'a> {
             .await
         })
         .await?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+
+        let Some(existing) = self.get(id).await? else {
+            return Ok(false);
+        };
+        Ok(
+            existing.finished_at.as_deref() == Some(finish.finished_at.as_str())
+                && existing.status == finish.status
+                && existing.exit_code == finish.exit_code
+                && existing.cost_usd_est == finish.cost_usd_est
+                && existing.error_kind == finish.error_kind
+                && existing.error_detail == finish.error_detail
+                && existing.tail_log == tail_log,
+        )
     }
 
     pub async fn archive_older_than_days(&self, retention_days: i64) -> Result<RunsArchiveOutcome> {
         let modifier = format!("-{} days", retention_days.max(1));
+        let mut tx = self.storage.writer_pool().begin().await?;
+        sqlx::query("UPDATE schema_meta SET value = value WHERE key = 'schema_version'")
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query_as::<_, RunRecord>(
             r#"
             SELECT id, cron_id, session_id, scheduled_at, started_at, finished_at,
@@ -511,10 +530,11 @@ impl<'a> RunsRepo<'a> {
             "#,
         )
         .bind(&modifier)
-        .fetch_all(self.storage.reader_pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         if rows.is_empty() {
+            tx.commit().await?;
             return Ok(RunsArchiveOutcome {
                 archived_rows: 0,
                 archive_files: 0,
@@ -533,13 +553,22 @@ impl<'a> RunsRepo<'a> {
         tokio::fs::create_dir_all(&archive_dir).await?;
 
         let mut archived_ids = Vec::new();
+        let mut archive_files = 0;
         for (month, rows) in by_month.iter() {
             let path = archive_dir.join(format!("{month}.jsonl.zst"));
-            append_runs_archive(&path, rows).await?;
+            let already_archived = read_archive_ids(&path).await?;
+            let new_rows: Vec<RunRecord> = rows
+                .iter()
+                .filter(|row| !already_archived.contains(&row.id))
+                .cloned()
+                .collect();
+            if !new_rows.is_empty() {
+                append_runs_archive(&path, &new_rows).await?;
+                archive_files += 1;
+            }
             archived_ids.extend(rows.iter().map(|row| row.id.clone()));
         }
 
-        let mut tx = self.storage.writer_pool().begin().await?;
         for id in &archived_ids {
             sqlx::query("DELETE FROM runs WHERE id = ?1")
                 .bind(id)
@@ -550,7 +579,7 @@ impl<'a> RunsRepo<'a> {
 
         Ok(RunsArchiveOutcome {
             archived_rows: archived_ids.len() as u64,
-            archive_files: by_month.len(),
+            archive_files,
         })
     }
 }
@@ -1113,6 +1142,40 @@ fn archive_month_key(scheduled_at: &str) -> String {
     } else {
         "unknown".to_string()
     }
+}
+
+fn truncate_tail_log(tail_log: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    tail_log.map(|mut bytes| {
+        if bytes.len() > 64 * 1024 {
+            bytes = bytes.split_off(bytes.len() - 64 * 1024);
+        }
+        bytes
+    })
+}
+
+async fn read_archive_ids(path: &Path) -> Result<HashSet<String>> {
+    if tokio::fs::metadata(path).await.is_err() {
+        return Ok(HashSet::new());
+    }
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<HashSet<String>> {
+        let file = std::fs::File::open(path)?;
+        let decoder = zstd::stream::read::Decoder::new(file)?;
+        let mut ids = HashSet::new();
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(decoder).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(&line)?;
+            if let Some(id) = value.get("id").and_then(|id| id.as_str()) {
+                ids.insert(id.to_string());
+            }
+        }
+        Ok(ids)
+    })
+    .await?
 }
 
 async fn append_runs_archive(path: &Path, rows: &[RunRecord]) -> Result<()> {

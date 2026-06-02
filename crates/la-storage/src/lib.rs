@@ -40,6 +40,8 @@ pub enum StorageError {
     MissingCron(String),
     #[error("missing run: {0}")]
     MissingRun(String),
+    #[error("backup output path must not be the live database: {0}")]
+    BackupSamePath(String),
     #[error("schema version {found} is newer than supported version {supported}")]
     SchemaTooNew { found: String, supported: String },
     #[error("busy after {attempts} attempts")]

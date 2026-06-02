@@ -141,6 +141,9 @@ impl Storage {
         if let Some(parent) = output.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        if equivalent_paths(&source, &output).await? {
+            return Err(StorageError::BackupSamePath(output.display().to_string()));
+        }
         tokio::task::spawn_blocking(move || -> Result<()> {
             let source = rusqlite::Connection::open(source)?;
             let mut destination = rusqlite::Connection::open(output)?;
@@ -202,6 +205,19 @@ async fn reject_too_new_schema(pool: &SqlitePool) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn equivalent_paths(left: &Path, right: &Path) -> Result<bool> {
+    let left = tokio::fs::canonicalize(left).await?;
+    let right = if tokio::fs::metadata(right).await.is_ok() {
+        tokio::fs::canonicalize(right).await?
+    } else if let Some(parent) = right.parent() {
+        let parent = tokio::fs::canonicalize(parent).await?;
+        parent.join(right.file_name().unwrap_or_default())
+    } else {
+        right.to_path_buf()
+    };
+    Ok(left == right)
 }
 
 fn version_gt(found: &str, supported: &str) -> bool {
