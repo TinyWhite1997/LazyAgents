@@ -1,0 +1,23 @@
+[package]
+name = "m2-smoke"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[dev-dependencies]
+la-proto = { path = "../../crates/la-proto" }
+la-ipc = { path = "../../crates/la-ipc" }
+la-adapter = { path = "../../crates/la-adapter" }
+la-daemon = { path = "../../crates/la-daemon" }
+la-tui = { path = "../../crates/la-tui" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+ratatui = { workspace = true }
+
