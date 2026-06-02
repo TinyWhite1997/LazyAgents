@@ -123,6 +123,28 @@ pub struct NewRun {
     pub coalesced_count: i64,
 }
 
+/// Audit-only insert used by WEK-33 / M3.2 quota gates when a cron fire is
+/// refused before any session is spawned. `finished_at` is set equal to
+/// `scheduled_at` in the SQL (single statement, same caller-supplied value);
+/// `started_at`, `session_id`, `exit_code`, `cost_usd_est`, and `tail_log`
+/// are NULL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewRejectedRun<'a> {
+    pub id: &'a str,
+    pub cron_id: &'a str,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
+    pub scheduled_at: &'a str,
+    /// Must satisfy the `runs.status` CHECK constraint. Today:
+    /// `"budget_exceeded"` for cost-budget refusals, `"cancelled"` for
+    /// every other quota dimension.
+    pub status: &'a str,
+    pub coalesced_count: i64,
+    /// Machine-parseable reason tag (e.g. `"quota_max_runs_per_day"`).
+    pub error_kind: &'a str,
+    /// Free-form human detail; surfaces in TUI run list.
+    pub error_detail: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunFinish {
     /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.

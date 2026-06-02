@@ -20,3 +20,5 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+la-scheduler = { path = "../la-scheduler" }
+chrono = { workspace = true }
