@@ -41,6 +41,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::ext_time::file_mtime_rfc3339;
 use crate::{
     AdapterDescriptor, AdapterError, AdapterEvent, AgentAdapter, DiscoverHints, DiscoveredSession,
     ParserState, ProbeResult, SpawnRequest, SpawnSpec, StdinMode, StopAction, StopSequence,
@@ -302,7 +303,7 @@ impl AgentAdapter for CodexAdapter {
         &self,
         hints: &DiscoverHints,
     ) -> Result<Vec<DiscoveredSession>, AdapterError> {
-        let root = sessions_root();
+        let root = hints.source_path_override.clone().or_else(sessions_root);
         let root = match root {
             Some(p) => p,
             None => return Ok(Vec::new()),
@@ -341,10 +342,13 @@ impl AgentAdapter for CodexAdapter {
                     continue;
                 }
             }
+            let created_at = meta.timestamp.clone().or_else(|| file_mtime_rfc3339(&file));
             out.push(DiscoveredSession {
                 external_id: meta.id,
                 project_hint: Some(PathBuf::from(meta.cwd)),
                 title_hint: None,
+                external_path: Some(file.clone()),
+                created_at,
             });
         }
 
@@ -389,6 +393,11 @@ struct SessionMetaWire {
 struct SessionMetaPayload {
     id: String,
     cwd: String,
+    /// Codex 0.135.0+ records the rollout's wall-clock start as
+    /// `payload.timestamp` (RFC3339). Older rollouts may omit it; the
+    /// adapter falls back to the file's mtime in that case.
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 /// Pull the first sem-ver-ish token out of `codex --version` output.

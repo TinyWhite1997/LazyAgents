@@ -20,18 +20,24 @@
 //! when SIGTERM lands.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use la_adapter::{AgentAdapter, SpawnRequest, StdinMode};
+use la_adapter::{
+    AdapterError, AgentAdapter, DiscoverHints, DiscoveredSession as AdapterDiscoveredSession,
+    SpawnRequest, StdinMode,
+};
 use la_core::{BusEvent, CoreError, SessionId, SessionManager};
 use la_ipc::{server_handshake, Connection, HubEvent, SendHalf, SubId, Subscription};
 use la_proto::error_codes;
 use la_proto::jsonrpc::{Message, Notification, Request, Response, RpcError};
 use la_proto::methods::{
-    EventTopic, EventsSubscribeParams, EventsSubscribeResult, Method, PtySize as ProtoPtySize,
-    ServerCapabilities, SessionState, SessionSummary, SessionsAttachParams, SessionsAttachResult,
-    SessionsCreateParams, SessionsCreateResult, SessionsDetachParams, SessionsDetachResult,
+    AdaptersDiscoverParams, AdaptersDiscoverResult, DiscoveredSession as ProtoDiscoveredSession,
+    EventTopic, EventsSubscribeParams, EventsSubscribeResult, ImportedSession, Method,
+    PtySize as ProtoPtySize, ServerCapabilities, SessionState, SessionSummary,
+    SessionsAttachParams, SessionsAttachResult, SessionsCreateParams, SessionsCreateResult,
+    SessionsDetachParams, SessionsDetachResult, SessionsImportParams, SessionsImportResult,
     SessionsListParams, SessionsListResult, SessionsSignalParams, SessionsSignalResult,
     SessionsWriteParams, SessionsWriteResult,
 };
@@ -383,8 +389,9 @@ async fn dispatch(
     ctx: &ConnectionContext,
 ) -> Result<serde_json::Value, RpcError> {
     use la_proto::methods::{
-        Initialize, SessionsArchive, SessionsAttach, SessionsCreate, SessionsDelete,
-        SessionsDetach, SessionsList, SessionsSignal, SessionsWrite,
+        AdaptersDiscover, Initialize, SessionsArchive, SessionsAttach, SessionsCreate,
+        SessionsDelete, SessionsDetach, SessionsImport, SessionsList, SessionsSignal,
+        SessionsWrite,
     };
 
     match req.method.as_str() {
@@ -430,6 +437,14 @@ async fn dispatch(
             let id = SessionId(params.session_id);
             state.manager.delete(&id).await.map_err(core_to_rpc)?;
             ok(la_proto::methods::SessionsDeleteResult {})
+        }
+        AdaptersDiscover::NAME => {
+            let params: AdaptersDiscoverParams = decode_params(req)?;
+            handle_adapters_discover(state, ctx, params).await
+        }
+        SessionsImport::NAME => {
+            let params: SessionsImportParams = decode_params(req)?;
+            handle_sessions_import(state, ctx, params).await
         }
         "shutdown" => ok(la_proto::methods::ShutdownResult {}),
         other => Err(RpcError::method_not_found(other)),
@@ -758,6 +773,206 @@ async fn handle_sessions_signal(
         .await
         .map_err(core_to_rpc)?;
     ok(SessionsSignalResult {})
+}
+
+async fn handle_adapters_discover(
+    state: &ConnState,
+    ctx: &ConnectionContext,
+    params: AdaptersDiscoverParams,
+) -> Result<serde_json::Value, RpcError> {
+    let mut out: Vec<ProtoDiscoveredSession> = Vec::new();
+
+    let targets: Vec<(String, Arc<dyn AgentAdapter>)> = match params.backend.as_deref() {
+        Some(name) => {
+            let adapter = ctx.adapters.get(name).ok_or_else(|| {
+                RpcError::new(
+                    error_codes::ADAPTER_NOT_INSTALLED,
+                    format!("{name}: no such backend registered"),
+                )
+            })?;
+            vec![(name.to_string(), adapter)]
+        }
+        None => ctx.adapters.pairs(),
+    };
+
+    let hints = DiscoverHints {
+        project_root: params.project_root.as_deref().map(PathBuf::from),
+        source_path_override: params.source_path.as_deref().map(PathBuf::from),
+    };
+
+    for (id, adapter) in targets {
+        let found = match adapter.discover(&hints).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(backend = %id, error = %err, "discover: adapter failed");
+                continue;
+            }
+        };
+        for d in found {
+            let existing = state
+                .manager
+                .storage()
+                .sessions()
+                .find_by_backend_external_id(&id, &d.external_id)
+                .await
+                .map_err(storage_to_rpc)?;
+            out.push(adapter_to_proto_discovered(&id, d, existing.is_some()));
+        }
+    }
+
+    ok(AdaptersDiscoverResult { discovered: out })
+}
+
+async fn handle_sessions_import(
+    state: &ConnState,
+    ctx: &ConnectionContext,
+    params: SessionsImportParams,
+) -> Result<serde_json::Value, RpcError> {
+    let adapter = ctx.adapters.get(&params.backend).ok_or_else(|| {
+        RpcError::new(
+            error_codes::ADAPTER_NOT_INSTALLED,
+            format!("{}: no such backend registered", params.backend),
+        )
+    })?;
+
+    let hints = DiscoverHints {
+        project_root: None,
+        source_path_override: params.source_path.as_deref().map(PathBuf::from),
+    };
+    let found = adapter.discover(&hints).await.map_err(adapter_to_rpc)?;
+
+    let wanted: Option<std::collections::HashSet<String>> = params
+        .external_ids
+        .as_ref()
+        .map(|v| v.iter().cloned().collect());
+
+    let mut out: Vec<ImportedSession> = Vec::new();
+    let storage = state.manager.storage();
+
+    for d in found {
+        if let Some(ref keep) = wanted {
+            if !keep.contains(&d.external_id) {
+                continue;
+            }
+        }
+
+        // Idempotency: same (backend, external_id) ⇒ same row.
+        if let Some(existing) = storage
+            .sessions()
+            .find_by_backend_external_id(&params.backend, &d.external_id)
+            .await
+            .map_err(storage_to_rpc)?
+        {
+            out.push(ImportedSession {
+                session_id: existing.id,
+                external_id: d.external_id.clone(),
+                backend: params.backend.clone(),
+                project_hint: d.project_hint.as_ref().map(|p| p.display().to_string()),
+                created_at: d.created_at.clone().unwrap_or(existing.created_at),
+                title_hint: d.title_hint.clone(),
+                external_path: existing.external_path,
+                already_existed: true,
+            });
+            continue;
+        }
+
+        // Sessions need a project. Reuse the row for `project_hint` when
+        // present, otherwise fall back to an `unknown` placeholder so
+        // the FK isn't violated — the user can re-bucket the imported
+        // session into the right project later from the TUI.
+        let project_dir = d
+            .project_hint
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let project_id = ensure_project(state, &project_dir).await?;
+
+        let id = la_storage::new_id();
+        let external_path_str = d.external_path.as_ref().map(|p| p.display().to_string());
+
+        let new_row = la_storage::NewSession {
+            id: id.clone(),
+            project_id,
+            backend_id: params.backend.clone(),
+            external_id: Some(d.external_id.clone()),
+            title: d.title_hint.clone(),
+            // Imported sessions describe past work the backend already
+            // finished; they enter the table in the terminal `Exited`
+            // state so the lifecycle reaper never tries to babysit a
+            // process it never spawned. `resume` (M2.4+) re-spawns the
+            // backend with `--resume <external_id>` against a brand new
+            // PTY when the user enters the row.
+            state: "exited".to_string(),
+            pid: None,
+            worktree_path: None,
+            worktree_branch: None,
+            base_branch: None,
+            spawn_args: serde_json::json!({}),
+            origin: "import".to_string(),
+            post_create_hook_status: None,
+            external_path: external_path_str.clone(),
+        };
+
+        storage
+            .sessions()
+            .create(new_row)
+            .await
+            .map_err(storage_to_rpc)?;
+
+        out.push(ImportedSession {
+            session_id: id,
+            external_id: d.external_id.clone(),
+            backend: params.backend.clone(),
+            project_hint: d.project_hint.as_ref().map(|p| p.display().to_string()),
+            created_at: d
+                .created_at
+                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
+            title_hint: d.title_hint.clone(),
+            external_path: external_path_str,
+            already_existed: false,
+        });
+    }
+
+    ok(SessionsImportResult { imported: out })
+}
+
+fn adapter_to_proto_discovered(
+    backend: &str,
+    d: AdapterDiscoveredSession,
+    already_imported: bool,
+) -> ProtoDiscoveredSession {
+    ProtoDiscoveredSession {
+        backend: backend.to_string(),
+        external_id: d.external_id,
+        external_path: d.external_path.map(|p| p.display().to_string()),
+        project_hint: d.project_hint.map(|p| p.display().to_string()),
+        title_hint: d.title_hint,
+        created_at: d.created_at,
+        already_imported,
+    }
+}
+
+fn adapter_to_rpc(err: AdapterError) -> RpcError {
+    match err {
+        AdapterError::NotInstalled { hint } => {
+            RpcError::new(error_codes::ADAPTER_NOT_INSTALLED, hint)
+        }
+        AdapterError::Unauthenticated { docs_url } => RpcError::new(
+            error_codes::ADAPTER_UNAUTHENTICATED,
+            format!("not authenticated; see {docs_url}"),
+        ),
+        AdapterError::SpawnFailed(io) => {
+            RpcError::new(error_codes::ADAPTER_SPAWN_FAILED, io.to_string())
+        }
+        AdapterError::UnsupportedOption { name } => RpcError::new(
+            error_codes::ADAPTER_UNSUPPORTED_OPTION,
+            format!("unsupported option: {name}"),
+        ),
+        AdapterError::ProtocolDrift { detail } => {
+            RpcError::new(error_codes::ADAPTER_PROTOCOL_DRIFT, detail)
+        }
+        AdapterError::Transient(detail) => RpcError::new(error_codes::ADAPTER_SPAWN_FAILED, detail),
+    }
 }
 
 fn parse_state(s: &str) -> SessionState {

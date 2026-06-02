@@ -167,9 +167,9 @@ impl<'a> SessionsRepo<'a> {
                 INSERT INTO sessions(
                     id, project_id, backend_id, external_id, title, state, pid,
                     worktree_path, worktree_branch, base_branch, spawn_args, origin,
-                    post_create_hook_status
+                    post_create_hook_status, external_path
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 "#,
             )
             .bind(&session.id)
@@ -185,6 +185,7 @@ impl<'a> SessionsRepo<'a> {
             .bind(&spawn_args)
             .bind(&session.origin)
             .bind(&session.post_create_hook_status)
+            .bind(&session.external_path)
             .execute(self.storage.writer_pool())
             .await
         })
@@ -200,7 +201,7 @@ impl<'a> SessionsRepo<'a> {
             SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                    worktree_path, worktree_branch, base_branch, spawn_args, origin,
                    transcript_path, transcript_bytes, created_at, updated_at, archived_at,
-                   post_create_hook_status
+                   post_create_hook_status, external_path
             FROM sessions
             WHERE id = ?1
             "#,
@@ -222,7 +223,7 @@ impl<'a> SessionsRepo<'a> {
                 SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                        worktree_path, worktree_branch, base_branch, spawn_args, origin,
                        transcript_path, transcript_bytes, created_at, updated_at, archived_at,
-                       post_create_hook_status
+                       post_create_hook_status, external_path
                 FROM sessions
                 WHERE project_id = ?1
                 ORDER BY created_at DESC
@@ -238,7 +239,7 @@ impl<'a> SessionsRepo<'a> {
                 SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                        worktree_path, worktree_branch, base_branch, spawn_args, origin,
                        transcript_path, transcript_bytes, created_at, updated_at, archived_at,
-                       post_create_hook_status
+                       post_create_hook_status, external_path
                 FROM sessions
                 WHERE project_id = ?1 AND archived_at IS NULL
                 ORDER BY created_at DESC
@@ -298,7 +299,7 @@ impl<'a> SessionsRepo<'a> {
             SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                    worktree_path, worktree_branch, base_branch, spawn_args, origin,
                    transcript_path, transcript_bytes, created_at, updated_at, archived_at,
-                   post_create_hook_status
+                   post_create_hook_status, external_path
             FROM sessions
             WHERE state IN ('starting', 'running', 'waiting')
             "#,
@@ -318,7 +319,7 @@ impl<'a> SessionsRepo<'a> {
             SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                    worktree_path, worktree_branch, base_branch, spawn_args, origin,
                    transcript_path, transcript_bytes, created_at, updated_at, archived_at,
-                   post_create_hook_status
+                   post_create_hook_status, external_path
             FROM sessions
             WHERE archived_at IS NOT NULL AND archived_at < ?1
             "#,
@@ -348,7 +349,7 @@ impl<'a> SessionsRepo<'a> {
             SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                    worktree_path, worktree_branch, base_branch, spawn_args, origin,
                    transcript_path, transcript_bytes, created_at, updated_at, archived_at,
-                   post_create_hook_status
+                   post_create_hook_status, external_path
             FROM sessions
             WHERE archived_at IS NOT NULL
               AND worktree_path IS NOT NULL
@@ -371,7 +372,7 @@ impl<'a> SessionsRepo<'a> {
             SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                    worktree_path, worktree_branch, base_branch, spawn_args, origin,
                    transcript_path, transcript_bytes, created_at, updated_at, archived_at,
-                   post_create_hook_status
+                   post_create_hook_status, external_path
             FROM sessions
             WHERE project_id = ?1
               AND worktree_path IS NOT NULL
@@ -446,6 +447,33 @@ impl<'a> SessionsRepo<'a> {
         })
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Look up a session by its `(backend_id, external_id)` pair so the
+    /// `sessions.import` path can stay idempotent — re-importing the
+    /// same backend session returns the existing row's id instead of
+    /// inserting a duplicate. Returns `None` when no row matches.
+    pub async fn find_by_backend_external_id(
+        &self,
+        backend_id: &str,
+        external_id: &str,
+    ) -> Result<Option<Session>> {
+        sqlx::query_as::<_, Session>(
+            r#"
+            SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
+                   worktree_path, worktree_branch, base_branch, spawn_args, origin,
+                   transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+                   post_create_hook_status, external_path
+            FROM sessions
+            WHERE backend_id = ?1 AND external_id = ?2
+            LIMIT 1
+            "#,
+        )
+        .bind(backend_id)
+        .bind(external_id)
+        .fetch_optional(self.storage.reader_pool())
+        .await
+        .map_err(Into::into)
     }
 }
 
@@ -640,7 +668,7 @@ async fn session_by_id(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<Opt
         SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                worktree_path, worktree_branch, base_branch, spawn_args, origin,
                transcript_path, transcript_bytes, created_at, updated_at, archived_at,
-               post_create_hook_status
+               post_create_hook_status, external_path
         FROM sessions
         WHERE id = ?1
         "#,

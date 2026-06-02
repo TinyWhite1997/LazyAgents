@@ -57,6 +57,7 @@ async fn seed_backend_project_session(storage: &Storage) -> (String, String, Str
             spawn_args: serde_json::json!({"args":["--verbose"]}),
             origin: "user".into(),
             post_create_hook_status: Some("ok".into()),
+            external_path: None,
         })
         .await
         .expect("session");
@@ -92,7 +93,10 @@ async fn migrations_enable_wal_and_schema_meta() {
         .schema_meta("migration")
         .await
         .expect("migration meta");
-    assert_eq!(migration.as_deref(), Some("0002_worktree_hook_status"));
+    assert_eq!(
+        migration.as_deref(),
+        Some("0003_session_external_reference")
+    );
 }
 
 #[tokio::test]

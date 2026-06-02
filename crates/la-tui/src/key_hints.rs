@@ -100,10 +100,23 @@ impl HintRegistry {
         if matches!(focus, Focus::Sidebar) {
             // Selection-sensitive entries.
             match selection {
+                Selection::Session { project_id, .. }
+                    if project_id == crate::model::ProjectGroup::DISCOVERED_ID =>
+                {
+                    // Discovered rows are read-only — `i` (import) is the
+                    // only valid affordance; suppress delete/archive so
+                    // the bar advertises only what works.
+                    out.push(Hint::new("i", "import", Importance::Primary));
+                }
                 Selection::Session { .. } => {
                     out.push(Hint::new("⏎", "open", Importance::Primary));
                     out.push(Hint::new("d", "delete", Importance::High));
                     out.push(Hint::new("a", "archive", Importance::High));
+                }
+                Selection::Group { project_id }
+                    if project_id == crate::model::ProjectGroup::DISCOVERED_ID =>
+                {
+                    out.push(Hint::new("l", "expand", Importance::Primary));
                 }
                 Selection::Group { project_id } => {
                     if project_id == crate::model::ProjectGroup::ARCHIVED_ID {

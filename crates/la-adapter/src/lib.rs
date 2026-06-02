@@ -29,6 +29,7 @@ use bytes::Bytes;
 
 pub mod claude;
 pub mod codex;
+pub mod ext_time;
 pub mod opencode;
 
 /// Static metadata about an adapter — used for UI listings and the
@@ -168,21 +169,38 @@ pub struct SpawnSpec {
     pub stdin_mode: StdinMode,
 }
 
-/// Hints passed to [`AgentAdapter::discover`]. M0 stub — the v1 set is
-/// defined in §4.2; for now only the project root is meaningful.
+/// Hints passed to [`AgentAdapter::discover`]. Adapters may ignore any
+/// field they don't understand; the daemon fills in whatever it has.
 #[derive(Debug, Clone, Default)]
 pub struct DiscoverHints {
+    /// Restrict the walk to sessions whose recorded cwd matches this
+    /// project root (canonicalised by the adapter). `None` ⇒ no filter.
     pub project_root: Option<PathBuf>,
+    /// Override the adapter's default discovery root with this path.
+    /// Useful for fixtures during tests and for users who pin their
+    /// backend's data dir to a non-default location via `config.toml`.
+    /// `None` ⇒ the adapter resolves its built-in default (env var →
+    /// well-known XDG / `$HOME` location).
+    pub source_path_override: Option<PathBuf>,
 }
 
 /// A pre-existing session surfaced from a backend's own on-disk store.
-/// Mirrors §4.1 of the architecture doc; only the fields that any
-/// adapter is expected to populate are included here.
+/// Mirrors §4.2 of the architecture doc; adapters populate whatever
+/// fields they can extract cheaply from the discovery file.
 #[derive(Debug, Clone)]
 pub struct DiscoveredSession {
     pub external_id: String,
     pub project_hint: Option<PathBuf>,
     pub title_hint: Option<String>,
+    /// Absolute path to the backend's own transcript file on disk
+    /// (JSONL/JSON). The daemon stores this as a read-only reference
+    /// so resume can re-attach the backend's data store without
+    /// copying or mutating it.
+    pub external_path: Option<PathBuf>,
+    /// RFC3339 creation timestamp. Adapters fall back to the discovery
+    /// file's mtime when the backend payload doesn't carry one; `None`
+    /// only when neither is obtainable (e.g. metadata-less fixture).
+    pub created_at: Option<String>,
 }
 
 /// Parser state threaded through repeated [`AgentAdapter::parse_chunk`]

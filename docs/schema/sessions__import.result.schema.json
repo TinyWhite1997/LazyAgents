@@ -15,7 +15,7 @@
   },
   "definitions": {
     "ImportedSession": {
-      "description": "A read-only reference to a backend-native session discovered on disk. The daemon assigns a fresh `session_id` so the rest of the system can reference it uniformly; `external_id` preserves the backend's own id.",
+      "description": "A read-only reference to a backend-native session promoted into the daemon's `sessions` table. The daemon assigns a fresh `session_id` so the rest of the system can reference it uniformly; `external_id` preserves the backend's own id.\n\nRe-importing a session that already exists (same `backend` + `external_id`) is idempotent — `session_id` is the existing row's id and `already_existed` is `true`.",
       "type": "object",
       "required": [
         "backend",
@@ -50,6 +50,18 @@
             "string",
             "null"
           ]
+        },
+        "external_path": {
+          "description": "Absolute path to the backend's own transcript file. Persisted on the row so resume can re-attach the data store.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "already_existed": {
+          "description": "`true` when this `(backend, external_id)` already had a row and the daemon returned the existing `session_id` instead of creating a new one.",
+          "default": false,
+          "type": "boolean"
         }
       }
     }

@@ -11,17 +11,24 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde::Deserialize;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::ext_time::file_mtime_rfc3339;
 use crate::{
-    AdapterDescriptor, AdapterError, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec, StdinMode,
-    StopAction, StopSequence, StopSignal,
+    AdapterDescriptor, AdapterError, AgentAdapter, DiscoverHints, DiscoveredSession, ProbeResult,
+    SpawnRequest, SpawnSpec, StdinMode, StopAction, StopSequence, StopSignal,
 };
 
 const DEFAULT_PROGRAM: &str = "claude";
 const DOCS_URL: &str = "https://docs.claude.com/en/docs/claude-code";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Env override for the on-disk session store walked by
+/// [`ClaudeAdapter::discover`]. When unset the adapter falls back to
+/// `<HOME>/.claude/projects`.
+pub const SESSIONS_DIR_ENV: &str = "CLAUDE_SESSIONS_DIR";
 
 /// Adapter for Anthropic's `claude` CLI ("Claude Code").
 ///
@@ -203,6 +210,151 @@ impl AgentAdapter for ClaudeAdapter {
             StopAction::Signal(StopSignal::Kill),
         ])
     }
+
+    async fn discover(
+        &self,
+        hints: &DiscoverHints,
+    ) -> Result<Vec<DiscoveredSession>, AdapterError> {
+        let root = match hints.source_path_override.clone().or_else(sessions_root) {
+            Some(p) => p,
+            None => return Ok(Vec::new()),
+        };
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut out: Vec<DiscoveredSession> = Vec::new();
+        let want_root = hints.project_root.as_deref().map(canonicalize_or_keep);
+
+        let entries = match collect_session_files(&root) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(AdapterError::Transient(format!(
+                    "cannot read claude sessions dir {}: {e}",
+                    root.display()
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %root.display(), "discover: walk failed");
+                return Ok(out);
+            }
+        };
+
+        for file in entries {
+            let Some(meta) = read_session_meta(&file) else {
+                continue;
+            };
+            let project_hint = meta.cwd.clone().map(PathBuf::from);
+            if let Some(ref want) = want_root {
+                let Some(ref cwd) = meta.cwd else {
+                    continue;
+                };
+                let got = canonicalize_or_keep(Path::new(cwd));
+                if &got != want {
+                    continue;
+                }
+            }
+            let created_at = meta.timestamp.or_else(|| file_mtime_rfc3339(&file));
+            out.push(DiscoveredSession {
+                external_id: meta.session_id,
+                project_hint,
+                title_hint: None,
+                external_path: Some(file.clone()),
+                created_at,
+            });
+        }
+
+        Ok(out)
+    }
+}
+
+/// Resolve the on-disk sessions root. Honours [`SESSIONS_DIR_ENV`] first
+/// (test override), then `<HOME>/.claude/projects`. Returns `None` when
+/// neither is available — discover() treats that as "no sessions".
+fn sessions_root() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(SESSIONS_DIR_ENV) {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".claude").join("projects"))
+}
+
+/// Walk the sessions root and return paths of every `*.jsonl` session
+/// rollout under it. Claude lays sessions out as
+/// `<root>/<encoded-cwd>/<session-uuid>.jsonl` — we just recurse one
+/// level deep, but accept anywhere in the tree to stay forward
+/// compatible with shape changes.
+fn collect_session_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in rd.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                if ext.eq_ignore_ascii_case("jsonl") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// First-line metadata pulled from a claude session rollout. The on-disk
+/// shape varies across releases — `session_id`/`sessionId`/`id` and
+/// `cwd`/`workingDir` are all observed — so the adapter accepts the
+/// permissive union via aliases.
+#[derive(Debug, Deserialize)]
+struct SessionMetaWire {
+    #[serde(alias = "session_id", alias = "sessionId", alias = "id")]
+    session_id: String,
+    #[serde(default, alias = "cwd", alias = "workingDir", alias = "working_dir")]
+    cwd: Option<String>,
+    #[serde(
+        default,
+        alias = "timestamp",
+        alias = "created_at",
+        alias = "createdAt",
+        alias = "started_at",
+        alias = "startedAt"
+    )]
+    timestamp: Option<String>,
+}
+
+/// Read the first non-empty line of a rollout file and try to extract
+/// the session metadata. Returns `None` for any I/O or shape error —
+/// callers skip malformed entries silently.
+fn read_session_meta(path: &Path) -> Option<SessionMetaWire> {
+    let bytes = std::fs::read(path).ok()?;
+    for raw_line in bytes.split(|b| *b == b'\n') {
+        if raw_line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<SessionMetaWire>(raw_line) {
+            Ok(m) => return Some(m),
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+fn canonicalize_or_keep(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Pull the first sem-ver-ish token out of `claude --version` output.

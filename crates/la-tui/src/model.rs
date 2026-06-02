@@ -106,6 +106,12 @@ pub struct SessionRow {
     /// Soft-deleted by the user — placed under the Archived bucket and
     /// hidden from per-project glyph computation.
     pub archived: bool,
+    /// Surfaced by `adapters.discover` but not yet imported. The row
+    /// lives under the synthetic Discovered bucket and is read-only —
+    /// only the `i` (import) action applies. `session_id` here is the
+    /// backend's own `external_id`; the daemon assigns a fresh row on
+    /// import.
+    pub discovered: bool,
 }
 
 impl SessionRow {
@@ -136,6 +142,7 @@ impl SessionRow {
             title: s.title.clone(),
             run_state: RunState::from_state(s.state),
             archived: matches!(s.state, SessionState::Archived),
+            discovered: false,
         }
     }
 }
@@ -192,6 +199,33 @@ impl ProjectGroup {
     /// Sentinel project id for the Archived bucket. Reserved — the daemon
     /// must never assign this UUID-shaped string to a real project.
     pub const ARCHIVED_ID: &'static str = "__archived__";
+
+    /// The synthetic Discovered bucket (WEK-26 / M2.3).
+    ///
+    /// Lists sessions surfaced by `adapters.discover` that the user has
+    /// not yet promoted via `sessions.import`. Rows here are read-only
+    /// — the only action is `i` (import). The bucket starts expanded so
+    /// fresh discoveries are visible without a key press; a renderer
+    /// pins it just above the Archived bucket so the project-list
+    /// order isn't disturbed.
+    pub fn discovered() -> Self {
+        Self {
+            project_id: Self::DISCOVERED_ID.to_string(),
+            display_name: "Discovered".to_string(),
+            root_path: String::new(),
+            expanded: true,
+            sessions: Vec::new(),
+            is_archived: false,
+        }
+    }
+
+    /// Sentinel project id for the Discovered bucket. Reserved.
+    pub const DISCOVERED_ID: &'static str = "__discovered__";
+
+    /// `true` when this group is the synthetic Discovered bucket.
+    pub fn is_discovered(&self) -> bool {
+        self.project_id == Self::DISCOVERED_ID
+    }
 }
 
 /// UI-side projection of a [`la_proto::notifications::BackendHealth`].
@@ -304,6 +338,7 @@ mod tests {
             title: None,
             run_state: RunState::Idle,
             archived: false,
+            discovered: false,
         };
         assert_eq!(s.display_title(), "claude · abcdef");
     }
@@ -317,6 +352,7 @@ mod tests {
             title: Some("Fix login bug".to_string()),
             run_state: RunState::Idle,
             archived: false,
+            discovered: false,
         };
         assert_eq!(s.display_title(), "Fix login bug");
     }

@@ -574,6 +574,7 @@ mod tests {
             title: None,
             run_state: run,
             archived: false,
+            discovered: false,
         };
         let mut a = ProjectGroup::new("p-a", "proj-a");
         a.sessions.extend([

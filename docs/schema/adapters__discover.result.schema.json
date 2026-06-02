@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AdaptersDiscoverResult",
+  "type": "object",
+  "required": [
+    "discovered"
+  ],
+  "properties": {
+    "discovered": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DiscoveredSession"
+      }
+    }
+  },
+  "definitions": {
+    "DiscoveredSession": {
+      "description": "One pre-existing backend session surfaced from disk. Mirrors `la_adapter::DiscoveredSession` plus the daemon-side bookkeeping fields (`backend`, `external_path`, `already_imported`).",
+      "type": "object",
+      "required": [
+        "backend",
+        "external_id"
+      ],
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "external_id": {
+          "type": "string"
+        },
+        "external_path": {
+          "description": "Absolute path to the backend's own transcript file (JSONL/JSON). The daemon promises never to mutate it; the import path stores it as a read-only reference (architecture §4.2 双轨).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_hint": {
+          "description": "Project root hint reported by the backend (if any).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title_hint": {
+          "description": "Backend-provided title or first-line preview (if any).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp recorded by the backend. Falls back to the discovery file's mtime when the backend payload doesn't carry one; `None` only when neither could be obtained.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "already_imported": {
+          "description": "`true` when the daemon's `sessions` table already contains a row for this `(backend, external_id)`. TUI should grey-out import affordance for these entries.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

@@ -285,6 +285,7 @@ impl SessionManager {
                 spawn_args,
                 origin: "user".to_string(),
                 post_create_hook_status: None,
+                external_path: None,
             })
             .await
         {

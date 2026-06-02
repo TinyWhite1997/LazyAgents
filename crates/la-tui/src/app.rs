@@ -97,6 +97,10 @@ pub enum AppMsg {
     ArchiveOrRestore,
     /// `n` new session (opens chooser modal).
     NewSession,
+    /// `i` promote a Discovered session into a native row via
+    /// `sessions.import` (WEK-26 / M2.3). No-op outside the
+    /// Discovered bucket.
+    ImportDiscovered,
     /// Confirm / cancel inside a modal.
     Confirm,
     Cancel,
@@ -209,6 +213,7 @@ impl<S: SessionSource> App<S> {
             AppMsg::Delete => self.on_delete(),
             AppMsg::ArchiveOrRestore => self.on_archive_or_restore(),
             AppMsg::NewSession => self.on_new_session(),
+            AppMsg::ImportDiscovered => self.on_import_discovered(),
             AppMsg::Confirm | AppMsg::Cancel => {
                 // No-op outside a modal.
             }
@@ -322,6 +327,29 @@ impl<S: SessionSource> App<S> {
             return;
         }
         self.modal = Some(Modal::NewSession { project_id });
+    }
+
+    /// `i` on a Discovered row: hand the row's external id to the
+    /// source so it can call `sessions.import` (or, in the mock,
+    /// flip the discovered flag). No-op on any other row so the key
+    /// stays silent outside the bucket.
+    fn on_import_discovered(&mut self) {
+        let sel = self.sidebar.selection();
+        let Some(sid) = sel.session_id() else { return };
+        let is_discovered = self
+            .sidebar
+            .groups()
+            .iter()
+            .flat_map(|g| g.sessions.iter())
+            .find(|s| s.session_id == sid)
+            .map(|s| s.discovered)
+            .unwrap_or(false);
+        if !is_discovered {
+            return;
+        }
+        let sid = sid.to_string();
+        self.source.import_discovered(&sid);
+        self.refresh_sessions();
     }
 }
 
@@ -471,5 +499,60 @@ mod tests {
         assert_eq!(a.status.running, 3);
         assert!(a.status.daemon_online);
         assert_eq!(a.status.next_cron_label.as_deref(), Some("next 02:00"));
+    }
+
+    #[test]
+    fn i_on_discovered_row_promotes_it_into_its_project() {
+        let mut a = app();
+        // Navigate cursor into the Discovered bucket and pick its first
+        // row.
+        a.handle(AppMsg::SidebarBottom); // archived (or last) group header
+                                         // Walk up until we land inside the Discovered group — fixture
+                                         // places it just above Archived.
+        loop {
+            a.handle(AppMsg::SidebarUp);
+            let in_discovered = a
+                .sidebar
+                .selection()
+                .session_id()
+                .and_then(|sid| {
+                    a.sidebar
+                        .groups()
+                        .iter()
+                        .flat_map(|g| g.sessions.iter())
+                        .find(|s| s.session_id == sid)
+                })
+                .map(|s| s.discovered)
+                .unwrap_or(false);
+            if in_discovered {
+                break;
+            }
+            // Safety: stop if we accidentally reach the top — the fixture
+            // is small enough this should never fire, and asserting keeps
+            // the test honest about its assumption.
+            if matches!(a.sidebar.selection(), Selection::Empty) {
+                panic!("could not find a discovered row");
+            }
+        }
+        let sid = a
+            .sidebar
+            .selection()
+            .session_id()
+            .map(str::to_string)
+            .unwrap();
+        a.handle(AppMsg::ImportDiscovered);
+        let snap = a.source().snapshot();
+        let still_discovered = snap
+            .iter()
+            .filter(|g| g.is_discovered())
+            .flat_map(|g| g.sessions.iter())
+            .any(|s| s.session_id == sid);
+        assert!(!still_discovered, "row left the Discovered bucket");
+        let in_project = snap
+            .iter()
+            .filter(|g| !g.is_discovered() && !g.is_archived)
+            .flat_map(|g| g.sessions.iter())
+            .any(|s| s.session_id == sid);
+        assert!(in_project, "row landed under its real project");
     }
 }

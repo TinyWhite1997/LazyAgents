@@ -14,6 +14,16 @@
         "string",
         "null"
       ]
+    },
+    "external_ids": {
+      "description": "Specific external ids to import; `None` ⇒ every discovered session. Unknown ids are silently dropped so a stale TUI snapshot never wedges an import call.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
     }
   }
 }

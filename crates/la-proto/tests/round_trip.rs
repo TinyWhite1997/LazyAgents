@@ -20,6 +20,7 @@
 use la_proto::chunking::chunk_session_output;
 use la_proto::jsonrpc::{Message, Notification, Request, RequestId, Response, RpcError, Version};
 use la_proto::methods::{
+    AdaptersDiscover, AdaptersDiscoverParams, AdaptersDiscoverResult, DiscoveredSession,
     EventTopic, EventsSubscribe, EventsSubscribeParams, EventsSubscribeResult, ImportedSession,
     Initialize, InitializeParams, InitializeResult, Method, PtySize, ServerCapabilities,
     SessionSignal, SessionState, SessionSummary, SessionsArchive, SessionsArchiveParams,
@@ -497,6 +498,7 @@ fn m1_envelope_round_trip_for_every_method() {
         &SessionsImportParams {
             backend: "codex".into(),
             source_path: None,
+            external_ids: Some(vec!["ext-1".into()]),
         },
         &SessionsImportResult {
             imported: vec![ImportedSession {
@@ -506,6 +508,30 @@ fn m1_envelope_round_trip_for_every_method() {
                 project_hint: Some("/work".into()),
                 created_at: "2026-05-30T08:00:00Z".into(),
                 title_hint: None,
+                external_path: Some(
+                    "/home/me/.codex/sessions/2026/05/30/rollout-ext-1.jsonl".into(),
+                ),
+                already_existed: false,
+            }],
+        },
+    );
+    roundtrip::<AdaptersDiscover>(
+        &AdaptersDiscoverParams {
+            backend: Some("codex".into()),
+            source_path: None,
+            project_root: Some("/work".into()),
+        },
+        &AdaptersDiscoverResult {
+            discovered: vec![DiscoveredSession {
+                backend: "codex".into(),
+                external_id: "ext-1".into(),
+                external_path: Some(
+                    "/home/me/.codex/sessions/2026/05/30/rollout-ext-1.jsonl".into(),
+                ),
+                project_hint: Some("/work".into()),
+                title_hint: None,
+                created_at: Some("2026-05-30T08:00:00Z".into()),
+                already_imported: false,
             }],
         },
     );
@@ -910,6 +936,7 @@ fn schema_files_match_generated_output() {
     add_method!(SessionsSignal);
     add_method!(SessionsArchive);
     add_method!(SessionsDelete);
+    add_method!(AdaptersDiscover);
     add_method!(SessionsImport);
     add_method!(SessionsReplay);
     add_method!(EventsSubscribe);
