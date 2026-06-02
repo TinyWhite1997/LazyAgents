@@ -29,6 +29,7 @@ use bytes::Bytes;
 
 pub mod claude;
 pub mod codex;
+pub mod opencode;
 
 /// Static metadata about an adapter — used for UI listings and the
 /// `backends` SQLite snapshot. Field values are stable for the lifetime

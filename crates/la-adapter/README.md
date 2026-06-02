@@ -31,6 +31,8 @@ LA_RUN_CLAUDE_E2E=1 \
   cargo test -p la-adapter --test real_claude  # real claude CLI, real tokens
 LA_RUN_CODEX_E2E=1 \
   cargo test -p la-adapter --test real_codex   # real codex CLI, real tokens
+LA_RUN_OPENCODE_E2E=1 \
+  cargo test -p la-adapter --test real_opencode # real opencode CLI, real tokens
 ```
 
 Coverage:
@@ -39,13 +41,19 @@ Coverage:
   spawn_spec branches.
 - `src/codex.rs` unit tests — version parsing, encode/stop semantics,
   line-buffered JSONL `parse_chunk`.
+- `src/opencode.rs` unit tests — version parsing, encode/stop semantics,
+  line-buffered JSONL `parse_chunk`.
 - `tests/adapter.rs` against the in-crate `mock-cli` binary — every
   `ProbeResult` variant + `spawn_spec` overrides (claude flavor).
 - `tests/codex.rs` against `mock-cli` with `MOCK_CLI_FLAVOR=codex` —
   every `ProbeResult` variant, `spawn_spec` arg ordering, `discover()`
   against a temp `CODEX_SESSIONS_DIR`.
-- `tests/real_claude.rs` / `tests/real_codex.rs` — opt-in E2Es that
-  drive the real CLIs through `la-pty`.
+- `tests/opencode.rs` against `mock-cli` with `MOCK_CLI_FLAVOR=opencode`
+  — every `ProbeResult` variant (including `auth list` unsupported →
+  stays Available), `spawn_spec` arg ordering, `discover()` against a
+  temp `OPENCODE_SESSIONS_DIR`.
+- `tests/real_claude.rs` / `tests/real_codex.rs` / `tests/real_opencode.rs`
+  — opt-in E2Es that drive the real CLIs through `la-pty`.
 
 ## Non-goals
 
@@ -90,4 +98,33 @@ through multiple codex upgrades surfaces sessions from every era.
 Resume (`codex resume <id>`) is intentionally not modelled by
 `spawn_spec` — the architecture doc specifies that resume always spawns
 a fresh process; `discover()` exposes the external id so the daemon can
+build the resume spawn elsewhere.
+
+## OpenCode (WEK-25 / M2.2)
+
+`opencode::OpencodeAdapter` implements the full trait surface against
+the sst.dev OpenCode CLI (`opencode` on PATH). Designed against
+`opencode 1.2.15`.
+
+| Method | M2.2 | Notes |
+|--------|------|-------|
+| `descriptor`        | ✅ | id=`opencode`, default_program=`opencode` |
+| `probe`             | ✅ | Parses `opencode --version`; secondary `opencode auth list` probe classifies `Unauthenticated` |
+| `spawn_spec`        | ✅ | `NullSink+prompt` → `run --format json [--dir <cwd>] <prompt>`; interactive launches the TUI with the project path as a positional |
+| `encode_user_input` | ✅ | Appends `\n` (opencode TUI submit key) |
+| `graceful_stop`     | ✅ | Signal-only (SIGTERM → wait → SIGKILL); no stable in-band exit across versions |
+| `discover`          | ✅ | Walks `$XDG_DATA_HOME/opencode/sessions/**/*.json` (and `.jsonl`); tolerates bare `{id, cwd}` and nested envelopes (`meta` / `session` / `payload`); honours `OPENCODE_SESSIONS_DIR` override |
+| `parse_chunk`       | ✅ | Line-buffered JSONL; emits one `Passthrough` per complete line (sanity-parses each line but does not yet extract structured events) |
+
+### OpenCode CLI version compatibility
+
+| opencode CLI version | `--version` parse | `run --format json` | `auth list` | sessions dir layout | adapter status |
+|----------------------|-------------------|---------------------|-------------|---------------------|----------------|
+| 1.2.15 (current dev box) | ✅ | ✅ JSONL | ✅ classifies Unauthenticated (empty list or stderr keyword) | flat `$XDG_DATA_HOME/opencode/sessions/*.json` | ✅ supported |
+| 1.x (other) | likely same shape (`opencode 1.x.y` or bare `1.x.y`) | likely same flag | unknown subcommand drift | flat or `sessions/<scope>/*.json` nested | best-effort, untested |
+| ≤ 0.x (historical) | unknown | may lack `--format json` | unknown | unknown | `discover()` tolerates nested + envelope shapes; `run` may degrade |
+
+Resume (`opencode run --session <id>` / `--continue`) is intentionally
+not modelled by `spawn_spec` — same rule as codex: resume always spawns
+a fresh process. `discover()` exposes the external id so the daemon can
 build the resume spawn elsewhere.
