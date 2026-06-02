@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-build = "build.rs"
 
 [dev-dependencies]
 la-proto = { path = "../../crates/la-proto" }
@@ -20,4 +19,3 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 ratatui = { workspace = true }
-

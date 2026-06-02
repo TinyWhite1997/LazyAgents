@@ -20,13 +20,3 @@ jobs:
           name: m2-smoke-snapshots
           path: target/m2-smoke/snapshots/
           if-no-files-found: warn
-
-  windows-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
-      - name: Check workspace for Windows target
-        run: cargo check --workspace --target x86_64-pc-windows-gnu

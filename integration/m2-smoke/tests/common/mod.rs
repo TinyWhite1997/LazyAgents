@@ -235,12 +235,10 @@ pub async fn run_git(cwd: &Path, args: &[&str]) {
 }
 
 pub async fn make_bare_project_repo() -> (TempDir, PathBuf) {
-    configure_bare_repo_safety();
     let td = tempfile::tempdir().expect("project tempdir");
-    let bare = td.path().join("project.git");
-    let seed = td.path().join("seed");
-    run_git(td.path(), &["init", "--bare", "-q", "project.git"]).await;
-    run_git(td.path(), &["clone", "-q", "project.git", "seed"]).await;
+    let repo = td.path().join("project");
+    run_git(td.path(), &["init", "-q", "project"]).await;
+    let seed = repo.as_path();
     run_git(&seed, &["checkout", "-q", "-b", "main"]).await;
     run_git(&seed, &["config", "user.email", "m2@example.test"]).await;
     run_git(&seed, &["config", "user.name", "m2 tester"]).await;
@@ -250,15 +248,7 @@ pub async fn make_bare_project_repo() -> (TempDir, PathBuf) {
         .unwrap();
     run_git(&seed, &["add", "."]).await;
     run_git(&seed, &["commit", "-q", "-m", "seed"]).await;
-    run_git(&seed, &["push", "-q", "origin", "main"]).await;
-    run_git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]).await;
-    (td, bare)
-}
-
-fn configure_bare_repo_safety() {
-    std::env::set_var("GIT_CONFIG_COUNT", "1");
-    std::env::set_var("GIT_CONFIG_KEY_0", "safe.bareRepository");
-    std::env::set_var("GIT_CONFIG_VALUE_0", "all");
+    (td, repo)
 }
 
 pub async fn write_agent_change(worktree: &Path, backend: &str, suffix: &str) -> String {

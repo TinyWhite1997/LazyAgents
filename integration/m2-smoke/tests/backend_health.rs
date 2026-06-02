@@ -46,6 +46,18 @@ async fn unavailable_backend_is_grey_state_health_not_panic() {
             .contains("missing"),
         "missing install hint: {codex:?}"
     );
+    for id in ["claude", "opencode"] {
+        let backend = health
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .unwrap_or_else(|| panic!("{id} health entry"));
+        assert_eq!(
+            backend.status,
+            BackendHealthStatus::Available,
+            "{id} should remain available while codex is grey-stated"
+        );
+    }
 }
 
 async fn read_health_with_backends(

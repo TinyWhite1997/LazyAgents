@@ -15,7 +15,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn diff_panel_buffer_snapshot_is_written_as_artifact_input() {
+async fn diff_payload_buffer_snapshot_is_written_as_artifact_input() {
     let daemon = bootstrap_daemon(standard_backends()).await;
     let (_project, repo) = make_bare_project_repo().await;
     let mut conn = client(&daemon.socket).await;
@@ -56,18 +56,21 @@ async fn diff_panel_buffer_snapshot_is_written_as_artifact_input() {
     )
     .await;
 
-    let snapshot = render_diff_payload_text(&status, &diff);
+    let snapshot = render_diff_payload_snapshot_text(&status, &diff);
     assert!(snapshot.contains("claude"));
     assert!(snapshot.contains("unstaged"));
 
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/m2-smoke/snapshots");
     tokio::fs::create_dir_all(&out_dir).await.unwrap();
-    tokio::fs::write(out_dir.join("diff-panel.txt"), snapshot)
+    tokio::fs::write(out_dir.join("diff-payload.txt"), snapshot)
         .await
         .unwrap();
 }
 
-fn render_diff_payload_text(status: &WorktreeStatusResult, diff: &WorktreeDiffResult) -> String {
+fn render_diff_payload_snapshot_text(
+    status: &WorktreeStatusResult,
+    diff: &WorktreeDiffResult,
+) -> String {
     let area = Rect::new(0, 0, 100, 12);
     let mut buf = Buffer::empty(area);
     put(&mut buf, 0, 0, &format!("branch: {}", status.branch));

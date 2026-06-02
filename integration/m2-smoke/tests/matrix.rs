@@ -256,7 +256,7 @@ async fn three_backends_run_concurrently_in_isolated_worktrees() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn detach_does_not_kill_child_process() {
+async fn client_detach_keeps_session_non_terminal() {
     let daemon = bootstrap_daemon(standard_backends()).await;
     let (_project, repo) = make_bare_project_repo().await;
     let mut conn = client(&daemon.socket).await;
@@ -313,18 +313,6 @@ async fn detach_does_not_kill_child_process() {
                 )),
         "session should remain non-terminal after client detach; listed={listed:?}"
     );
-}
-
-#[cfg(have_codex_bin)]
-#[test]
-fn codex_binary_presence_cfg_is_detected() {
-    assert!(option_env!("PATH").is_some());
-}
-
-#[cfg(have_opencode_bin)]
-#[test]
-fn opencode_binary_presence_cfg_is_detected() {
-    assert!(option_env!("PATH").is_some());
 }
 
 impl DiffOp {

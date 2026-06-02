@@ -18,11 +18,38 @@ use tokio::time::timeout;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_stage_same_hunk_does_not_corrupt_index_or_session_row() {
     let daemon = bootstrap_daemon(standard_backends()).await;
+    let mut observed_contention = false;
+
+    for round in 0..32 {
+        let outcomes = run_stage_race_round(&daemon, round).await;
+        assert!(
+            outcomes.iter().all(StageOutcome::is_safe),
+            "unexpected race outcomes in round {round}: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().any(|o| matches!(o, StageOutcome::Applied)),
+            "at least one concurrent stage should apply the hunk in round {round}: {outcomes:?}"
+        );
+        observed_contention |= outcomes
+            .iter()
+            .any(|o| matches!(o, StageOutcome::Stale | StageOutcome::StorageBusy));
+        if observed_contention {
+            break;
+        }
+    }
+
+    assert!(
+        observed_contention,
+        "32 concurrent stage attempts never observed a stale/storage-busy loser"
+    );
+}
+
+async fn run_stage_race_round(daemon: &common::TestDaemon, round: usize) -> Vec<StageOutcome> {
     let (_project, repo) = make_bare_project_repo().await;
     let mut conn = client(&daemon.socket).await;
     let created: SessionsCreateResult = call(
         &mut conn,
-        1,
+        1 + round as i64 * 10,
         "sessions.create",
         SessionsCreateParams {
             project_dir: repo.to_string_lossy().into_owned(),
@@ -37,7 +64,7 @@ async fn concurrent_stage_same_hunk_does_not_corrupt_index_or_session_row() {
     let path = write_agent_change(&wt, "claude", "race").await;
     let diff: WorktreeDiffResult = call(
         &mut conn,
-        2,
+        2 + round as i64 * 10,
         "worktree.diff",
         WorktreeDiffParams {
             session_id: created.session_id.clone(),
@@ -56,22 +83,14 @@ async fn concurrent_stage_same_hunk_does_not_corrupt_index_or_session_row() {
     let hunk_a = hunk_id.clone();
     let hunk_b = hunk_id;
     let (left, right) = tokio::join!(
-        tokio::spawn(async move { stage_once(&socket_a, 10, session_a, hunk_a).await }),
-        tokio::spawn(async move { stage_once(&socket_b, 20, session_b, hunk_b).await })
+        tokio::spawn(async move { stage_once(&socket_a, 3, session_a, hunk_a).await }),
+        tokio::spawn(async move { stage_once(&socket_b, 4, session_b, hunk_b).await })
     );
     let outcomes = vec![left.expect("left join"), right.expect("right join")];
-    assert!(
-        outcomes.iter().all(StageOutcome::is_safe),
-        "unexpected race outcomes: {outcomes:?}"
-    );
-    assert!(
-        outcomes.iter().any(|o| matches!(o, StageOutcome::Applied)),
-        "at least one concurrent stage should apply the hunk: {outcomes:?}"
-    );
 
     let status: WorktreeStatusResult = call(
         &mut conn,
-        3,
+        5 + round as i64 * 10,
         "worktree.status",
         WorktreeStatusParams {
             session_id: created.session_id.clone(),
@@ -86,7 +105,7 @@ async fn concurrent_stage_same_hunk_does_not_corrupt_index_or_session_row() {
 
     let listed: SessionsListResult = call(
         &mut conn,
-        4,
+        6 + round as i64 * 10,
         "sessions.list",
         SessionsListParams {
             project: None,
@@ -101,6 +120,7 @@ async fn concurrent_stage_same_hunk_does_not_corrupt_index_or_session_row() {
         .find(|s| s.session_id == created.session_id)
         .expect("session row still present");
     assert_eq!(row.worktree_path.as_deref(), Some(created.cwd.as_str()));
+    outcomes
 }
 
 #[derive(Debug)]
