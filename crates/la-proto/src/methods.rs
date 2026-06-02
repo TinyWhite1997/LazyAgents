@@ -1041,8 +1041,15 @@ pub struct WorktreeDiffParams {
     /// `true` ⇒ diff between index and HEAD; `false` ⇒ working tree
     /// vs index.
     pub staged: bool,
-    /// Number of context lines around each hunk. Defaults to git's
-    /// stock 3 when omitted.
+    /// Number of context lines around each hunk. **M2.5 daemons
+    /// ignore this field and always reply with `-U3`** — the
+    /// `hunk_id` fingerprint is body-bytes-derived, and the mutation
+    /// path (`worktree.stage` / `unstage` / `discard`) re-reads with
+    /// `-U3` to recompute it. A different context here would silently
+    /// produce ids the same daemon could not later apply. The field
+    /// is kept on the wire for forward compat: a future minor that
+    /// teaches the mutation path to replay the request's context can
+    /// honour this without a schema bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_lines: Option<u32>,
 }

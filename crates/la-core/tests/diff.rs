@@ -188,6 +188,34 @@ async fn untracked_file_can_be_staged() {
     assert_eq!(staged.applied.len(), 1, "rejected={:?}", staged.rejected);
 }
 
+/// Regression for the WEK-28 review blocker: untracked files surface
+/// a synthetic hunk via `diff_file`, but discard used `raw_diff` which
+/// returns empty for untracked paths — every id ended up `stale`. The
+/// engine now reuses `diff_untracked` so the id round-trips and the
+/// file is removed on confirmed discard.
+#[tokio::test]
+async fn untracked_file_can_be_discarded_and_is_removed_from_disk() {
+    let (_td, repo) = make_repo().await;
+    let new_path = repo.join("scratch.txt");
+    tokio::fs::write(&new_path, "fresh\nbody\n").await.unwrap();
+    let eng = engine(&repo);
+    let diff = eng.diff_file("scratch.txt", false, None).await.unwrap();
+    assert_eq!(diff.hunks.len(), 1, "synthetic hunk must surface");
+    let id = diff.hunks[0].hunk_id.clone();
+
+    let outcome = eng.discard(&[id.clone()]).await.unwrap();
+    assert_eq!(outcome.applied, vec![id], "rejected={:?}", outcome.rejected);
+    assert!(
+        outcome.rejected.is_empty(),
+        "must NOT be stale; got {:?}",
+        outcome.rejected
+    );
+    assert!(
+        !new_path.exists(),
+        "discard of an untracked file removes it from disk"
+    );
+}
+
 #[tokio::test]
 async fn large_file_returns_truncation_marker() {
     let (_td, repo) = make_repo().await;

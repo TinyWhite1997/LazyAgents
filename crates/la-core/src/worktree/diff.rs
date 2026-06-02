@@ -290,12 +290,23 @@ impl DiffEngine {
 
     /// Per-file diff. Returns a [`TruncationOutcome`] for binaries,
     /// submodules, and files larger than [`MAX_INLINE_DIFF_BYTES`].
+    ///
+    /// **`context_lines` is accepted for forward-compat and currently
+    /// ignored — every read goes through `-U3`.** The wire field stays
+    /// on the protocol so a future minor that wires per-request
+    /// context (along with matching mutation-side context replay)
+    /// won't be a wire break, but right now changing it would
+    /// invalidate every returned `hunk_id` against the mutation path,
+    /// which re-reads with `-U3` to recompute the canonical body. We
+    ///'d rather a TUI ignore-and-default than silently produce un-
+    /// applicable ids.
     pub async fn diff_file(
         &self,
         path: &str,
         staged: bool,
         context_lines: Option<u32>,
     ) -> CoreResult<DiffOutcome> {
+        let _requested_context = context_lines;
         let abs_path = self.worktree_path.join(path);
         let size = tokio::fs::metadata(&abs_path)
             .await
@@ -358,10 +369,15 @@ impl DiffEngine {
         // Untracked files have no diff history; show synthetic
         // "everything added" by feeding `git diff --no-index /dev/null
         // <path>`.
+        //
+        // `context_lines` is intentionally `None` here regardless of
+        // the request — `raw_diff` (the mutation path) is hard-wired
+        // to `-U3`, and the canonical hunk body that feeds `hunk_id`
+        // must match. See the doc on this method.
         let parsed = if matches!(entry.status, FileStatus::Untracked) && !staged {
-            self.diff_untracked(path, context_lines).await?
+            self.diff_untracked(path, None).await?
         } else {
-            self.git_diff(path, staged, context_lines).await?
+            self.git_diff(path, staged, None).await?
         };
 
         let hunks = parsed
@@ -525,6 +541,23 @@ impl DiffEngine {
             }
 
             // For each file, fetch the appropriate diff source.
+            //
+            // The Untracked case is special: `git diff <path>` returns
+            // nothing for an untracked file, so the canonical hunks
+            // emitted by `diff_file()` come from `diff_untracked()`.
+            // The mutation path must re-read through the same
+            // synthetic path or the TUI's `hunk_id` would never match
+            // the empty list `raw_diff` produces.
+            //
+            // Stage: extra `git add --intent-to-add` first so
+            //   `git apply --cached` has a real index entry to diff
+            //   against (then the standard `raw_diff` works).
+            // Discard: skip the patch path entirely — discarding an
+            //   untracked hunk is the same operation as deleting the
+            //   file (or, when the TUI ever supports partial
+            //   selection of an untracked file, truncating it to the
+            //   non-selected lines; M2 keeps it simple and removes
+            //   the file on any matched-hunk discard).
             let (diff_buf, staged_flag) = match kind {
                 MutationKind::Stage => {
                     if matches!(entry.status, FileStatus::Untracked) {
@@ -537,11 +570,42 @@ impl DiffEngine {
                             &["add", "--intent-to-add", "--", &path],
                         )
                         .await;
+                        (self.raw_diff(&path, false).await?, false)
+                    } else {
+                        (self.raw_diff(&path, false).await?, false)
+                    }
+                }
+                MutationKind::Unstage => (self.raw_diff(&path, true).await?, true),
+                MutationKind::Discard => {
+                    if matches!(entry.status, FileStatus::Untracked) {
+                        // Synthetic diff path so the TUI's hunk_id can
+                        // round-trip; we do NOT call `git apply`
+                        // below — see the early-`continue` after the
+                        // match.
+                        let synth = self.diff_untracked(&path, None).await?;
+                        match try_discard_untracked(&path, synth, &id_set) {
+                            DiscardUntrackedOutcome::Matched { matched_ids } => {
+                                let _ =
+                                    tokio::fs::remove_file(self.worktree_path.join(&path)).await;
+                                for id in matched_ids {
+                                    applied.push(id);
+                                }
+                                affected.push(path.clone());
+                            }
+                            DiscardUntrackedOutcome::NoMatch => {
+                                // Hunk id didn't match the synthetic
+                                // hunks — fall through to the
+                                // regular "skip this file" path. We
+                                // intentionally do not push to
+                                // `rejected` here: the same id might
+                                // belong to a different file in the
+                                // same call.
+                            }
+                        }
+                        continue;
                     }
                     (self.raw_diff(&path, false).await?, false)
                 }
-                MutationKind::Unstage => (self.raw_diff(&path, true).await?, true),
-                MutationKind::Discard => (self.raw_diff(&path, false).await?, false),
             };
             let parsed = parser::parse(&diff_buf);
             let parsed_file = match parsed.files.into_iter().next() {
@@ -603,14 +667,9 @@ impl DiffEngine {
                 {
                     let _ = run_git(&self.worktree_path, &["rm", "--cached", "--", &path]).await;
                 }
-                // Discard of an untracked file: also `rm` it from disk
-                // (the patch only reverses content, not file
-                // existence).
-                if matches!(kind, MutationKind::Discard)
-                    && matches!(entry.status, FileStatus::Untracked)
-                {
-                    let _ = tokio::fs::remove_file(self.worktree_path.join(&path)).await;
-                }
+                // Discard of an untracked file is handled in the
+                // synthetic branch above (early `continue`); the
+                // `git apply --reverse` path never runs for them.
                 let _ = staged_flag;
             } else {
                 // `git apply` refused. Two distinct failure modes; the
@@ -812,6 +871,42 @@ impl DiffEngine {
         let behind = parts.next()?.parse().ok()?;
         let ahead = parts.next()?.parse().ok()?;
         Some((ahead, behind))
+    }
+}
+
+/// Result of matching a discard request against the synthetic diff
+/// produced for an untracked file. Untracked discard never reaches
+/// `git apply` — the operation collapses to "remove the file from
+/// disk" once any caller-supplied hunk id matches the synthesised
+/// hunks (M2 keeps the granularity coarse; partial-line discard on
+/// untracked files is M3).
+enum DiscardUntrackedOutcome {
+    Matched { matched_ids: Vec<String> },
+    NoMatch,
+}
+
+fn try_discard_untracked(
+    path: &str,
+    synth: ParsedDiff,
+    id_set: &std::collections::HashSet<&str>,
+) -> DiscardUntrackedOutcome {
+    let Some(parsed_file) = synth.files.into_iter().next() else {
+        return DiscardUntrackedOutcome::NoMatch;
+    };
+    // `build_hunks` is the same id-derivation path `diff_file` uses,
+    // so the TUI's saved id round-trips byte-exactly.
+    let canonical = build_hunks(&parsed_file, false);
+    let matched: Vec<String> = canonical
+        .into_iter()
+        .filter(|h| id_set.contains(h.hunk_id.as_str()))
+        .map(|h| h.hunk_id)
+        .collect();
+    if matched.is_empty() {
+        return DiscardUntrackedOutcome::NoMatch;
+    }
+    let _ = path; // path is consumed by the caller for the actual fs::remove
+    DiscardUntrackedOutcome::Matched {
+        matched_ids: matched,
     }
 }
 
