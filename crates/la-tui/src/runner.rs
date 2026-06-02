@@ -28,7 +28,7 @@ use ratatui::Terminal;
 use crate::app::{App, AppOutcome, Focus, Modal, Tab};
 use crate::input::{translate, HitBoxes};
 use crate::key_hints::{format_hint_bar, HintRegistry};
-use crate::sidebar::{render_sidebar, Selection};
+use crate::sidebar::{render_backends, render_sidebar, Selection};
 use crate::source::SessionSource;
 use crate::status::render_status;
 use crate::tabs::render_tabs;
@@ -137,9 +137,30 @@ pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
 
     match app.tab {
         Tab::Sessions => {
+            // Split the left column: Backends panel on top, Sessions list
+            // below. The Backends panel is sized to fit the current
+            // snapshot (1 short header line per available backend, up to
+            // 3 lines per grey-stated one). Caps at 12 rows so a fleet
+            // of unhealthy backends doesn't crowd the session list.
+            let backends_rows = if app.backends.is_empty() {
+                3
+            } else {
+                let raw: usize = app
+                    .backends
+                    .iter()
+                    .map(|b| 1 + b.reason.is_some() as usize + b.docs_url.is_some() as usize)
+                    .sum();
+                // +2 for the panel border (top + bottom).
+                (raw + 2).clamp(4, 12)
+            };
+            let sidebar_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(backends_rows as u16), Constraint::Min(3)])
+                .split(sidebar_area);
+            render_backends(frame, sidebar_split[0], &app.backends);
             render_sidebar(
                 frame,
-                sidebar_area,
+                sidebar_split[1],
                 &app.sidebar,
                 app.focus == Focus::Sidebar,
             );

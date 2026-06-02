@@ -19,13 +19,14 @@
 
 use std::cell::Cell;
 
+use la_proto::notifications::BackendHealthStatus;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::model::{ProjectGroup, RunState};
+use crate::model::{BackendBadge, ProjectGroup, RunState};
 
 /// What the cursor is pointing at.
 ///
@@ -381,6 +382,139 @@ pub fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &SidebarState, f
     // Mirror the post-render offset so the mouse hit-tester can compensate
     // for scrolling on the very next event without an extra render pass.
     state.scroll_offset.set(list_state.offset());
+}
+
+/// Render the Backends panel (`WEK-29` / M2.6 grey-state surface).
+///
+/// One line per known backend. Available backends render with the
+/// adapter glyph in green plus their parsed version; everything else
+/// renders dim with the failure reason and an optional docs URL the
+/// user can copy out. The panel never gains focus — it is informational
+/// only. `n` (new session) inside the sidebar already short-circuits if
+/// the chosen backend is unavailable (the dispatcher refuses the
+/// `sessions.create` with the right business code).
+pub fn render_backends(frame: &mut Frame<'_>, area: Rect, badges: &[BackendBadge]) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Backends")
+        .border_style(Style::default().fg(Color::DarkGray));
+    if badges.is_empty() {
+        let body = Paragraph::new(Line::from(Span::styled(
+            "no probe yet — waiting for daemon.health",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        )))
+        .block(block);
+        frame.render_widget(body, area);
+        return;
+    }
+
+    let lines: Vec<ListItem> = badges
+        .iter()
+        .flat_map(|b| backend_lines(b))
+        .map(ListItem::new)
+        .collect();
+    let list = List::new(lines).block(block);
+    frame.render_widget(list, area);
+}
+
+/// One or two `Line`s per backend: the primary status row + a wrapped
+/// hint row for non-Available states. Returned as a `Vec` so the caller
+/// can chain everything into a single `List` without juggling indices.
+fn backend_lines(b: &BackendBadge) -> Vec<Line<'static>> {
+    let (glyph_color, name_style) = match b.status {
+        BackendHealthStatus::Available => (
+            Color::Green,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        BackendHealthStatus::NotInstalled => (
+            Color::DarkGray,
+            // Grey + DIM is the canonical "灰态" rendering the PRD asks
+            // for (PRD §5.3 + WEK-29 acceptance "未安装/未鉴权后端在侧栏
+            // 显示灰态"). We intentionally do not mark these rows with
+            // `Modifier::CROSSED_OUT` — that confused early reviewers
+            // into thinking the backend had been removed by the user.
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::DIM | Modifier::BOLD),
+        ),
+        BackendHealthStatus::Unauthenticated => (
+            Color::Yellow,
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::DIM | Modifier::BOLD),
+        ),
+        BackendHealthStatus::ProtocolDrift => (
+            Color::Red,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        BackendHealthStatus::Error => (
+            Color::Red,
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::DIM | Modifier::BOLD),
+        ),
+    };
+
+    let suffix: String = if b.status == BackendHealthStatus::Available {
+        match &b.version {
+            Some(v) => format!("  v{v}"),
+            None => String::new(),
+        }
+    } else {
+        format!("  ({})", b.status_label())
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(b.glyph().to_string(), Style::default().fg(glyph_color)),
+        Span::raw(" "),
+        Span::styled(b.display_name.clone(), name_style),
+        Span::styled(
+            suffix,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+    ])];
+
+    if let Some(reason) = b.reason.as_deref().filter(|_| b.is_unavailable()) {
+        lines.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                truncate(reason, 28),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+            ),
+        ]));
+    }
+    if let Some(url) = b.docs_url.as_deref().filter(|_| b.is_unavailable()) {
+        lines.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                truncate(url, 28),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn render_item<'a>(state: &'a SidebarState, item: &'a Item) -> ListItem<'a> {

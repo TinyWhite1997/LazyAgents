@@ -61,7 +61,7 @@ pub mod vte_term;
 pub use app::{App, AppMsg, Focus, Tab};
 pub use composer::{Composer, ComposerAction, ComposerView};
 pub use detach_notice::{DetachNotice, DetachNoticeView};
-pub use model::{Backend, ProjectGroup, RunState, SessionRow};
+pub use model::{Backend, BackendBadge, ProjectGroup, RunState, SessionRow};
 pub use source::{MockSessionSource, SessionSource};
 pub use status::Status;
 pub use transcript::{ScrollAction, Transcript, TranscriptView};

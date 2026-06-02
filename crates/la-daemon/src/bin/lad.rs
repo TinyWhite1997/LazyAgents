@@ -20,7 +20,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use la_adapter::{claude::ClaudeAdapter, AgentAdapter};
+use la_adapter::{
+    claude::ClaudeAdapter, codex::CodexAdapter, opencode::OpencodeAdapter, AgentAdapter,
+};
 #[cfg(debug_assertions)]
 use la_adapter::{AdapterDescriptor, ProbeResult, SpawnRequest, SpawnSpec};
 use la_daemon::paths::{ensure_runtime_dir, SocketDiscovery, SocketLocation};
@@ -281,6 +283,19 @@ fn run_foreground(p: Parsed) -> Result<(), DaemonError> {
         adapters.insert(
             "claude".to_string(),
             Arc::new(ClaudeAdapter::new()) as Arc<dyn AgentAdapter>,
+        );
+        // M2.6 (WEK-29): also register `codex` and `opencode` so the
+        // health probe loop reports their availability and so the TUI
+        // can `sessions.create` against them once the user installs
+        // them. Adapters are stateless — registering a backend whose
+        // CLI is missing is harmless; the probe simply grey-states it.
+        adapters.insert(
+            "codex".to_string(),
+            Arc::new(CodexAdapter::new()) as Arc<dyn AgentAdapter>,
+        );
+        adapters.insert(
+            "opencode".to_string(),
+            Arc::new(OpencodeAdapter::new()) as Arc<dyn AgentAdapter>,
         );
         #[cfg(debug_assertions)]
         if let Some(script) = &p.test_shell_adapter_script {

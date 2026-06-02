@@ -196,6 +196,66 @@ pub struct DaemonHealthParams {
     /// Errors observed in the last 5 minutes (any kind, used for the
     /// status-bar dot colour).
     pub errors_last_5m: u32,
+    /// Per-backend probe snapshot — additive in M2.6 (`WEK-29`). Clients
+    /// that don't understand the field simply ignore it; daemons that
+    /// never probe leave it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<BackendHealth>,
+}
+
+/// Probe state for a single registered adapter, broadcast as part of
+/// `daemon.health` so the TUI can render grey-state sidebar entries
+/// (architecture §4.3 / `WEK-29`).
+///
+/// The `status` enum mirrors the variants of [`crate::methods::SessionState`]
+/// in spirit but is independent: one is a *session* lifecycle, the other
+/// is a *backend* installation state. The two never collapse.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "BackendHealth")]
+pub struct BackendHealth {
+    /// Stable adapter id, e.g. `"claude"` / `"codex"` / `"opencode"`.
+    pub id: String,
+    /// Human-readable label suitable for sidebar rendering.
+    pub display_name: String,
+    /// Probe outcome (`available` / `not_installed` / `unauthenticated` /
+    /// `protocol_drift` / `error`).
+    pub status: BackendHealthStatus,
+    /// Parsed CLI version when the last probe was `Available`; otherwise
+    /// `None`. Required by `WEK-29` 验收: "日志包含 backend version".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// One-line reason suitable for UI surface — never sensitive (no
+    /// stderr dumps, no command lines). For `Available` ⇒ `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Best-effort docs link for the failure (login page for
+    /// `Unauthenticated`, install page for `NotInstalled`, upgrade page
+    /// for `ProtocolDrift`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_url: Option<String>,
+    /// RFC3339 timestamp of the most recent probe attempt. Empty on the
+    /// first pulse before any probe has run.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_probed_at: String,
+}
+
+/// Wire representation of a backend's classified probe state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "BackendHealthStatus")]
+pub enum BackendHealthStatus {
+    /// Installed, runs, authenticated, version parsed.
+    Available,
+    /// Executable not on `$PATH` (or at the configured override path).
+    NotInstalled,
+    /// Executable exists but the user has not logged in.
+    Unauthenticated,
+    /// Backend version returned output the adapter could not parse —
+    /// usually means the CLI shipped a breaking change and the adapter
+    /// needs an upgrade.
+    ProtocolDrift,
+    /// Anything else (timeout, permission denied, transport failure).
+    Error,
 }
 
 impl NotificationMethod for DaemonHealth {

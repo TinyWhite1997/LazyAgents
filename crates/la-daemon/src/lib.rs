@@ -24,12 +24,14 @@
 
 pub mod daemonize;
 pub mod dispatcher;
+pub mod health;
 pub mod paths;
 pub mod runtime;
 pub mod signals;
 
 pub use daemonize::{spawn_daemonized, DaemonizeError};
 pub use dispatcher::AdapterRegistry;
+pub use health::{HealthRegistry, ProbeLoopConfig, DEFAULT_PROBE_INTERVAL};
 pub use paths::{default_socket_path, default_state_dir, socket_path_for_version, SocketDiscovery};
 pub use runtime::{Daemon, DaemonConfig, DaemonError, DaemonHandle};
 

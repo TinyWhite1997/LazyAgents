@@ -638,6 +638,7 @@ fn cron_fired_and_daemon_health_round_trip() {
         queue_depth: 3,
         running: 7,
         errors_last_5m: 0,
+        backends: Vec::new(),
     };
     let n = Notification::new(DaemonHealth::NAME, &health).unwrap();
     let back: DaemonHealthParams =
@@ -645,6 +646,70 @@ fn cron_fired_and_daemon_health_round_trip() {
             Message::Notification(nn) => nn.params_as().unwrap(),
             _ => panic!(),
         };
+    assert_eq!(back, health);
+}
+
+#[test]
+fn daemon_health_tolerates_legacy_payload_without_backends() {
+    // M1 daemons (and any client serializing by hand) won't include the
+    // `backends` field that landed with `WEK-29`. The struct must still
+    // decode and surface an empty vec, otherwise we'd break the
+    // single-version compatibility envelope.
+    let legacy_json = r#"{"queue_depth":1,"running":2,"errors_last_5m":0}"#;
+    let back: DaemonHealthParams = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(back.queue_depth, 1);
+    assert_eq!(back.running, 2);
+    assert_eq!(back.errors_last_5m, 0);
+    assert!(
+        back.backends.is_empty(),
+        "missing `backends` should decode to an empty vec, not fail"
+    );
+}
+
+#[test]
+fn daemon_health_backends_status_serializes_as_snake_case() {
+    use la_proto::notifications::{BackendHealth, BackendHealthStatus};
+    let health = DaemonHealthParams {
+        queue_depth: 0,
+        running: 0,
+        errors_last_5m: 0,
+        backends: vec![
+            BackendHealth {
+                id: "claude".into(),
+                display_name: "Claude Code".into(),
+                status: BackendHealthStatus::Available,
+                version: Some("2.1.158".into()),
+                reason: None,
+                docs_url: None,
+                last_probed_at: "2026-06-02T00:00:00Z".into(),
+            },
+            BackendHealth {
+                id: "codex".into(),
+                display_name: "Codex CLI".into(),
+                status: BackendHealthStatus::NotInstalled,
+                version: None,
+                reason: Some("not on $PATH".into()),
+                docs_url: Some("https://example.com/install/codex".into()),
+                last_probed_at: "2026-06-02T00:00:00Z".into(),
+            },
+            BackendHealth {
+                id: "opencode".into(),
+                display_name: "OpenCode".into(),
+                status: BackendHealthStatus::ProtocolDrift,
+                version: Some("9.9.9-future".into()),
+                reason: Some("could not parse version line".into()),
+                docs_url: None,
+                last_probed_at: "2026-06-02T00:00:00Z".into(),
+            },
+        ],
+    };
+    let s = serde_json::to_string(&health).unwrap();
+    // Status strings on the wire must be snake_case (TUI relies on this
+    // to avoid a backend-specific deserializer).
+    assert!(s.contains("\"status\":\"available\""), "wire = {s}");
+    assert!(s.contains("\"status\":\"not_installed\""), "wire = {s}");
+    assert!(s.contains("\"status\":\"protocol_drift\""), "wire = {s}");
+    let back: DaemonHealthParams = serde_json::from_str(&s).unwrap();
     assert_eq!(back, health);
 }
 

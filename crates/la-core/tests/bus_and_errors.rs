@@ -18,6 +18,7 @@ async fn bus_broadcasts_to_all_subscribers() {
         queue_depth: 1,
         running: 2,
         errors_last_5m: 0,
+        backends: Vec::new(),
     }));
     assert_eq!(sent, 2, "both subs should receive");
 
@@ -109,4 +110,47 @@ fn error_kind_maps_to_business_codes() {
             "wrong wire code for {err:?}: got {code}, want {expected}",
         );
     }
+}
+
+/// `WEK-29` 验收 — "错误码段映射正确"：every `AdapterError` variant must
+/// land inside the dedicated `-33100..-33199` adapter business range.
+/// A new variant that misses this lane (e.g. accidentally falls through
+/// to `Internal`) is a contract regression — the dispatcher would no
+/// longer be able to disambiguate the failure surface for the TUI's
+/// grey-state renderer.
+#[test]
+fn adapter_error_variants_all_live_in_the_adapter_code_segment() {
+    use la_adapter::AdapterError;
+    let cases: Vec<CoreError> = vec![
+        CoreError::Adapter(AdapterError::NotInstalled { hint: "x".into() }),
+        CoreError::Adapter(AdapterError::Unauthenticated {
+            docs_url: "x".into(),
+        }),
+        CoreError::Adapter(AdapterError::ProtocolDrift { detail: "x".into() }),
+        CoreError::Adapter(AdapterError::UnsupportedOption { name: "x".into() }),
+        CoreError::Adapter(AdapterError::SpawnFailed(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        ))),
+    ];
+    for err in cases {
+        let code = err.kind().code();
+        assert!(
+            (-33199..=-33101).contains(&code),
+            "{err:?} mapped to {code}; expected somewhere in the adapter -33101..-33199 segment",
+        );
+    }
+}
+
+/// `WEK-29` — `AdapterError::Transient` is intentionally NOT in the
+/// adapter segment; it represents a recoverable internal hiccup and
+/// folds into the generic `Internal` code (`-32603`). Pinning that
+/// choice so a future refactor doesn't silently promote it into the
+/// adapter range and start triggering grey-state in the TUI for what
+/// should be a transient retryable failure.
+#[test]
+fn adapter_error_transient_folds_into_internal_not_adapter_segment() {
+    use la_adapter::AdapterError;
+    let err = CoreError::Adapter(AdapterError::Transient("temporary".into()));
+    assert_eq!(err.kind().code(), error_codes::INTERNAL_ERROR);
 }
