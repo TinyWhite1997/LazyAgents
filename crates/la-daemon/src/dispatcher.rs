@@ -573,10 +573,12 @@ async fn handle_sessions_attach(
     params: SessionsAttachParams,
 ) -> Result<serde_json::Value, RpcError> {
     let id = SessionId(params.session_id.clone());
-    // `resume_from_seq` is the architecture §3 "重连一次 RPC 即可" path: a
-    // reconnecting client passes its last observed seq and gets a single
-    // attach that both resubscribes and catches up. First-time attaches
-    // pass `None` and replay everything still in the ring.
+    // `resume_from_seq` is the architecture §3 "重连一次 RPC 即可" path. The
+    // semantics mirror `OutputHub::subscribe`:
+    //   * `None`            ⇒ start fresh / live-only, no catch-up replay.
+    //   * `Some(prev_seq)`  ⇒ replay only ring chunks with `seq > prev_seq`,
+    //                          then continue live.
+    // First-time attachers that want the full ring content can pass `Some(0)`.
     let outcome = state
         .manager
         .attach(&id, params.resume_from_seq, params.acquire_input)

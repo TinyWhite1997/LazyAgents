@@ -275,13 +275,20 @@ pub enum SessionsAttach {}
 #[schemars(rename = "SessionsAttachParams")]
 pub struct SessionsAttachParams {
     pub session_id: String,
-    /// Resume from this `seq` (inclusive lower bound for catch-up replay).
-    /// `None` on first attach ⇒ daemon replays everything still in the ring.
-    /// `Some(prev_seq)` after a reconnect ⇒ daemon replays only the gap.
-    /// This is the architecture §3 "重连一次 RPC 即可" path: a reconnecting
-    /// client carries its last observed `seq` and gets a single `attach` that
-    /// both resubscribes and catches up, with no follow-up `sessions.replay`
-    /// required as long as the bytes are still in the ring.
+    /// Resume cursor. The semantics match the hub-level subscription:
+    /// `None` ⇒ start fresh / live-only, no catch-up replay (the response's
+    /// `snapshot_seq` tells the client which `seq` the live stream starts
+    /// after — typically used by first-time attachers that do not need
+    /// historical output).
+    /// `Some(prev_seq)` ⇒ daemon replays only ring chunks whose
+    /// `seq > prev_seq`, then continues live. This is the architecture §3
+    /// "重连一次 RPC 即可" path: a reconnecting client carries its last
+    /// observed `seq` and gets a single `attach` that both resubscribes and
+    /// catches up, with no follow-up `sessions.replay` required as long as
+    /// the bytes are still in the ring.
+    ///
+    /// A first-time attacher that does want everything currently in the
+    /// ring can pass `Some(0)` explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_from_seq: Option<u64>,
     /// Replay window: the daemon should resend at most this many bytes from

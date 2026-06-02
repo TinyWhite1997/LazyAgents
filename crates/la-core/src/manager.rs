@@ -268,9 +268,11 @@ impl SessionManager {
 
     /// Attach a subscriber to a session's output hub.
     ///
-    /// `since_seq` is the inclusive lower bound for catch-up replay: pass
-    /// `None` on first attach to replay everything still in the ring,
-    /// pass `Some(prev_seq)` after a reconnect to replay only the gap.
+    /// `since_seq` is the resume cursor and matches the hub-level
+    /// subscription semantics: `None` ⇒ start fresh / live-only, no
+    /// catch-up replay; `Some(prev_seq)` ⇒ replay ring chunks whose
+    /// `seq > prev_seq`, then continue live. A first-time attacher that
+    /// wants whatever is still in the ring can pass `Some(0)` explicitly.
     /// `acquire_input = true` requests writer ownership; if another
     /// client holds it, attach still succeeds and returns
     /// `input_acquired = false`.

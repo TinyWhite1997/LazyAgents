@@ -604,3 +604,97 @@ async fn reattach_with_resume_from_seq_catches_up_without_double_delivery() {
     daemon.handle.shutdown();
     let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
+
+/// First-time `sessions.attach` with `resume_from_seq=None` is **live-only**:
+/// frames the daemon emitted before the attach landed are NOT replayed.
+/// This pins the semantics that match `OutputHub::subscribe(None)` and
+/// guards against the WEK-49 review finding where the schema/docs claimed
+/// `None` would replay the ring (the opposite of what the daemon does).
+///
+/// Walk:
+///   1. Start a slow-stream session.
+///   2. Wait long enough that the script has clearly emitted several
+///      lines into the hub ring.
+///   3. Attach with `resume_from_seq=None` on a fresh connection.
+///   4. Drain frames until we reach a line emitted after the attach.
+///   5. Assert: the first observed `seq` is strictly greater than the
+///      `snapshot_seq` echoed in the attach response. If the daemon were
+///      ring-replaying on `None`, we would instead see `seq <= snapshot_seq`.
+#[tokio::test]
+async fn first_attach_with_none_resume_is_live_only_no_ring_replay() {
+    let project = tempfile::tempdir().expect("project tmp");
+    // 40 lines × 50 ms ≈ 2 s total runtime; plenty of room to land the
+    // attach after the ring already holds output.
+    let script = "for i in $(seq 1 40); do printf 'line-%02d\\n' $i; sleep 0.05; done";
+    let daemon = bootstrap_daemon(script).await;
+    let mut conn = client(&daemon.socket).await;
+
+    let create_params = SessionsCreateParams {
+        project_dir: project.path().to_string_lossy().to_string(),
+        backend: "shtest".to_string(),
+        args: vec![],
+        prompt: None,
+        worktree: false,
+    };
+    send_request(&mut conn, 1, "sessions.create", &create_params).await;
+    let result: SessionsCreateResult =
+        serde_json::from_value(recv_response_for(&mut conn, 1).await).expect("decode create");
+    let session_id = result.session_id;
+
+    // Let the session produce output into the ring *before* we attach,
+    // so any ring replay would be observable.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let attach_params = SessionsAttachParams {
+        session_id: session_id.clone(),
+        resume_from_seq: None,
+        replay_bytes: None,
+        acquire_input: false,
+    };
+    send_request(&mut conn, 2, "sessions.attach", &attach_params).await;
+    let ack: SessionsAttachResult =
+        serde_json::from_value(recv_response_for(&mut conn, 2).await).expect("decode attach");
+    // snapshot_seq is the last seq committed to the hub *at attach time*.
+    // For `None` (live-only) semantics, the first frame we observe must
+    // be strictly newer than this.
+    let snapshot_seq = ack.snapshot_seq;
+
+    let mut seen_seqs = Vec::<u64>::new();
+    let mut seen_bytes = Vec::<u8>::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !contains(&seen_bytes, b"line-30") {
+        let msg = match tokio::time::timeout(Duration::from_millis(300), conn.recv()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => continue,
+        };
+        if let Message::Notification(n) = msg {
+            if n.method == "session.output" {
+                if let Some(params) = n.params.as_ref() {
+                    let p: SessionOutputParams =
+                        serde_json::from_value(params.clone()).expect("decode output");
+                    seen_seqs.push(p.seq);
+                    seen_bytes.extend_from_slice(&p.data_bytes().expect("base64"));
+                }
+            }
+        }
+    }
+
+    let first_seq = *seen_seqs
+        .first()
+        .expect("live-only attach saw no chunks; script may have finished too fast");
+    assert!(
+        first_seq > snapshot_seq,
+        "WEK-49 semantics violation: first observed seq={first_seq} must be > snapshot_seq={snapshot_seq} \
+         when resume_from_seq=None (live-only). Ring replay leaked through.",
+    );
+    // Sanity: we are still receiving the live stream and should reach
+    // lines emitted *after* attach landed.
+    assert!(
+        contains(&seen_bytes, b"line-30"),
+        "live-only attach never reached line 30; got {:?}",
+        String::from_utf8_lossy(&seen_bytes)
+    );
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
