@@ -93,9 +93,14 @@ impl CodexAdapter {
     }
 
     /// Best-effort secondary auth probe: run `<program> login status` and
-    /// classify "Not logged in" stdout / non-zero exit as
-    /// unauthenticated. Returns `None` on any spawn or timeout failure
-    /// so the caller can fall through to its existing classification.
+    /// classify the output. Returns `Some(true)` ONLY when stdout/stderr
+    /// contains an explicit "not logged in" keyword. A non-zero exit
+    /// without such a keyword is treated as `Some(false)` — older / newer
+    /// codex builds may lack the `login status` subcommand entirely
+    /// (older flat-layout versions, hypothetical future renames), and we
+    /// don't want to misreport "subcommand missing" as "unauthenticated".
+    /// Returns `None` on spawn / timeout failure so the caller falls
+    /// through to its existing classification (typically `Available`).
     async fn login_status_indicates_unauth(&self) -> Option<bool> {
         let program = self.resolved_program(None);
         let mut cmd = Command::new(&program);
@@ -113,8 +118,7 @@ impl CodexAdapter {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let unauth = looks_unauthenticated(&stdout, &stderr) || !output.status.success();
-        Some(unauth)
+        Some(looks_unauthenticated(&stdout, &stderr))
     }
 }
 

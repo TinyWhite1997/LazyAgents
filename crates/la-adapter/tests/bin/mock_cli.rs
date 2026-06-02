@@ -96,7 +96,11 @@ fn version(flavor: Flavor, mode: &str) -> ExitCode {
             println!("welcome to nothing in particular");
             ExitCode::SUCCESS
         }
-        (Flavor::Codex, "ok") => {
+        (Flavor::Codex, "ok") | (Flavor::Codex, "login_unsupported") => {
+            // `login_unsupported` is a `login status`-only switch; for
+            // `--version` it behaves identically to `ok` so the adapter's
+            // secondary auth probe is exercised against a valid version
+            // line. See `codex_login` for the login-side behaviour.
             println!("codex-cli 0.135.0");
             ExitCode::SUCCESS
         }
@@ -148,6 +152,16 @@ fn codex_login(args: &[String], mode: &str) -> ExitCode {
         "unauth" => {
             println!("Not logged in");
             ExitCode::from(1)
+        }
+        // Simulates an older / newer codex that doesn't recognise
+        // `login status`: non-zero exit with NO unauth keyword. The
+        // adapter must NOT misclassify this as Unauthenticated.
+        "login_unsupported" => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "error: unrecognized subcommand 'status'"
+            );
+            ExitCode::from(2)
         }
         other => {
             let _ = writeln!(std::io::stderr(), "mock-cli: unknown mode: {other}");

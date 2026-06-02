@@ -13,12 +13,12 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use la_adapter::codex::{CodexAdapter, SESSIONS_DIR_ENV};
 use la_adapter::{
     AgentAdapter, DiscoverHints, ProbeResult, SpawnRequest, StdinMode, StopAction, StopSignal,
 };
+use tokio::sync::Mutex;
 
 fn mock_cli() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mock-cli"))
@@ -27,12 +27,10 @@ fn mock_cli() -> PathBuf {
 /// Probe tests mutate `MOCK_CLI_MODE` / `MOCK_CLI_FLAVOR` — serialize
 /// access so cargo test's default thread-per-test parallelism doesn't
 /// race them against each other (or against `tests/adapter.rs`'s
-/// claude-flavored runs in the same process).
-static MOCK_ENV: Mutex<()> = Mutex::new(());
-
-fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    MOCK_ENV.lock().unwrap_or_else(|p| p.into_inner())
-}
+/// claude-flavored runs in the same process). `tokio::sync::Mutex` so
+/// the guard can be held across `.await` cleanly (no
+/// `clippy::await_holding_lock`).
+static MOCK_ENV: Mutex<()> = Mutex::const_new(());
 
 fn with_codex_flavor() {
     std::env::set_var("MOCK_CLI_FLAVOR", "codex");
@@ -45,7 +43,7 @@ fn clear_flavor_and_mode() {
 
 #[tokio::test]
 async fn probe_against_mock_cli_returns_available() {
-    let _g = lock_env();
+    let _g = MOCK_ENV.lock().await;
     clear_flavor_and_mode();
     with_codex_flavor();
     let adapter = CodexAdapter::with_program(mock_cli());
@@ -77,7 +75,7 @@ async fn probe_classifies_missing_binary_as_not_installed() {
 
 #[tokio::test]
 async fn probe_classifies_unauthenticated_via_stderr() {
-    let _g = lock_env();
+    let _g = MOCK_ENV.lock().await;
     clear_flavor_and_mode();
     with_codex_flavor();
     std::env::set_var("MOCK_CLI_MODE", "unauth");
@@ -95,7 +93,7 @@ async fn probe_classifies_unauthenticated_via_stderr() {
 
 #[tokio::test]
 async fn probe_classifies_garbage_output_as_error() {
-    let _g = lock_env();
+    let _g = MOCK_ENV.lock().await;
     clear_flavor_and_mode();
     with_codex_flavor();
     std::env::set_var("MOCK_CLI_MODE", "garbage");
@@ -108,6 +106,33 @@ async fn probe_classifies_garbage_output_as_error() {
             assert!(detail.contains("unrecognized"), "detail: {detail}");
         }
         other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+/// Older / unknown codex builds may not implement `login status` at all
+/// — that subcommand will exit non-zero with NO "not logged in" keyword.
+/// The secondary auth probe must NOT misreport that as `Unauthenticated`;
+/// `--version` succeeded, so the user is `Available`.
+#[tokio::test]
+async fn probe_keeps_available_when_login_status_unsupported() {
+    let _g = MOCK_ENV.lock().await;
+    clear_flavor_and_mode();
+    with_codex_flavor();
+    std::env::set_var("MOCK_CLI_MODE", "login_unsupported");
+    let adapter = CodexAdapter::with_program(mock_cli());
+    let result = adapter.probe().await;
+    clear_flavor_and_mode();
+
+    match result {
+        ProbeResult::Available { version } => {
+            assert!(
+                version.starts_with("0.135"),
+                "expected 0.135.x version, got {version:?}"
+            );
+        }
+        other => panic!(
+            "login status unsupported must not be misreported as unauth — got {other:?}"
+        ),
     }
 }
 
@@ -184,7 +209,7 @@ fn graceful_stop_sequence_shape() {
 /// the result set without touching the user's real home.
 #[tokio::test]
 async fn discover_reads_nested_rollout_layout() {
-    let _g = lock_env();
+    let _g = MOCK_ENV.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("sessions");
 
@@ -257,7 +282,7 @@ async fn discover_reads_nested_rollout_layout() {
 
 #[tokio::test]
 async fn discover_returns_empty_when_root_missing() {
-    let _g = lock_env();
+    let _g = MOCK_ENV.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let absent = tmp.path().join("does-not-exist");
     std::env::set_var(SESSIONS_DIR_ENV, &absent);
