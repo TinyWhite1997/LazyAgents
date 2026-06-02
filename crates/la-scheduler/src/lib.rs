@@ -31,6 +31,7 @@ pub mod cron_spec;
 pub mod error;
 pub mod event;
 pub mod heap;
+pub mod quota;
 mod scheduler;
 
 pub use catchup::{apply_catchup, CatchupMode, CatchupOutcome, ResolvedFire, MAX_CATCHUP};
@@ -41,4 +42,8 @@ pub use cron_spec::CronSpec;
 pub use error::Error;
 pub use event::{FireEvent, SchedulerEvent};
 pub use heap::{CronId, Entry, EntryTable, HeapEntry};
+pub use quota::{
+    evaluate_admission, max_runtime, should_auto_pause, AdmissionDecision, CronQuota, GlobalQuota,
+    QuotaSnapshot,
+};
 pub use scheduler::{Scheduler, SchedulerChannels, SchedulerHandle};

@@ -10,9 +10,9 @@ use sqlx::{Error as SqlxError, Sqlite, Transaction};
 use tokio::io::AsyncWriteExt;
 
 use crate::models::{
-    AppendOutcome, Backend, BackendUpsert, ChunkKind, Cron, CronUpsert, NewProject, NewRun,
-    NewSession, Project, RunArchiveLine, RunFinish, RunRecord, RunsArchiveOutcome, RunsListFilter,
-    Session, SessionChunk, SpillLine,
+    AppendOutcome, Backend, BackendUpsert, ChunkKind, Cron, CronUpsert, NewProject, NewRejectedRun,
+    NewRun, NewSession, Project, RunArchiveLine, RunFinish, RunRecord, RunsArchiveOutcome,
+    RunsListFilter, Session, SessionChunk, SpillLine,
 };
 use crate::{Result, Storage, StorageError};
 
@@ -319,6 +319,84 @@ impl<'a> CronsRepo<'a> {
         .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    /// Atomically increment `consecutive_failures` by 1 and return the
+    /// post-increment counter value. WEK-33 / M3.2 uses this on every
+    /// terminal-failure run completion so an immediate `pause_for_failures`
+    /// can compare against the threshold without re-reading the row.
+    ///
+    /// Returns `Ok(None)` if the cron does not exist.
+    pub async fn bump_consecutive_failures(&self, id: &str) -> Result<Option<i64>> {
+        retry_busy(|| async {
+            sqlx::query(
+                r#"
+                UPDATE crons
+                SET consecutive_failures = consecutive_failures + 1,
+                    updated_at = datetime('now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(id)
+            .execute(self.storage.writer_pool())
+            .await
+        })
+        .await?;
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT consecutive_failures FROM crons WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(self.storage.reader_pool())
+                .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    /// Reset `consecutive_failures` to 0 (called on a `completed` run).
+    /// Returns `Ok(true)` when a row was actually changed, `Ok(false)` when
+    /// the counter was already zero or the cron does not exist.
+    pub async fn reset_consecutive_failures(&self, id: &str) -> Result<bool> {
+        let result = retry_busy(|| async {
+            sqlx::query(
+                r#"
+                UPDATE crons
+                SET consecutive_failures = 0, updated_at = datetime('now')
+                WHERE id = ?1 AND consecutive_failures != 0
+                "#,
+            )
+            .bind(id)
+            .execute(self.storage.writer_pool())
+            .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Atomically flip `enabled = 0` iff the consecutive-failure threshold
+    /// has been met. Returns `Ok(true)` when the cron was paused by this
+    /// call; `Ok(false)` when the threshold was not yet met OR the cron was
+    /// already disabled. This is the auto-disable hook for §5.4
+    /// "pause_on_consecutive_failures".
+    ///
+    /// We re-evaluate the threshold inside the same UPDATE so a concurrent
+    /// `reset_consecutive_failures` (a competing success path) cannot lose
+    /// to a stale "should pause" decision computed before the update.
+    pub async fn pause_for_failures(&self, id: &str) -> Result<bool> {
+        let result = retry_busy(|| async {
+            sqlx::query(
+                r#"
+                UPDATE crons
+                SET enabled = 0, updated_at = datetime('now')
+                WHERE id = ?1
+                  AND enabled = 1
+                  AND pause_on_consecutive_failures > 0
+                  AND consecutive_failures >= pause_on_consecutive_failures
+                "#,
+            )
+            .bind(id)
+            .execute(self.storage.writer_pool())
+            .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 pub struct RunsRepo<'a> {
@@ -355,6 +433,112 @@ impl<'a> RunsRepo<'a> {
         self.get(&run.id)
             .await?
             .ok_or(StorageError::MissingRun(run.id))
+    }
+
+    /// Insert a "rejected before spawn" audit row in a single statement —
+    /// `started_at IS NULL`, `finished_at = scheduled_at` (the moment the
+    /// gate refused), `exit_code IS NULL`, with the rejection reason in
+    /// `error_kind` / `error_detail`. WEK-33 / M3.2 admission control uses
+    /// this for every quota refusal that cannot ride through the normal
+    /// `runs.finish` path (because no run was ever started).
+    ///
+    /// `status` must be one of the schema enum strings ("budget_exceeded"
+    /// or "cancelled" today); SQLite's CHECK on `runs.status` enforces it.
+    pub async fn create_rejected(&self, rejected: NewRejectedRun<'_>) -> Result<RunRecord> {
+        retry_busy(|| async {
+            sqlx::query(
+                r#"
+                INSERT INTO runs(
+                    id, cron_id, session_id, scheduled_at, started_at,
+                    finished_at, status, exit_code, coalesced_count,
+                    cost_usd_est, error_kind, error_detail
+                )
+                VALUES (?1, ?2, NULL, ?3, NULL, ?3, ?4, NULL, ?5, NULL, ?6, ?7)
+                "#,
+            )
+            .bind(rejected.id)
+            .bind(rejected.cron_id)
+            .bind(rejected.scheduled_at)
+            .bind(rejected.status)
+            .bind(rejected.coalesced_count.max(1))
+            .bind(rejected.error_kind)
+            .bind(rejected.error_detail)
+            .execute(self.storage.writer_pool())
+            .await
+        })
+        .await?;
+        self.get(rejected.id)
+            .await?
+            .ok_or_else(|| StorageError::MissingRun(rejected.id.to_string()))
+    }
+
+    /// Count rows for `cron_id` that are still in-flight (status in
+    /// `pending|spawning|running` and `finished_at IS NULL`). Used by
+    /// `max_concurrent_runs` enforcement.
+    pub async fn count_running_for_cron(&self, cron_id: &str) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM runs
+            WHERE cron_id = ?1
+              AND finished_at IS NULL
+              AND status IN ('pending','spawning','running')
+            "#,
+        )
+        .bind(cron_id)
+        .fetch_one(self.storage.reader_pool())
+        .await?;
+        Ok(count)
+    }
+
+    /// Global in-flight count across all crons. Used by
+    /// `global_max_concurrent_runs`.
+    pub async fn count_running_global(&self) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM runs
+            WHERE finished_at IS NULL
+              AND status IN ('pending','spawning','running')
+            "#,
+        )
+        .fetch_one(self.storage.reader_pool())
+        .await?;
+        Ok(count)
+    }
+
+    /// Count rows for `cron_id` whose `scheduled_at >= since` (typically
+    /// `now - 24h`). Counts every triggered fire including audit rows for
+    /// rejected admissions and `coalesced` consolidations, since the user
+    /// asked for "how many times in the last 24h did this cron try to fire."
+    /// Matches arch §5.4 "24h 滚动窗口硬上限" semantics.
+    pub async fn count_since_for_cron(&self, cron_id: &str, since: &str) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM runs
+            WHERE cron_id = ?1 AND scheduled_at >= ?2
+            "#,
+        )
+        .bind(cron_id)
+        .bind(since)
+        .fetch_one(self.storage.reader_pool())
+        .await?;
+        Ok(count)
+    }
+
+    /// Sum `cost_usd_est` for `cron_id` since the given lexical timestamp.
+    /// Rows with NULL cost are treated as 0 (the field is only populated
+    /// when the adapter reports usage; absent costs don't consume budget).
+    pub async fn sum_cost_since_for_cron(&self, cron_id: &str, since: &str) -> Result<f64> {
+        let (sum,): (Option<f64>,) = sqlx::query_as(
+            r#"
+            SELECT COALESCE(SUM(cost_usd_est), 0.0) FROM runs
+            WHERE cron_id = ?1 AND scheduled_at >= ?2
+            "#,
+        )
+        .bind(cron_id)
+        .bind(since)
+        .fetch_one(self.storage.reader_pool())
+        .await?;
+        Ok(sum.unwrap_or(0.0))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<RunRecord>> {
