@@ -65,7 +65,7 @@ pub use composer::{Composer, ComposerAction, ComposerView};
 pub use detach_notice::{DetachNotice, DetachNoticeView};
 pub use diff_view::{
     DiffAction, DiffEvent, DiffFileState, DiffFocus, DiffKey, DiffModal, DiffPayload, DiffSource,
-    DiffView, DiscardScope, MockDiffSource,
+    DiffView, DiffViewWidget, DiscardScope, MockDiffSource,
 };
 pub use health_sub::HealthEvent;
 pub use model::{Backend, BackendBadge, ProjectGroup, RunState, SessionRow};

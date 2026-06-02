@@ -1,0 +1,22 @@
+name: M2 smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  m2-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run M0 and M2 smoke suites
+        run: cargo test -p m0-smoke -p m2-smoke
+      - name: Upload M2 smoke snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m2-smoke-snapshots
+          path: target/m2-smoke/snapshots/
+          if-no-files-found: warn
