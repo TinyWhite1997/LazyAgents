@@ -599,6 +599,11 @@ fn spawn_runs_archive_loop(cfg: RunsArchiveLoopConfig) -> JoinHandle<()> {
             shutdown,
         } = cfg;
 
+        // Retention cleanup is deliberately monotonic after startup: the
+        // first delay is aligned to the next 03:17 UTC wall-clock tick, and
+        // later ticks use a 24h monotonic interval. System clock/NTP jumps
+        // are picked up on daemon restart; unlike cron firing, this cleanup
+        // path can tolerate delayed realignment.
         let mut sleep = Box::pin(tokio::time::sleep(initial_delay));
         loop {
             tokio::select! {

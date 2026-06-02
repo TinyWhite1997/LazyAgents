@@ -136,7 +136,19 @@ impl Storage {
     /// materializes a standalone destination database that can be used as a
     /// fresh `lad.sqlite` in another state directory.
     pub async fn backup_to(&self, output: impl Into<PathBuf>) -> Result<()> {
-        let source = self.database_path.clone();
+        Self::backup_path_to(self.database_path.clone(), output).await
+    }
+
+    /// Create a consistent snapshot from an arbitrary SQLite source path.
+    ///
+    /// Used by `lad backup` so the CLI can back up a live daemon database
+    /// without opening `Storage` (which would run migrations and create a
+    /// second writer pool).
+    pub async fn backup_path_to(
+        source: impl Into<PathBuf>,
+        output: impl Into<PathBuf>,
+    ) -> Result<()> {
+        let source = source.into();
         let output = output.into();
         if let Some(parent) = output.parent() {
             tokio::fs::create_dir_all(parent).await?;

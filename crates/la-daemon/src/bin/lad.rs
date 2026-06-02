@@ -302,13 +302,7 @@ fn run_backup(
         .map_err(DaemonError::Io)?;
     runtime.block_on(async move {
         let state_dir = state_dir_override.unwrap_or_else(la_daemon::default_state_dir);
-        let storage = la_storage::Storage::open(la_storage::StorageConfig::new(
-            state_dir.join("lad.sqlite"),
-            state_dir,
-        ))
-        .await?;
-        storage.backup_to(&output).await?;
-        storage.close().await;
+        la_storage::Storage::backup_path_to(state_dir.join("lad.sqlite"), &output).await?;
         println!("backup written: {}", output.display());
         Ok(())
     })

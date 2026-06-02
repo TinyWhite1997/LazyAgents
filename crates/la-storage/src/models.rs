@@ -55,7 +55,11 @@ pub struct Cron {
     pub failure_backoff: String,
     pub pause_on_consecutive_failures: i64,
     pub consecutive_failures: i64,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
+    /// Keep this format for every scheduler-written timestamp so string
+    /// comparisons in due queries remain chronologically correct.
     pub last_fired_at: Option<String>,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
     pub next_fire_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -80,7 +84,9 @@ pub struct CronUpsert {
     pub failure_backoff: String,
     pub pause_on_consecutive_failures: i64,
     pub consecutive_failures: i64,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
     pub last_fired_at: Option<String>,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
     pub next_fire_at: Option<String>,
 }
 
@@ -89,8 +95,11 @@ pub struct RunRecord {
     pub id: String,
     pub cron_id: Option<String>,
     pub session_id: Option<String>,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
     pub scheduled_at: String,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
     pub started_at: Option<String>,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
     pub finished_at: Option<String>,
     pub status: String,
     pub exit_code: Option<i64>,
@@ -106,7 +115,9 @@ pub struct NewRun {
     pub id: String,
     pub cron_id: Option<String>,
     pub session_id: Option<String>,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
     pub scheduled_at: String,
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
     pub started_at: Option<String>,
     pub status: String,
     pub coalesced_count: i64,
@@ -114,6 +125,7 @@ pub struct NewRun {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunFinish {
+    /// UTC timestamp in SQLite lexical format: `YYYY-MM-DD HH:MM:SS`.
     pub finished_at: String,
     pub status: String,
     pub exit_code: Option<i64>,
