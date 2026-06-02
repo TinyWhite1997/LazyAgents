@@ -10,6 +10,7 @@
 //!   `lad --help` lists it).
 //! - `lad doctor` — prints the resolved socket path + state dir and
 //!   reports whether a daemon is already alive.
+//! - `lad backup --output <path>` — writes a consistent SQLite snapshot.
 //!
 //! The binary stays small on purpose — all logic lives in `la-daemon` so
 //! the integration suite can spin up a daemon in-process without invoking
@@ -41,6 +42,7 @@ COMMANDS:
     daemonize          Fork into a detached background process.
     metrics            (stub) Print the active daemon's metrics.
     doctor             Diagnose socket / state paths and reachability.
+    backup             Write a consistent SQLite snapshot to --output <path>.
 
 GLOBAL FLAGS:
     --socket <path>    Override the socket path. Default = $LAZYAGENTS_RUNTIME_DIR
@@ -75,17 +77,21 @@ enum Command {
     Daemonize,
     Metrics,
     Doctor,
+    Backup { output: std::path::PathBuf },
     Help,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut iter = args.iter().skip(1);
     let cmd_raw = iter.next().cloned().unwrap_or_else(|| "help".to_string());
-    let cmd = match cmd_raw.as_str() {
+    let mut cmd = match cmd_raw.as_str() {
         "start" => Command::Start,
         "daemonize" => Command::Daemonize,
         "metrics" => Command::Metrics,
         "doctor" => Command::Doctor,
+        "backup" => Command::Backup {
+            output: std::path::PathBuf::new(),
+        },
         "-h" | "--help" | "help" => Command::Help,
         other => return Err(format!("unknown command: {other}")),
     };
@@ -120,6 +126,16 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                     .cloned()
                     .ok_or_else(|| "--log-level expects a value".to_string())?;
             }
+            "--output" => match &mut cmd {
+                Command::Backup { output } => {
+                    *output = iter
+                        .next()
+                        .cloned()
+                        .ok_or_else(|| "--output expects a path".to_string())?
+                        .into();
+                }
+                _ => return Err("--output is only valid for backup".to_string()),
+            },
             #[cfg(debug_assertions)]
             "--test-shell-adapter" => {
                 test_shell_adapter_script =
@@ -186,6 +202,20 @@ fn run(p: Parsed) -> ExitCode {
                 }
             }
             ExitCode::SUCCESS
+        }
+        Command::Backup { output } => {
+            if output.as_os_str().is_empty() {
+                eprintln!("lad: backup requires --output <path>");
+                return ExitCode::from(2);
+            }
+            init_tracing(&p.log_level);
+            match run_backup(p.state_dir_override, output) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("lad: backup failed: {err}");
+                    ExitCode::from(1)
+                }
+            }
         }
         Command::Metrics => {
             eprintln!("lad metrics: not yet implemented (tracked under M3 observability work).");
@@ -260,6 +290,22 @@ fn run(p: Parsed) -> ExitCode {
             }
         }
     }
+}
+
+fn run_backup(
+    state_dir_override: Option<std::path::PathBuf>,
+    output: std::path::PathBuf,
+) -> Result<(), DaemonError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(DaemonError::Io)?;
+    runtime.block_on(async move {
+        let state_dir = state_dir_override.unwrap_or_else(la_daemon::default_state_dir);
+        la_storage::Storage::backup_path_to(state_dir.join("lad.sqlite"), &output).await?;
+        println!("backup written: {}", output.display());
+        Ok(())
+    })
 }
 
 fn run_foreground(p: Parsed) -> Result<(), DaemonError> {

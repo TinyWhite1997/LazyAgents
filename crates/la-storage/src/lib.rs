@@ -13,7 +13,7 @@ pub use storage::{Storage, StorageConfig};
 
 pub const MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-pub const CURRENT_SCHEMA_VERSION: &str = "3";
+pub const CURRENT_SCHEMA_VERSION: &str = "4";
 pub const DEFAULT_TRANSCRIPT_SPILL_BYTES: i64 = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -26,12 +26,22 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("sqlite backup: {0}")]
+    SqliteBackup(#[from] rusqlite::Error),
+    #[error("task join: {0}")]
+    Join(#[from] tokio::task::JoinError),
     #[error("base64: {0}")]
     Base64(#[from] base64::DecodeError),
     #[error("missing session: {0}")]
     MissingSession(String),
     #[error("missing project: {0}")]
     MissingProject(String),
+    #[error("missing cron: {0}")]
+    MissingCron(String),
+    #[error("missing run: {0}")]
+    MissingRun(String),
+    #[error("backup output path must not be the live database: {0}")]
+    BackupSamePath(String),
     #[error("schema version {found} is newer than supported version {supported}")]
     SchemaTooNew { found: String, supported: String },
     #[error("busy after {attempts} attempts")]

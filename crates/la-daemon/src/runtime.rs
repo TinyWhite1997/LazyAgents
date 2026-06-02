@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use la_adapter::AgentAdapter;
 use la_core::{ManagerConfig, SessionManager, WorktreeManager};
@@ -38,6 +38,10 @@ pub const WORKTREE_SWEEP_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// magnitude, but keeps the loop responsive enough that a long-running
 /// daemon doesn't accumulate weeks of orphan worktrees.
 pub const WORKTREE_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+pub const RUNS_ARCHIVE_RETENTION_DAYS: i64 = 90;
+pub const RUNS_ARCHIVE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const RUNS_ARCHIVE_UTC_SECONDS: u64 = 3 * 60 * 60 + 17 * 60;
 
 /// Errors surfaced while spinning up a daemon.
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +86,14 @@ pub struct DaemonConfig {
     /// [`WORKTREE_SWEEP_INTERVAL`] (1 hour). Tests shrink this together
     /// with `worktree_sweep_ttl` to drive the periodic path.
     pub worktree_sweep_interval: Duration,
+    /// Retention window for `runs` rows before they are compressed to
+    /// `runs/archive/<yyyymm>.jsonl.zst` and deleted from SQLite.
+    pub runs_archive_retention_days: i64,
+    /// Production leaves this `None`, which means "next 03:17 UTC".
+    /// Tests can set `Some(Duration::ZERO)` and use Tokio's paused time
+    /// to prove the day-counter path fires without sleeping.
+    pub runs_archive_initial_delay: Option<Duration>,
+    pub runs_archive_interval: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -96,6 +108,9 @@ impl Default for DaemonConfig {
             probe_interval: DEFAULT_PROBE_INTERVAL,
             worktree_sweep_ttl: WORKTREE_SWEEP_TTL,
             worktree_sweep_interval: WORKTREE_SWEEP_INTERVAL,
+            runs_archive_retention_days: RUNS_ARCHIVE_RETENTION_DAYS,
+            runs_archive_initial_delay: None,
+            runs_archive_interval: RUNS_ARCHIVE_INTERVAL,
         }
     }
 }
@@ -117,6 +132,7 @@ pub struct Daemon {
     /// doesn't tear the SQLite handle out from under an in-flight
     /// query.
     worktree_sweep_loop: Option<JoinHandle<()>>,
+    runs_archive_loop: Option<JoinHandle<()>>,
 }
 
 impl Daemon {
@@ -134,6 +150,9 @@ impl Daemon {
             probe_interval,
             worktree_sweep_ttl,
             worktree_sweep_interval,
+            runs_archive_retention_days,
+            runs_archive_initial_delay,
+            runs_archive_interval,
         } = config;
 
         let socket = socket_discovery.resolve();
@@ -254,6 +273,15 @@ impl Daemon {
             shutdown: shutdown.clone(),
         }));
 
+        let runs_archive_loop = Some(spawn_runs_archive_loop(RunsArchiveLoopConfig {
+            storage: manager.storage().clone(),
+            retention_days: runs_archive_retention_days,
+            initial_delay: runs_archive_initial_delay
+                .unwrap_or_else(delay_until_next_runs_archive_tick),
+            interval: runs_archive_interval,
+            shutdown: shutdown.clone(),
+        }));
+
         Ok(Self {
             manager,
             socket,
@@ -263,6 +291,7 @@ impl Daemon {
             shutdown_deadline,
             health_loop,
             worktree_sweep_loop: sweep_loop,
+            runs_archive_loop,
         })
     }
 
@@ -299,6 +328,7 @@ impl Daemon {
             shutdown_deadline,
             health_loop,
             worktree_sweep_loop,
+            runs_archive_loop,
         } = self;
 
         tracing::info!(socket = %socket.socket_path.display(), "lad listening");
@@ -348,6 +378,10 @@ impl Daemon {
             let _ = tokio::time::timeout(BACKGROUND_LOOP_JOIN_BUDGET, h).await;
         }
         if let Some(h) = worktree_sweep_loop {
+            h.abort();
+            let _ = tokio::time::timeout(BACKGROUND_LOOP_JOIN_BUDGET, h).await;
+        }
+        if let Some(h) = runs_archive_loop {
             h.abort();
             let _ = tokio::time::timeout(BACKGROUND_LOOP_JOIN_BUDGET, h).await;
         }
@@ -545,4 +579,231 @@ fn spawn_worktree_sweep_loop(cfg: WorktreeSweepLoopConfig) -> JoinHandle<()> {
             }
         }
     })
+}
+
+struct RunsArchiveLoopConfig {
+    storage: la_storage::Storage,
+    retention_days: i64,
+    initial_delay: Duration,
+    interval: Duration,
+    shutdown: Arc<Notify>,
+}
+
+fn spawn_runs_archive_loop(cfg: RunsArchiveLoopConfig) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let RunsArchiveLoopConfig {
+            storage,
+            retention_days,
+            initial_delay,
+            interval,
+            shutdown,
+        } = cfg;
+
+        // Retention cleanup is deliberately monotonic after startup: the
+        // first delay is aligned to the next 03:17 UTC wall-clock tick, and
+        // later ticks use a 24h monotonic interval. System clock/NTP jumps
+        // are picked up on daemon restart; unlike cron firing, this cleanup
+        // path can tolerate delayed realignment.
+        let mut sleep = Box::pin(tokio::time::sleep(initial_delay));
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                _ = &mut sleep => {
+                    match storage.runs().archive_older_than_days(retention_days).await {
+                        Ok(outcome) if outcome.archived_rows > 0 => {
+                            tracing::info!(
+                                rows = outcome.archived_rows,
+                                files = outcome.archive_files,
+                                retention_days,
+                                "runs archive tick"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(%err, retention_days, "runs archive tick failed");
+                        }
+                    }
+                    sleep.as_mut().reset(tokio::time::Instant::now() + interval);
+                }
+            }
+        }
+    })
+}
+
+fn delay_until_next_runs_archive_tick() -> Duration {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    delay_until_next_runs_archive_tick_from(now_secs)
+}
+
+fn delay_until_next_runs_archive_tick_from(now_secs: u64) -> Duration {
+    let day_pos = now_secs % RUNS_ARCHIVE_INTERVAL.as_secs();
+    let wait_secs = if day_pos < RUNS_ARCHIVE_UTC_SECONDS {
+        RUNS_ARCHIVE_UTC_SECONDS - day_pos
+    } else {
+        RUNS_ARCHIVE_INTERVAL.as_secs() - day_pos + RUNS_ARCHIVE_UTC_SECONDS
+    };
+    Duration::from_secs(wait_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use la_storage::{BackendUpsert, CronUpsert, NewProject, NewRun, Storage, StorageConfig};
+    use tempfile::TempDir;
+
+    async fn archive_loop_storage() -> (TempDir, Storage, Arc<Notify>) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::open(StorageConfig::for_test(dir.path()))
+            .await
+            .expect("open storage");
+        storage
+            .backends()
+            .upsert(BackendUpsert {
+                id: "claude",
+                display_name: "Claude Code",
+                version: None,
+                available: true,
+            })
+            .await
+            .expect("backend");
+        storage
+            .projects()
+            .create(NewProject {
+                id: "project-1".into(),
+                root_path: "/tmp/lazyagents/archive-loop".into(),
+                display_name: "archive-loop".into(),
+                vcs: Some("git".into()),
+            })
+            .await
+            .expect("project");
+        storage
+            .crons()
+            .upsert(CronUpsert {
+                id: "cron-1".into(),
+                name: "daily".into(),
+                enabled: true,
+                project_id: "project-1".into(),
+                backend_id: "claude".into(),
+                spawn_args: serde_json::json!({}),
+                prompt: "status".into(),
+                cron_expr: "17 3 * * *".into(),
+                tz: "UTC".into(),
+                catchup_mode: "coalesce".into(),
+                max_concurrent_runs: 1,
+                max_runs_per_day: 24,
+                max_runtime_s: 1800,
+                cost_budget_usd_per_day: None,
+                failure_backoff: "expo(1m,2,1h)".into(),
+                pause_on_consecutive_failures: 5,
+                consecutive_failures: 0,
+                last_fired_at: None,
+                next_fire_at: Some("2026-01-01 03:17:00".into()),
+            })
+            .await
+            .expect("cron");
+        storage
+            .runs()
+            .create(NewRun {
+                id: "run-old".into(),
+                cron_id: Some("cron-1".into()),
+                session_id: None,
+                scheduled_at: "2000-01-01 03:17:00".into(),
+                started_at: None,
+                status: "pending".into(),
+                coalesced_count: 1,
+            })
+            .await
+            .expect("run");
+        (dir, storage, Arc::new(Notify::new()))
+    }
+
+    #[tokio::test]
+    async fn runs_archive_loop_fires_under_paused_time() {
+        let (_dir, storage, shutdown) = archive_loop_storage().await;
+        tokio::time::pause();
+        let handle = spawn_runs_archive_loop(RunsArchiveLoopConfig {
+            storage: storage.clone(),
+            retention_days: 90,
+            initial_delay: Duration::from_secs(24 * 60 * 60),
+            interval: Duration::from_secs(24 * 60 * 60),
+            shutdown: shutdown.clone(),
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+        tokio::time::resume();
+        for _ in 0..20 {
+            if storage.runs().get("run-old").await.unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(storage.runs().get("run-old").await.unwrap().is_none());
+        assert!(storage
+            .data_dir()
+            .join("runs/archive/200001.jsonl.zst")
+            .exists());
+
+        shutdown.notify_waiters();
+        handle.await.expect("archive loop joins");
+    }
+
+    #[tokio::test]
+    async fn runs_archive_loop_second_tick_does_not_duplicate_after_delete() {
+        let (_dir, storage, shutdown) = archive_loop_storage().await;
+        tokio::time::pause();
+        let handle = spawn_runs_archive_loop(RunsArchiveLoopConfig {
+            storage: storage.clone(),
+            retention_days: 90,
+            initial_delay: Duration::ZERO,
+            interval: Duration::from_secs(24 * 60 * 60),
+            shutdown: shutdown.clone(),
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+        tokio::time::resume();
+        for _ in 0..20 {
+            if storage.runs().get("run-old").await.unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let archive = storage.data_dir().join("runs/archive/200001.jsonl.zst");
+        let first_len = tokio::fs::metadata(&archive).await.unwrap().len();
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second_len = tokio::fs::metadata(&archive).await.unwrap().len();
+        assert_eq!(first_len, second_len);
+
+        shutdown.notify_waiters();
+        handle.await.expect("archive loop joins");
+    }
+
+    #[test]
+    fn runs_archive_delay_realigns_to_next_0317_utc_from_wall_clock() {
+        assert_eq!(
+            delay_until_next_runs_archive_tick_from(3 * 60 * 60 + 16 * 60 + 59),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            delay_until_next_runs_archive_tick_from(RUNS_ARCHIVE_UTC_SECONDS),
+            RUNS_ARCHIVE_INTERVAL
+        );
+        assert_eq!(
+            delay_until_next_runs_archive_tick_from(RUNS_ARCHIVE_UTC_SECONDS + 1),
+            RUNS_ARCHIVE_INTERVAL - Duration::from_secs(1)
+        );
+        assert_eq!(
+            delay_until_next_runs_archive_tick_from(2 * RUNS_ARCHIVE_INTERVAL.as_secs() + 60),
+            Duration::from_secs(RUNS_ARCHIVE_UTC_SECONDS - 60)
+        );
+    }
 }
