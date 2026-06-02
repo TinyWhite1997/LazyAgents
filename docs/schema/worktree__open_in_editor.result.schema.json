@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeOpenInEditorResult",
+  "type": "object",
+  "required": [
+    "command",
+    "launched"
+  ],
+  "properties": {
+    "launched": {
+      "description": "`true` ⇒ child process was spawned. The daemon makes no claim about whether the editor actually opened the file.",
+      "type": "boolean"
+    },
+    "command": {
+      "description": "argv joined with spaces, redacted of environment values. Lets the TUI show \"launched: code --goto path:12\" in a toast.",
+      "type": "string"
+    },
+    "pid": {
+      "description": "Child PID when available (Unix). `None` when the platform does not expose it or the daemon can't get it.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeMutationParams",
+  "description": "Shared params shape for stage / unstage / discard. `hunk_ids` are the fingerprints returned by an earlier `worktree.diff`. `confirmed` is only meaningful for `discard` — the daemon refuses unless it is `true` (PRD 撤销 二次确认 acceptance).",
+  "type": "object",
+  "required": [
+    "hunk_ids",
+    "session_id"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "hunk_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "confirmed": {
+      "description": "Required `true` for `worktree.discard`; ignored elsewhere. Modelled as `bool` (not `Option`) so the wire form is explicit; older clients that never set it default to `false` and therefore fail discard with `WORKTREE_DISCARD_UNCONFIRMED`, which is the safe outcome.",
+      "default": false,
+      "type": "boolean"
+    }
+  }
+}

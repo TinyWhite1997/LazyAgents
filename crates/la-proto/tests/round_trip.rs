@@ -131,6 +131,7 @@ fn initialize_result_round_trip() {
             adapters: vec!["claude".into()],
             cron: true,
             worktree: true,
+            diff: true,
             events: true,
         },
     };
@@ -554,6 +555,163 @@ fn m1_envelope_round_trip_for_every_method() {
             topics: vec![EventTopic::SessionState],
         },
     );
+    {
+        use la_proto::methods::{
+            DiffLine, DiffOrigin, FileEntry, FileKind, FileStatus, Hunk, HunkReject, LineRange,
+            ModeChange, TruncationMarker, WorktreeCommit, WorktreeCommitParams,
+            WorktreeCommitResult, WorktreeDiff, WorktreeDiffParams, WorktreeDiffResult,
+            WorktreeDiscard, WorktreeMutationParams, WorktreeMutationResult, WorktreeOpenInEditor,
+            WorktreeOpenInEditorParams, WorktreeOpenInEditorResult, WorktreeStage, WorktreeStatus,
+            WorktreeStatusParams, WorktreeStatusResult, WorktreeUnstage,
+        };
+        let entry = FileEntry {
+            path: "src/main.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            kind: FileKind::Text,
+            staged_hunks: 1,
+            unstaged_hunks: 2,
+            size_bytes: 4096,
+            mode_change: Some(ModeChange {
+                old_mode: 0o100644,
+                new_mode: 0o100755,
+            }),
+        };
+        roundtrip::<WorktreeStatus>(
+            &WorktreeStatusParams {
+                session_id: "s1".into(),
+            },
+            &WorktreeStatusResult {
+                branch: "la/session-deadbeef".into(),
+                base_branch: Some("main".into()),
+                head: "0".repeat(40),
+                ahead: 0,
+                behind: 0,
+                files: vec![entry.clone()],
+                generated_at: "2026-06-03T00:00:00Z".into(),
+            },
+        );
+        roundtrip::<WorktreeDiff>(
+            &WorktreeDiffParams {
+                session_id: "s1".into(),
+                path: "src/main.rs".into(),
+                staged: false,
+                context_lines: Some(3),
+            },
+            &WorktreeDiffResult {
+                file: entry.clone(),
+                hunks: vec![Hunk {
+                    hunk_id: "abcdef0123456789".into(),
+                    staged: false,
+                    old_range: LineRange { start: 1, count: 3 },
+                    new_range: LineRange { start: 1, count: 4 },
+                    header: "@@ -1,3 +1,4 @@".into(),
+                    lines: vec![
+                        DiffLine {
+                            origin: DiffOrigin::Context,
+                            content: "fn main() {".into(),
+                            no_newline: false,
+                        },
+                        DiffLine {
+                            origin: DiffOrigin::Add,
+                            content: "    println!(\"hi\");".into(),
+                            no_newline: false,
+                        },
+                        DiffLine {
+                            origin: DiffOrigin::Context,
+                            content: "}".into(),
+                            no_newline: true,
+                        },
+                    ],
+                }],
+                truncated: None,
+            },
+        );
+        roundtrip::<WorktreeDiff>(
+            &WorktreeDiffParams {
+                session_id: "s1".into(),
+                path: "big.bin".into(),
+                staged: false,
+                context_lines: None,
+            },
+            &WorktreeDiffResult {
+                file: FileEntry {
+                    path: "big.bin".into(),
+                    old_path: None,
+                    status: FileStatus::Added,
+                    kind: FileKind::Binary,
+                    staged_hunks: 0,
+                    unstaged_hunks: 0,
+                    size_bytes: 12_000_000,
+                    mode_change: None,
+                },
+                hunks: vec![],
+                truncated: Some(TruncationMarker {
+                    reason: "too_large".into(),
+                    size_bytes: 12_000_000,
+                    hint: "open_in_editor".into(),
+                }),
+            },
+        );
+        let mut_result = WorktreeMutationResult {
+            applied: vec!["abcdef0123456789".into()],
+            rejected: vec![HunkReject {
+                hunk_id: "stalehunk000000".into(),
+                reason: "stale".into(),
+            }],
+            status: vec![entry.clone()],
+        };
+        roundtrip::<WorktreeStage>(
+            &WorktreeMutationParams {
+                session_id: "s1".into(),
+                hunk_ids: vec!["abcdef0123456789".into()],
+                confirmed: false,
+            },
+            &mut_result,
+        );
+        roundtrip::<WorktreeUnstage>(
+            &WorktreeMutationParams {
+                session_id: "s1".into(),
+                hunk_ids: vec!["abcdef0123456789".into()],
+                confirmed: false,
+            },
+            &mut_result,
+        );
+        roundtrip::<WorktreeDiscard>(
+            &WorktreeMutationParams {
+                session_id: "s1".into(),
+                hunk_ids: vec!["abcdef0123456789".into()],
+                confirmed: true,
+            },
+            &mut_result,
+        );
+        roundtrip::<WorktreeCommit>(
+            &WorktreeCommitParams {
+                session_id: "s1".into(),
+                message: "feat: do a thing\n\nbody".into(),
+                allow_empty: false,
+            },
+            &WorktreeCommitResult {
+                commit_sha: "0".repeat(40),
+                summary: "feat: do a thing".into(),
+                files_changed: 2,
+            },
+        );
+        roundtrip::<WorktreeOpenInEditor>(
+            &WorktreeOpenInEditorParams {
+                session_id: "s1".into(),
+                path: "src/main.rs".into(),
+                line: Some(12),
+                column: Some(4),
+                editor_override: Some("code".into()),
+            },
+            &WorktreeOpenInEditorResult {
+                launched: true,
+                command: "code --goto src/main.rs:12:4".into(),
+                pid: Some(4242),
+            },
+        );
+    }
 }
 
 #[test]
@@ -818,6 +976,38 @@ fn error_kind_to_code_table_is_pinned() {
             error_codes::CRON_BUDGET_EXCEEDED,
         ),
         (ErrorKind::CronInvalidTz, error_codes::CRON_INVALID_TZ),
+        (
+            ErrorKind::WorktreeUnavailable,
+            error_codes::WORKTREE_UNAVAILABLE,
+        ),
+        (
+            ErrorKind::WorktreeDiffTooLarge,
+            error_codes::WORKTREE_DIFF_TOO_LARGE,
+        ),
+        (
+            ErrorKind::WorktreeHunkStale,
+            error_codes::WORKTREE_HUNK_STALE,
+        ),
+        (
+            ErrorKind::WorktreeCommitHookFailed,
+            error_codes::WORKTREE_COMMIT_HOOK_FAILED,
+        ),
+        (
+            ErrorKind::WorktreeCommitEmpty,
+            error_codes::WORKTREE_COMMIT_EMPTY,
+        ),
+        (
+            ErrorKind::WorktreePatchRejected,
+            error_codes::WORKTREE_PATCH_REJECTED,
+        ),
+        (
+            ErrorKind::WorktreeEditorUnavailable,
+            error_codes::WORKTREE_EDITOR_UNAVAILABLE,
+        ),
+        (
+            ErrorKind::WorktreeDiscardUnconfirmed,
+            error_codes::WORKTREE_DISCARD_UNCONFIRMED,
+        ),
     ];
     for (k, expected) in table {
         assert_eq!(k.code(), *expected, "code drift for {:?}", k);
@@ -940,12 +1130,21 @@ fn schema_files_match_generated_output() {
     add_method!(SessionsImport);
     add_method!(SessionsReplay);
     add_method!(EventsSubscribe);
+    add_method!(la_proto::methods::WorktreeStatus);
+    add_method!(la_proto::methods::WorktreeDiff);
+    add_method!(la_proto::methods::WorktreeStage);
+    add_method!(la_proto::methods::WorktreeUnstage);
+    add_method!(la_proto::methods::WorktreeDiscard);
+    add_method!(la_proto::methods::WorktreeCommit);
+    add_method!(la_proto::methods::WorktreeOpenInEditor);
 
     add_notif!(SessionOutput);
     add_notif!(SessionStateNotice);
     add_notif!(SessionGap);
     add_notif!(CronFired);
     add_notif!(DaemonHealth);
+    add_notif!(la_proto::notifications::WorktreeChanged);
+    add_notif!(la_proto::notifications::WorktreeCommitCreated);
 
     // 1. Every expected file exists with the expected bytes.
     let mut missing = Vec::new();

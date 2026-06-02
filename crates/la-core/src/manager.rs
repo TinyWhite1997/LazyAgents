@@ -38,7 +38,9 @@ use tokio::sync::{Mutex, RwLock};
 use crate::error::CoreResult;
 use crate::event_bus::{BusEvent, EventBus};
 use crate::session::{SessionId, SessionRuntime, SessionStateChange, SignalFn};
-use crate::worktree::{project_slug, WorktreeManager, WorktreePlan};
+use crate::worktree::{
+    diff::WorktreeLocks, project_slug, DiffEngine, WorktreeManager, WorktreePlan,
+};
 use crate::{CoreError, DEFAULT_RUNNING_PROMOTE, DEFAULT_WAITING_IDLE};
 
 /// Tunables that callers (mostly tests) want to override.
@@ -141,6 +143,11 @@ struct Inner {
     /// per-session read-only access borrows briefly inside the lock and
     /// hands out cloneable handles, so contention stays low.
     registry: Mutex<HashMap<SessionId, Arc<RwLock<SessionRuntime>>>>,
+    /// Per-session mutex map for the M2.5 diff review surface (WEK-28).
+    /// Stage / unstage / discard / commit take their session's mutex so
+    /// concurrent callers don't race on `.git/index.lock`. Reads are
+    /// lock-free.
+    worktree_locks: WorktreeLocks,
 }
 
 impl SessionManager {
@@ -156,6 +163,7 @@ impl SessionManager {
                 bus,
                 config,
                 registry: Mutex::new(HashMap::new()),
+                worktree_locks: WorktreeLocks::new(),
             }),
         }
     }
@@ -181,6 +189,65 @@ impl SessionManager {
     /// Number of in-memory sessions; surfaced on `daemon.health`.
     pub async fn active_count(&self) -> usize {
         self.inner.registry.lock().await.len()
+    }
+
+    /// Look up the `(repo_root, worktree_path, base_branch)` triple for a
+    /// session id. `repo_root` is sourced from the project's `root_path`;
+    /// `worktree_path` / `base_branch` come from the session row.
+    /// Returns `None` when:
+    ///
+    /// - the session id is unknown,
+    /// - the session has no `worktree_path` recorded
+    ///   (`worktree: false` at create time, or already cleared by
+    ///   archive),
+    /// - the owning project can't be looked up (storage error or row
+    ///   missing).
+    ///
+    /// Used by the M2.5 diff RPCs (WEK-28) so the dispatcher can build
+    /// a [`DiffEngine`] without threading `Storage` itself.
+    pub async fn worktree_for(
+        &self,
+        id: &SessionId,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf, Option<String>)> {
+        let row = self
+            .inner
+            .storage
+            .sessions()
+            .get(id.as_str())
+            .await
+            .ok()??;
+        let wt = row.worktree_path?;
+        let project = self
+            .inner
+            .storage
+            .projects()
+            .get(&row.project_id)
+            .await
+            .ok()??;
+        Some((
+            std::path::PathBuf::from(project.root_path),
+            std::path::PathBuf::from(wt),
+            row.base_branch,
+        ))
+    }
+
+    /// Build a [`DiffEngine`] bound to a session. Returns `None` under
+    /// the same conditions as [`Self::worktree_for`]. The session's
+    /// recorded base branch (if any) is threaded into the engine so
+    /// `worktree.status` returns real ahead/behind counters instead of
+    /// `(0, 0)`.
+    pub async fn diff_engine_for(&self, id: &SessionId) -> Option<(DiffEngine, Option<String>)> {
+        let (repo_root, worktree_path, base) = self.worktree_for(id).await?;
+        Some((
+            DiffEngine::new(
+                repo_root,
+                worktree_path,
+                id.clone(),
+                self.inner.worktree_locks.clone(),
+                base.clone(),
+            ),
+            base,
+        ))
     }
 
     /// Spawn a new session sharing the project root (no per-session

@@ -150,6 +150,56 @@ pub mod error_codes {
     /// stderr (trimmed) so the user can self-diagnose.
     pub const WORKTREE_PROVISION_FAILED: i32 = -33119;
 
+    // ----- Worktree diff review (M2.5 / WEK-28): -33120..-33129 -----
+    //
+    // The diff RPCs (`worktree.status` / `worktree.diff` / `worktree.stage`
+    // / `worktree.unstage` / `worktree.discard` / `worktree.commit` /
+    // `worktree.open_in_editor`) use this sub-range. Same stability rule
+    // as -33110..-33119: code numbers are contract, additions go at
+    // -33128..-33129.
+    /// `-33120` — session has no `worktree_path` (or `session_id` not
+    /// found). Returned by every `worktree.*` method before it touches
+    /// git.
+    pub const WORKTREE_UNAVAILABLE: i32 = -33120;
+    /// `-33121` — `worktree.diff` was forced past the truncation guard
+    /// for a file that is too large to inline. Reserved for the future
+    /// "force_full = true" override; M2 returns a `TruncationMarker`
+    /// instead and never raises this.
+    pub const WORKTREE_DIFF_TOO_LARGE: i32 = -33121;
+    /// `-33122` — every hunk id in a `worktree.stage` / `unstage` /
+    /// `discard` request is stale. Partial staleness goes in the
+    /// `rejected` array on the result instead.
+    pub const WORKTREE_HUNK_STALE: i32 = -33122;
+    /// `-33123` — `git commit` failed because a pre-commit hook
+    /// returned non-zero. `data.stderr` carries the trimmed hook
+    /// stderr (4 KiB cap, same convention as `WORKTREE_PROVISION_FAILED`).
+    pub const WORKTREE_COMMIT_HOOK_FAILED: i32 = -33123;
+    /// `-33124` — `git commit` reported "nothing to commit" without the
+    /// `allow_empty` flag.
+    pub const WORKTREE_COMMIT_EMPTY: i32 = -33124;
+    /// `-33125` — `git apply --cached` (or `--reverse`) rejected the
+    /// synthesised patch. Typically means the file changed between the
+    /// diff read and the apply attempt; retry after a fresh
+    /// `worktree.status`.
+    ///
+    /// **Reserved for a future `force_full = true` override**, not
+    /// raised on the normal mutation path. Per-hunk patch rejections
+    /// from `worktree.stage` / `unstage` / `discard` ride back inside
+    /// the call's [`WorktreeMutationResult::rejected`] array with
+    /// `reason = "patch_rejected"`; that keeps the structured
+    /// partial-success / partial-failure feedback intact instead of
+    /// collapsing the whole call to one error. This code only
+    /// surfaces when a future caller asks the daemon to refuse the
+    /// whole batch on any rejected hunk.
+    pub const WORKTREE_PATCH_REJECTED: i32 = -33125;
+    /// `-33126` — no editor command could be resolved (no override, no
+    /// `$VISUAL`, no `$EDITOR`, and `code` not on PATH).
+    pub const WORKTREE_EDITOR_UNAVAILABLE: i32 = -33126;
+    /// `-33127` — `worktree.discard` was called without `confirmed:
+    /// true`. The TUI must go through the 二次确认 modal before
+    /// re-issuing.
+    pub const WORKTREE_DISCARD_UNCONFIRMED: i32 = -33127;
+
     // ----- Storage / SQLite: -33200..-33299 -----
 
     /// `-33201` — SQLite reported `SQLITE_BUSY` after our retry budget.
@@ -223,6 +273,14 @@ pub enum ErrorKind {
     WorktreeIo,
     WorktreeGitUnavailable,
     WorktreeProvisionFailed,
+    WorktreeUnavailable,
+    WorktreeDiffTooLarge,
+    WorktreeHunkStale,
+    WorktreeCommitHookFailed,
+    WorktreeCommitEmpty,
+    WorktreePatchRejected,
+    WorktreeEditorUnavailable,
+    WorktreeDiscardUnconfirmed,
     StorageBusy,
     StorageConflict,
     StorageFailed,
@@ -264,6 +322,14 @@ impl ErrorKind {
             ErrorKind::WorktreeIo => WORKTREE_IO,
             ErrorKind::WorktreeGitUnavailable => WORKTREE_GIT_UNAVAILABLE,
             ErrorKind::WorktreeProvisionFailed => WORKTREE_PROVISION_FAILED,
+            ErrorKind::WorktreeUnavailable => WORKTREE_UNAVAILABLE,
+            ErrorKind::WorktreeDiffTooLarge => WORKTREE_DIFF_TOO_LARGE,
+            ErrorKind::WorktreeHunkStale => WORKTREE_HUNK_STALE,
+            ErrorKind::WorktreeCommitHookFailed => WORKTREE_COMMIT_HOOK_FAILED,
+            ErrorKind::WorktreeCommitEmpty => WORKTREE_COMMIT_EMPTY,
+            ErrorKind::WorktreePatchRejected => WORKTREE_PATCH_REJECTED,
+            ErrorKind::WorktreeEditorUnavailable => WORKTREE_EDITOR_UNAVAILABLE,
+            ErrorKind::WorktreeDiscardUnconfirmed => WORKTREE_DISCARD_UNCONFIRMED,
             ErrorKind::StorageBusy => STORAGE_BUSY,
             ErrorKind::StorageConflict => STORAGE_CONFLICT,
             ErrorKind::StorageFailed => STORAGE_FAILED,

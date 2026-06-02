@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeOpenInEditorParams",
+  "type": "object",
+  "required": [
+    "path",
+    "session_id"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "path": {
+      "description": "File path relative to the worktree root.",
+      "type": "string"
+    },
+    "line": {
+      "description": "1-based line number; passed to editors that support `:line` jump syntax. `None` ⇒ open at file head.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "column": {
+      "description": "1-based column; only honoured by editors that support `:line:col` (VS Code, Cursor, Zed). Ignored otherwise.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "editor_override": {
+      "description": "Override the daemon's editor resolution chain for this single call. Plain command name (`\"code\"`, `\"cursor\"`, `\"zed\"`, `\"idea\"`, …). `None` ⇒ use the daemon's standard chain.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

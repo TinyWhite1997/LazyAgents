@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeCommitCreatedParams",
+  "type": "object",
+  "required": [
+    "commit_sha",
+    "files_changed",
+    "generated_at",
+    "session_id",
+    "summary"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "commit_sha": {
+      "description": "40-char hex SHA of the new commit.",
+      "type": "string"
+    },
+    "summary": {
+      "description": "First line of the commit message.",
+      "type": "string"
+    },
+    "files_changed": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "generated_at": {
+      "description": "RFC3339 timestamp of the commit.",
+      "type": "string"
+    }
+  }
+}

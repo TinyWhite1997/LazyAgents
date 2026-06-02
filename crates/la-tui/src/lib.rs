@@ -47,6 +47,7 @@
 pub mod app;
 pub mod composer;
 pub mod detach_notice;
+pub mod diff_view;
 pub mod health_sub;
 pub mod input;
 pub mod key_hints;
@@ -62,6 +63,10 @@ pub mod vte_term;
 pub use app::{App, AppMsg, Focus, Tab};
 pub use composer::{Composer, ComposerAction, ComposerView};
 pub use detach_notice::{DetachNotice, DetachNoticeView};
+pub use diff_view::{
+    DiffAction, DiffEvent, DiffFileState, DiffFocus, DiffKey, DiffModal, DiffPayload, DiffSource,
+    DiffView, DiscardScope, MockDiffSource,
+};
 pub use health_sub::HealthEvent;
 pub use model::{Backend, BackendBadge, ProjectGroup, RunState, SessionRow};
 pub use source::{MockSessionSource, SessionSource};

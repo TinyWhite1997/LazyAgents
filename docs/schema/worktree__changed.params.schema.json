@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorktreeChangedParams",
+  "type": "object",
+  "required": [
+    "affected_files",
+    "generated_at",
+    "kind",
+    "session_id"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "kind": {
+      "description": "`\"stage\" | \"unstage\" | \"discard\" | \"commit\" | \"external\"`.",
+      "type": "string"
+    },
+    "affected_files": {
+      "description": "Paths relative to the worktree root. Empty when the mutation scope is the entire worktree (`commit` returns the post-commit dirty set, which is usually short or empty).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "generated_at": {
+      "description": "RFC3339 timestamp of the mutation.",
+      "type": "string"
+    }
+  }
+}

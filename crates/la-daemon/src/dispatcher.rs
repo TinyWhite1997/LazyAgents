@@ -39,10 +39,15 @@ use la_proto::methods::{
     SessionsAttachParams, SessionsAttachResult, SessionsCreateParams, SessionsCreateResult,
     SessionsDetachParams, SessionsDetachResult, SessionsImportParams, SessionsImportResult,
     SessionsListParams, SessionsListResult, SessionsSignalParams, SessionsSignalResult,
-    SessionsWriteParams, SessionsWriteResult,
+    SessionsWriteParams, SessionsWriteResult, WorktreeCommit, WorktreeCommitParams,
+    WorktreeCommitResult, WorktreeDiff, WorktreeDiffParams, WorktreeDiffResult, WorktreeDiscard,
+    WorktreeMutationParams, WorktreeMutationResult, WorktreeOpenInEditor,
+    WorktreeOpenInEditorParams, WorktreeOpenInEditorResult, WorktreeStage, WorktreeStatus,
+    WorktreeStatusParams, WorktreeStatusResult, WorktreeUnstage,
 };
 use la_proto::notifications::{
     DaemonHealth, NotificationMethod, SessionGap, SessionOutput, SessionStateNotice,
+    WorktreeChanged, WorktreeChangedParams, WorktreeCommitCreated, WorktreeCommitCreatedParams,
 };
 use la_proto::PROTOCOL_VERSION;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -140,6 +145,10 @@ where
         // onwards; if a future build wants to disable worktrees it
         // should clear `ManagerConfig.worktree` AND drop this bit.
         worktree: true,
+        // WEK-28: `worktree.status` / `worktree.diff` / `worktree.stage`
+        // / `worktree.unstage` / `worktree.discard` / `worktree.commit`
+        // / `worktree.open_in_editor` are all routed below.
+        diff: true,
         events: true,
     };
     let handshake = match server_handshake(
@@ -230,6 +239,8 @@ struct ConnStateInner {
 struct TopicSet {
     session_state: bool,
     daemon_health: bool,
+    worktree_changed: bool,
+    worktree_commit: bool,
 }
 
 struct AttachmentSlot {
@@ -354,6 +365,12 @@ async fn deliver_bus_event(state: &ConnState, event: BusEvent) {
         BusEvent::DaemonHealth(p) if topics.daemon_health => {
             Notification::new(DaemonHealth::NAME, &p)
         }
+        BusEvent::WorktreeChanged(p) if topics.worktree_changed => {
+            Notification::new(WorktreeChanged::NAME, &p)
+        }
+        BusEvent::WorktreeCommitCreated(p) if topics.worktree_commit => {
+            Notification::new(WorktreeCommitCreated::NAME, &p)
+        }
         _ => return,
     };
     match notification {
@@ -446,6 +463,34 @@ async fn dispatch(
             let params: SessionsImportParams = decode_params(req)?;
             handle_sessions_import(state, ctx, params).await
         }
+        WorktreeStatus::NAME => {
+            let params: WorktreeStatusParams = decode_params(req)?;
+            handle_worktree_status(state, params).await
+        }
+        WorktreeDiff::NAME => {
+            let params: WorktreeDiffParams = decode_params(req)?;
+            handle_worktree_diff(state, params).await
+        }
+        WorktreeStage::NAME => {
+            let params: WorktreeMutationParams = decode_params(req)?;
+            handle_worktree_mutation(state, params, WorktreeMutationKind::Stage).await
+        }
+        WorktreeUnstage::NAME => {
+            let params: WorktreeMutationParams = decode_params(req)?;
+            handle_worktree_mutation(state, params, WorktreeMutationKind::Unstage).await
+        }
+        WorktreeDiscard::NAME => {
+            let params: WorktreeMutationParams = decode_params(req)?;
+            handle_worktree_mutation(state, params, WorktreeMutationKind::Discard).await
+        }
+        WorktreeCommit::NAME => {
+            let params: WorktreeCommitParams = decode_params(req)?;
+            handle_worktree_commit(state, params).await
+        }
+        WorktreeOpenInEditor::NAME => {
+            let params: WorktreeOpenInEditorParams = decode_params(req)?;
+            handle_worktree_open_in_editor(state, params).await
+        }
         "shutdown" => ok(la_proto::methods::ShutdownResult {}),
         other => Err(RpcError::method_not_found(other)),
     }
@@ -484,6 +529,14 @@ async fn handle_events_subscribe(
                         send_health_snapshot = true;
                     }
                     topics.daemon_health = true;
+                    effective.push(*t);
+                }
+                EventTopic::WorktreeChanged => {
+                    topics.worktree_changed = true;
+                    effective.push(*t);
+                }
+                EventTopic::WorktreeCommit => {
+                    topics.worktree_commit = true;
                     effective.push(*t);
                 }
                 EventTopic::SessionOutput | EventTopic::SessionGap => {
@@ -1035,5 +1088,306 @@ fn storage_to_rpc(err: la_storage::StorageError) -> RpcError {
             format!("missing project: {id}"),
         ),
         _ => RpcError::new(error_codes::STORAGE_FAILED, err.to_string()),
+    }
+}
+
+// ===========================================================================
+// Worktree diff review handlers (M2.5 / WEK-28).
+// ===========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeMutationKind {
+    Stage,
+    Unstage,
+    Discard,
+}
+
+impl WorktreeMutationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorktreeMutationKind::Stage => "stage",
+            WorktreeMutationKind::Unstage => "unstage",
+            WorktreeMutationKind::Discard => "discard",
+        }
+    }
+}
+
+async fn handle_worktree_status(
+    state: &ConnState,
+    params: WorktreeStatusParams,
+) -> Result<serde_json::Value, RpcError> {
+    let id = SessionId(params.session_id.clone());
+    let (engine, recorded_base) = state
+        .manager
+        .diff_engine_for(&id)
+        .await
+        .ok_or_else(|| worktree_unavailable(&params.session_id))?;
+    let snap = engine.status().await.map_err(core_to_rpc)?;
+    let now_rfc3339 = rfc3339_now();
+    let files = snap
+        .files
+        .into_iter()
+        .map(core_to_proto_file_entry)
+        .collect();
+    ok(WorktreeStatusResult {
+        branch: snap.branch,
+        base_branch: snap.base_branch.or(recorded_base),
+        head: snap.head,
+        ahead: snap.ahead,
+        behind: snap.behind,
+        files,
+        generated_at: now_rfc3339,
+    })
+}
+
+async fn handle_worktree_diff(
+    state: &ConnState,
+    params: WorktreeDiffParams,
+) -> Result<serde_json::Value, RpcError> {
+    let id = SessionId(params.session_id.clone());
+    let (engine, _base) = state
+        .manager
+        .diff_engine_for(&id)
+        .await
+        .ok_or_else(|| worktree_unavailable(&params.session_id))?;
+    let out = engine
+        .diff_file(&params.path, params.staged, params.context_lines)
+        .await
+        .map_err(core_to_rpc)?;
+    let file = core_to_proto_file_entry(out.file);
+    let hunks = out.hunks.into_iter().map(core_to_proto_hunk).collect();
+    let truncated = out.truncated.map(|t| la_proto::methods::TruncationMarker {
+        reason: t.reason.to_string(),
+        size_bytes: t.size_bytes,
+        hint: t.hint.to_string(),
+    });
+    ok(WorktreeDiffResult {
+        file,
+        hunks,
+        truncated,
+    })
+}
+
+async fn handle_worktree_mutation(
+    state: &ConnState,
+    params: WorktreeMutationParams,
+    kind: WorktreeMutationKind,
+) -> Result<serde_json::Value, RpcError> {
+    if matches!(kind, WorktreeMutationKind::Discard) && !params.confirmed {
+        return Err(core_to_rpc(la_core::CoreError::WorktreeDiscardUnconfirmed));
+    }
+    let id = SessionId(params.session_id.clone());
+    let (engine, _base) = state
+        .manager
+        .diff_engine_for(&id)
+        .await
+        .ok_or_else(|| worktree_unavailable(&params.session_id))?;
+    let outcome = match kind {
+        WorktreeMutationKind::Stage => engine.stage(&params.hunk_ids).await,
+        WorktreeMutationKind::Unstage => engine.unstage(&params.hunk_ids).await,
+        WorktreeMutationKind::Discard => engine.discard(&params.hunk_ids).await,
+    }
+    .map_err(core_to_rpc)?;
+
+    // Fire the worktree.changed broadcast — only if something actually
+    // moved, so a TUI that wired an empty button click doesn't ripple
+    // out to other clients.
+    if !outcome.applied.is_empty() || !outcome.affected_files.is_empty() {
+        let bus_event = BusEvent::WorktreeChanged(WorktreeChangedParams {
+            session_id: params.session_id.clone(),
+            kind: kind.as_str().to_string(),
+            affected_files: outcome.affected_files.clone(),
+            generated_at: rfc3339_now(),
+        });
+        state.manager.bus().publish(bus_event);
+    }
+
+    let proto = WorktreeMutationResult {
+        applied: outcome.applied,
+        rejected: outcome
+            .rejected
+            .into_iter()
+            .map(|r| la_proto::methods::HunkReject {
+                hunk_id: r.hunk_id,
+                reason: r.reason.to_string(),
+            })
+            .collect(),
+        status: outcome
+            .status
+            .into_iter()
+            .map(core_to_proto_file_entry)
+            .collect(),
+    };
+    ok(proto)
+}
+
+async fn handle_worktree_commit(
+    state: &ConnState,
+    params: WorktreeCommitParams,
+) -> Result<serde_json::Value, RpcError> {
+    let id = SessionId(params.session_id.clone());
+    let (engine, _base) = state
+        .manager
+        .diff_engine_for(&id)
+        .await
+        .ok_or_else(|| worktree_unavailable(&params.session_id))?;
+    let outcome = engine
+        .commit(&params.message, params.allow_empty)
+        .await
+        .map_err(core_to_rpc)?;
+
+    let bus = state.manager.bus();
+    bus.publish(BusEvent::WorktreeChanged(WorktreeChangedParams {
+        session_id: params.session_id.clone(),
+        kind: "commit".to_string(),
+        affected_files: vec![],
+        generated_at: rfc3339_now(),
+    }));
+    bus.publish(BusEvent::WorktreeCommitCreated(
+        WorktreeCommitCreatedParams {
+            session_id: params.session_id.clone(),
+            commit_sha: outcome.commit_sha.clone(),
+            summary: outcome.summary.clone(),
+            files_changed: outcome.files_changed,
+            generated_at: rfc3339_now(),
+        },
+    ));
+
+    ok(WorktreeCommitResult {
+        commit_sha: outcome.commit_sha,
+        summary: outcome.summary,
+        files_changed: outcome.files_changed,
+    })
+}
+
+async fn handle_worktree_open_in_editor(
+    state: &ConnState,
+    params: WorktreeOpenInEditorParams,
+) -> Result<serde_json::Value, RpcError> {
+    let id = SessionId(params.session_id.clone());
+    let (engine, _base) = state
+        .manager
+        .diff_engine_for(&id)
+        .await
+        .ok_or_else(|| worktree_unavailable(&params.session_id))?;
+    let outcome = engine
+        .open_in_editor(
+            &params.path,
+            params.line,
+            params.column,
+            params.editor_override.as_deref(),
+        )
+        .await
+        .map_err(core_to_rpc)?;
+    ok(WorktreeOpenInEditorResult {
+        launched: outcome.launched,
+        command: outcome.command,
+        pid: outcome.pid,
+    })
+}
+
+fn worktree_unavailable(session_id: &str) -> RpcError {
+    let kind = la_proto::ErrorKind::WorktreeUnavailable;
+    RpcError::new(
+        kind.code(),
+        format!(
+            "worktree unavailable for session {session_id}: \
+             session has no `worktree_path` (or the id is unknown)"
+        ),
+    )
+}
+
+fn rfc3339_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Inline conversion so we don't add a new chrono dep just for one
+    // timestamp. Same approach the rest of the daemon uses.
+    let (year, month, day, hour, min, sec) = unix_to_ymd_hms(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+fn unix_to_ymd_hms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let total_days = (secs / 86_400) as i64;
+    let secs_of_day = secs % 86_400;
+    let hour = (secs_of_day / 3_600) as u32;
+    let min = ((secs_of_day % 3_600) / 60) as u32;
+    let sec = (secs_of_day % 60) as u32;
+    // Algorithm from Howard Hinnant's date library — civil_from_days.
+    let z = total_days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = (y + if m <= 2 { 1 } else { 0 }) as i32;
+    (y, m, d, hour, min, sec)
+}
+
+fn core_to_proto_file_entry(f: la_core::FileEntry) -> la_proto::methods::FileEntry {
+    use la_proto::methods::{FileKind as PK, FileStatus as PS, ModeChange};
+    let status = match f.status {
+        la_core::FileStatus::Added => PS::Added,
+        la_core::FileStatus::Modified => PS::Modified,
+        la_core::FileStatus::Deleted => PS::Deleted,
+        la_core::FileStatus::Renamed => PS::Renamed,
+        la_core::FileStatus::Copied => PS::Copied,
+        la_core::FileStatus::Untracked => PS::Untracked,
+        la_core::FileStatus::Conflicted => PS::Conflicted,
+    };
+    let kind = match f.kind {
+        la_core::FileKind::Text => PK::Text,
+        la_core::FileKind::Binary => PK::Binary,
+        la_core::FileKind::Submodule => PK::Submodule,
+        la_core::FileKind::Symlink => PK::Symlink,
+    };
+    la_proto::methods::FileEntry {
+        path: f.path,
+        old_path: f.old_path,
+        status,
+        kind,
+        staged_hunks: f.staged_hunks,
+        unstaged_hunks: f.unstaged_hunks,
+        size_bytes: f.size_bytes,
+        mode_change: f.mode_change.map(|(o, n)| ModeChange {
+            old_mode: o,
+            new_mode: n,
+        }),
+    }
+}
+
+fn core_to_proto_hunk(h: la_core::Hunk) -> la_proto::methods::Hunk {
+    use la_proto::methods::{DiffLine, DiffOrigin, LineRange};
+    let lines = h
+        .lines
+        .into_iter()
+        .map(|l| DiffLine {
+            origin: match l.origin {
+                la_core::LineOrigin::Context => DiffOrigin::Context,
+                la_core::LineOrigin::Add => DiffOrigin::Add,
+                la_core::LineOrigin::Delete => DiffOrigin::Delete,
+            },
+            content: l.content,
+            no_newline: l.no_newline,
+        })
+        .collect();
+    la_proto::methods::Hunk {
+        hunk_id: h.hunk_id,
+        staged: h.staged,
+        old_range: LineRange {
+            start: h.old_start,
+            count: h.old_count,
+        },
+        new_range: LineRange {
+            start: h.new_start,
+            count: h.new_count,
+        },
+        header: h.header,
+        lines,
     }
 }

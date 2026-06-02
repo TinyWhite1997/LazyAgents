@@ -18,6 +18,7 @@
 use la_proto::methods::EventTopic;
 use la_proto::notifications::{
     CronFiredParams, DaemonHealthParams, SessionGapParams, SessionStateParams,
+    WorktreeChangedParams, WorktreeCommitCreatedParams,
 };
 use tokio::sync::broadcast;
 
@@ -39,6 +40,10 @@ pub enum Topic {
     SessionGap,
     CronFired,
     DaemonHealth,
+    /// Per-worktree mutation pulse (M2.5 / WEK-28).
+    WorktreeChanged,
+    /// Per-worktree commit pulse (M2.5 / WEK-28).
+    WorktreeCommit,
 }
 
 impl Topic {
@@ -50,6 +55,8 @@ impl Topic {
             Topic::SessionGap => EventTopic::SessionGap,
             Topic::CronFired => EventTopic::CronFired,
             Topic::DaemonHealth => EventTopic::DaemonHealth,
+            Topic::WorktreeChanged => EventTopic::WorktreeChanged,
+            Topic::WorktreeCommit => EventTopic::WorktreeCommit,
         }
     }
 
@@ -62,6 +69,8 @@ impl Topic {
             EventTopic::SessionGap => Topic::SessionGap,
             EventTopic::CronFired => Topic::CronFired,
             EventTopic::DaemonHealth => Topic::DaemonHealth,
+            EventTopic::WorktreeChanged => Topic::WorktreeChanged,
+            EventTopic::WorktreeCommit => Topic::WorktreeCommit,
             EventTopic::SessionOutput => return None,
         })
     }
@@ -80,6 +89,8 @@ pub enum BusEvent {
     SessionGap(SessionGapParams),
     CronFired(CronFiredParams),
     DaemonHealth(DaemonHealthParams),
+    WorktreeChanged(WorktreeChangedParams),
+    WorktreeCommitCreated(WorktreeCommitCreatedParams),
 }
 
 impl BusEvent {
@@ -89,6 +100,8 @@ impl BusEvent {
             BusEvent::SessionGap(_) => Topic::SessionGap,
             BusEvent::CronFired(_) => Topic::CronFired,
             BusEvent::DaemonHealth(_) => Topic::DaemonHealth,
+            BusEvent::WorktreeChanged(_) => Topic::WorktreeChanged,
+            BusEvent::WorktreeCommitCreated(_) => Topic::WorktreeCommit,
         }
     }
 }

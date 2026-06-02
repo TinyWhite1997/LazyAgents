@@ -18,10 +18,12 @@ use std::path::{Path, PathBuf};
 use la_proto::methods::{
     AdaptersDiscover, EventsSubscribe, Initialize, Method, SessionsArchive, SessionsAttach,
     SessionsCreate, SessionsDelete, SessionsDetach, SessionsImport, SessionsList, SessionsReplay,
-    SessionsResize, SessionsSignal, SessionsWrite, Shutdown,
+    SessionsResize, SessionsSignal, SessionsWrite, Shutdown, WorktreeCommit, WorktreeDiff,
+    WorktreeDiscard, WorktreeOpenInEditor, WorktreeStage, WorktreeStatus, WorktreeUnstage,
 };
 use la_proto::notifications::{
     CronFired, DaemonHealth, NotificationMethod, SessionGap, SessionOutput, SessionStateNotice,
+    WorktreeChanged, WorktreeCommitCreated,
 };
 use schemars::schema::RootSchema;
 use schemars::schema_for;
@@ -49,6 +51,13 @@ fn main() {
     write_method::<SessionsImport>(&out_dir);
     write_method::<SessionsReplay>(&out_dir);
     write_method::<EventsSubscribe>(&out_dir);
+    write_method::<WorktreeStatus>(&out_dir);
+    write_method::<WorktreeDiff>(&out_dir);
+    write_method::<WorktreeStage>(&out_dir);
+    write_method::<WorktreeUnstage>(&out_dir);
+    write_method::<WorktreeDiscard>(&out_dir);
+    write_method::<WorktreeCommit>(&out_dir);
+    write_method::<WorktreeOpenInEditor>(&out_dir);
 
     // Notifications: only params have a schema.
     write_notification::<SessionOutput>(&out_dir);
@@ -56,6 +65,8 @@ fn main() {
     write_notification::<SessionGap>(&out_dir);
     write_notification::<CronFired>(&out_dir);
     write_notification::<DaemonHealth>(&out_dir);
+    write_notification::<WorktreeChanged>(&out_dir);
+    write_notification::<WorktreeCommitCreated>(&out_dir);
 
     println!("wrote schemas to {}", out_dir.display());
 }

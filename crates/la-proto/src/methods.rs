@@ -46,6 +46,13 @@ pub const METHOD_NAMES: &[&str] = &[
     SessionsImport::NAME,
     SessionsReplay::NAME,
     EventsSubscribe::NAME,
+    WorktreeStatus::NAME,
+    WorktreeDiff::NAME,
+    WorktreeStage::NAME,
+    WorktreeUnstage::NAME,
+    WorktreeDiscard::NAME,
+    WorktreeCommit::NAME,
+    WorktreeOpenInEditor::NAME,
 ];
 
 /// Trait carried by every RPC method type for static method-name lookup.
@@ -105,6 +112,12 @@ pub struct ServerCapabilities {
     /// True once worktree-based isolation is enabled (post-M1).
     #[serde(default)]
     pub worktree: bool,
+    /// True once the `worktree.*` diff review surface (status / diff /
+    /// stage / unstage / discard / commit / open_in_editor) is wired up.
+    /// Added in M2.5 (WEK-28). Old clients ignore the field; new clients
+    /// hide the diff view when the daemon does not advertise this bit.
+    #[serde(default)]
+    pub diff: bool,
     /// True once `events.subscribe` is honoured by the daemon (M1+).
     #[serde(default)]
     pub events: bool,
@@ -750,6 +763,15 @@ pub enum EventTopic {
     CronFired,
     /// Daemon health pulse for the status bar (`daemon.health`).
     DaemonHealth,
+    /// Per-worktree mutation notice (`worktree.changed`). Pushed after
+    /// `worktree.stage` / `worktree.unstage` / `worktree.discard` /
+    /// `worktree.commit` succeeds, so other clients attached to the same
+    /// session can invalidate cached diff state. M2.5 (WEK-28).
+    WorktreeChanged,
+    /// New commit landed on a session's worktree branch
+    /// (`worktree.commit_created`). Carries `commit_sha` so the TUI can
+    /// pop a toast. M2.5 (WEK-28).
+    WorktreeCommit,
 }
 
 /// Subscribe to the global event stream (architecture §3). Per-session
@@ -778,4 +800,418 @@ impl Method for EventsSubscribe {
     const NAME: &'static str = "events.subscribe";
     type Params = EventsSubscribeParams;
     type Result = EventsSubscribeResult;
+}
+
+// ===========================================================================
+// Worktree diff review surface (M2.5 / WEK-28).
+//
+// All methods below operate on a session that was created with
+// `worktree: true`. The daemon resolves `session_id` to that session's
+// `worktree_path`; if the field is `None` the call fails with
+// [`crate::error_codes::WORKTREE_UNAVAILABLE`].
+//
+// Naming and shape match the WEK-8 brief §3.2:
+// - `worktree.status` is a lightweight summary (no hunks). Used to render
+//   the file list for the diff view.
+// - `worktree.diff` returns one file at a time, lazy-loaded when the user
+//   expands a fold. Files > 5 MiB return a [`TruncationMarker`] instead of
+//   hunks so the TUI can suggest "open in editor".
+// - `worktree.stage` / `worktree.unstage` / `worktree.discard` are hunk-
+//   level. They take a list of [`hunk_id`](Hunk::hunk_id) fingerprints
+//   computed from a previous `worktree.diff`; ids whose backing hunk has
+//   shifted go to `rejected` with `reason = "stale"`. Discard requires
+//   `confirmed = true` as a wire-level guard so the TUI cannot fire it
+//   without going through the 二次确认 modal (PRD acceptance).
+// - `worktree.commit` shells `git commit -F -` inside the worktree; the
+//   message is read from stdin to avoid shell-quoting bugs. M2 explicitly
+//   does NOT expose `--amend`, `--signoff`, GPG flag toggling, or auto-
+//   push (brief §3.4).
+// - `worktree.open_in_editor` spawns the user's editor and returns as soon
+//   as `spawn()` succeeds. The TUI does NOT hand over the alternate
+//   screen — this is fire-and-forget by design.
+// ===========================================================================
+
+// ---------- common diff types ----------
+
+/// On-disk classification for a single file in a `worktree.status` result.
+/// Matches the standard git porcelain v2 vocabulary minus `Unknown`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+#[schemars(rename = "WorktreeFileStatus")]
+pub enum FileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Untracked,
+    /// Either side of an unresolved merge conflict.
+    Conflicted,
+}
+
+/// What kind of payload a file carries. The TUI renders binaries /
+/// submodules differently and refuses hunk-level operations on them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+#[schemars(rename = "WorktreeFileKind")]
+pub enum FileKind {
+    Text,
+    Binary,
+    Submodule,
+    Symlink,
+}
+
+/// Lightweight per-file summary returned by `worktree.status`. The
+/// `staged_hunks` / `unstaged_hunks` counters let the TUI render fold
+/// badges without a follow-up `worktree.diff` per file.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeFileEntry")]
+pub struct FileEntry {
+    /// Path relative to the worktree root, forward-slash separated.
+    pub path: String,
+    /// Source path when `status == Renamed | Copied`; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub status: FileStatus,
+    pub kind: FileKind,
+    /// Number of hunks currently in the index for this file. `0` for
+    /// purely unstaged changes.
+    pub staged_hunks: u32,
+    /// Number of hunks currently in the working tree but not the index.
+    pub unstaged_hunks: u32,
+    /// On-disk size of the working-tree copy (0 for `Deleted`). Lets the
+    /// TUI render a size hint and pre-empts loading the diff on huge
+    /// files.
+    pub size_bytes: u64,
+    /// `(old_mode, new_mode)` octal — only set when the file's mode bits
+    /// changed across the diff (chmod +x). `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_change: Option<ModeChange>,
+}
+
+/// Octal mode pair carried on [`FileEntry::mode_change`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeModeChange")]
+pub struct ModeChange {
+    pub old_mode: u32,
+    pub new_mode: u32,
+}
+
+/// `(start_line, line_count)` on either side of a hunk.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeLineRange")]
+pub struct LineRange {
+    pub start: u32,
+    pub count: u32,
+}
+
+/// Single line inside a hunk. Mirrors the unified-diff origin character.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[schemars(rename = "WorktreeDiffOrigin")]
+pub enum DiffOrigin {
+    /// Unchanged context line.
+    Context,
+    /// `+` line (added).
+    Add,
+    /// `-` line (removed).
+    Delete,
+}
+
+/// One line inside a [`Hunk`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeDiffLine")]
+pub struct DiffLine {
+    pub origin: DiffOrigin,
+    /// Line content without the leading origin byte and trailing `\n`.
+    pub content: String,
+    /// `true` when the file is missing the trailing newline at EOF and
+    /// git emitted `\ No newline at end of file` after this line.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_newline: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One hunk inside a `worktree.diff` response. `hunk_id` is a stable
+/// fingerprint (brief §3.3) so stage / unstage are idempotent under
+/// concurrent TUIs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeHunk")]
+pub struct Hunk {
+    /// Hex string, 16 chars. Computed as a sha256 of `path | old_range |
+    /// hunk_body_bytes`; see [`crate::methods::compute_hunk_id`] in
+    /// la-core. Stable across re-reads as long as the underlying bytes
+    /// don't shift.
+    pub hunk_id: String,
+    /// `true` when this hunk is in the index (returned by a `staged:
+    /// true` diff); `false` when it lives only in the working tree.
+    pub staged: bool,
+    pub old_range: LineRange,
+    pub new_range: LineRange,
+    /// Raw hunk header from git, e.g. `"@@ -12,7 +12,9 @@ fn foo()"`.
+    pub header: String,
+    pub lines: Vec<DiffLine>,
+}
+
+/// Returned in place of `hunks` when the file is too large or otherwise
+/// unsuitable for inline rendering.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeTruncationMarker")]
+pub struct TruncationMarker {
+    /// Machine-readable reason: `"too_large" | "binary" | "submodule"`.
+    pub reason: String,
+    pub size_bytes: u64,
+    /// Hint string surfaced to the TUI: `"open_in_editor"`.
+    pub hint: String,
+}
+
+/// Per-hunk rejection emitted by `worktree.stage` / `unstage` /
+/// `discard` when an id no longer matches a live hunk.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeHunkReject")]
+pub struct HunkReject {
+    pub hunk_id: String,
+    /// One of: `"stale"` (id no longer present), `"binary"` (per-hunk op
+    /// not supported on binary file), `"conflict"` (file has unresolved
+    /// merge markers), `"unknown"` (other classified failure).
+    pub reason: String,
+}
+
+// ---------- worktree.status ----------
+
+/// Equivalent of `git status --porcelain=v2 -z` + `git rev-parse HEAD`
+/// scoped to a single session's worktree. Returns lightweight per-file
+/// summaries; per-hunk content comes from `worktree.diff`. Brief §3.6
+/// budget: p95 ≤ 100 ms.
+pub enum WorktreeStatus {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeStatusParams")]
+pub struct WorktreeStatusParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeStatusResult")]
+pub struct WorktreeStatusResult {
+    /// Current branch of the worktree (`la/session-<short_sid>` for
+    /// daemon-provisioned worktrees).
+    pub branch: String,
+    /// Base branch the worktree was forked from when created. `None`
+    /// when the session row no longer carries that hint (e.g. archived).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Resolved tip SHA of the worktree's branch (40-char hex). Empty
+    /// string when the branch has no commits yet.
+    pub head: String,
+    /// Commits on `branch` not reachable from `base_branch`. `0` until
+    /// the first commit; cheap proxy for "anything to merge upstream".
+    pub ahead: u32,
+    /// Commits on `base_branch` not reachable from `branch`. `0` for
+    /// freshly-created worktrees.
+    pub behind: u32,
+    pub files: Vec<FileEntry>,
+    /// RFC3339 timestamp the snapshot was taken. Used by the TUI to
+    /// suppress redundant re-renders when nothing changed.
+    pub generated_at: String,
+}
+
+impl Method for WorktreeStatus {
+    const NAME: &'static str = "worktree.status";
+    type Params = WorktreeStatusParams;
+    type Result = WorktreeStatusResult;
+}
+
+// ---------- worktree.diff ----------
+
+/// Per-file unified diff. Returned lazily when the TUI expands a file
+/// fold (brief §3.3 — file-level lazy load is the only pagination layer;
+/// no streaming notifications).
+pub enum WorktreeDiff {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeDiffParams")]
+pub struct WorktreeDiffParams {
+    pub session_id: String,
+    /// File path relative to the worktree root, forward-slash separated.
+    pub path: String,
+    /// `true` ⇒ diff between index and HEAD; `false` ⇒ working tree
+    /// vs index.
+    pub staged: bool,
+    /// Number of context lines around each hunk. **M2.5 daemons
+    /// ignore this field and always reply with `-U3`** — the
+    /// `hunk_id` fingerprint is body-bytes-derived, and the mutation
+    /// path (`worktree.stage` / `unstage` / `discard`) re-reads with
+    /// `-U3` to recompute it. A different context here would silently
+    /// produce ids the same daemon could not later apply. The field
+    /// is kept on the wire for forward compat: a future minor that
+    /// teaches the mutation path to replay the request's context can
+    /// honour this without a schema bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_lines: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeDiffResult")]
+pub struct WorktreeDiffResult {
+    pub file: FileEntry,
+    /// Empty when [`truncated`](Self::truncated) is `Some`.
+    pub hunks: Vec<Hunk>,
+    /// Populated when the file exceeds the inline-diff cap (brief §3.6:
+    /// 5 MiB) or is binary / a submodule. `hunks` is then empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<TruncationMarker>,
+}
+
+impl Method for WorktreeDiff {
+    const NAME: &'static str = "worktree.diff";
+    type Params = WorktreeDiffParams;
+    type Result = WorktreeDiffResult;
+}
+
+// ---------- worktree.stage / unstage / discard ----------
+
+/// Shared params shape for stage / unstage / discard. `hunk_ids` are the
+/// fingerprints returned by an earlier `worktree.diff`. `confirmed` is
+/// only meaningful for `discard` — the daemon refuses unless it is
+/// `true` (PRD 撤销 二次确认 acceptance).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeMutationParams")]
+pub struct WorktreeMutationParams {
+    pub session_id: String,
+    pub hunk_ids: Vec<String>,
+    /// Required `true` for `worktree.discard`; ignored elsewhere.
+    /// Modelled as `bool` (not `Option`) so the wire form is explicit;
+    /// older clients that never set it default to `false` and therefore
+    /// fail discard with `WORKTREE_DISCARD_UNCONFIRMED`, which is the
+    /// safe outcome.
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+/// Shared response shape for stage / unstage / discard. `status` carries
+/// the post-mutation [`FileEntry`] for every file touched so the TUI can
+/// refresh badges in one round trip.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeMutationResult")]
+pub struct WorktreeMutationResult {
+    pub applied: Vec<String>,
+    pub rejected: Vec<HunkReject>,
+    /// `FileEntry` snapshot for every file referenced by the mutation
+    /// (whether or not its hunk(s) succeeded). Order matches `files` in
+    /// the most-recent `worktree.status`.
+    pub status: Vec<FileEntry>,
+}
+
+pub enum WorktreeStage {}
+impl Method for WorktreeStage {
+    const NAME: &'static str = "worktree.stage";
+    type Params = WorktreeMutationParams;
+    type Result = WorktreeMutationResult;
+}
+
+pub enum WorktreeUnstage {}
+impl Method for WorktreeUnstage {
+    const NAME: &'static str = "worktree.unstage";
+    type Params = WorktreeMutationParams;
+    type Result = WorktreeMutationResult;
+}
+
+pub enum WorktreeDiscard {}
+impl Method for WorktreeDiscard {
+    const NAME: &'static str = "worktree.discard";
+    type Params = WorktreeMutationParams;
+    type Result = WorktreeMutationResult;
+}
+
+// ---------- worktree.commit ----------
+
+/// Run `git commit -F -` inside the worktree, sending `message` on
+/// stdin. Inherits the repo's existing `commit.gpgsign`, signing key,
+/// commit template, and pre-commit hooks. M2 deliberately omits:
+/// `--amend`, `--signoff`, GPG flag toggling, `--no-verify`, auto-push.
+pub enum WorktreeCommit {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeCommitParams")]
+pub struct WorktreeCommitParams {
+    pub session_id: String,
+    pub message: String,
+    /// `true` ⇒ pass `--allow-empty`. Default `false`. Lets `git commit`
+    /// land a no-op commit (e.g. to record a checkpoint after a revert).
+    #[serde(default)]
+    pub allow_empty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeCommitResult")]
+pub struct WorktreeCommitResult {
+    /// 40-char hex SHA of the new commit.
+    pub commit_sha: String,
+    /// First line of the commit message (the "subject"). Echoed so the
+    /// TUI can render a toast without re-parsing the input.
+    pub summary: String,
+    /// Number of files in the commit. Pre-computed by `git
+    /// diff-tree --name-only HEAD~..HEAD | wc -l` so the TUI doesn't
+    /// need to round-trip.
+    pub files_changed: u32,
+}
+
+impl Method for WorktreeCommit {
+    const NAME: &'static str = "worktree.commit";
+    type Params = WorktreeCommitParams;
+    type Result = WorktreeCommitResult;
+}
+
+// ---------- worktree.open_in_editor ----------
+
+/// Spawn `$VISUAL` / `$EDITOR` (or the configured override) pointed at
+/// `path` inside the worktree. Returns as soon as the spawn syscall
+/// succeeds — does NOT wait for the editor to exit and does NOT hand
+/// over the alternate screen. Brief §3.2.
+pub enum WorktreeOpenInEditor {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeOpenInEditorParams")]
+pub struct WorktreeOpenInEditorParams {
+    pub session_id: String,
+    /// File path relative to the worktree root.
+    pub path: String,
+    /// 1-based line number; passed to editors that support `:line`
+    /// jump syntax. `None` ⇒ open at file head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// 1-based column; only honoured by editors that support
+    /// `:line:col` (VS Code, Cursor, Zed). Ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+    /// Override the daemon's editor resolution chain for this single
+    /// call. Plain command name (`"code"`, `"cursor"`, `"zed"`,
+    /// `"idea"`, …). `None` ⇒ use the daemon's standard chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_override: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "WorktreeOpenInEditorResult")]
+pub struct WorktreeOpenInEditorResult {
+    /// `true` ⇒ child process was spawned. The daemon makes no claim
+    /// about whether the editor actually opened the file.
+    pub launched: bool,
+    /// argv joined with spaces, redacted of environment values. Lets
+    /// the TUI show "launched: code --goto path:12" in a toast.
+    pub command: String,
+    /// Child PID when available (Unix). `None` when the platform does
+    /// not expose it or the daemon can't get it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+impl Method for WorktreeOpenInEditor {
+    const NAME: &'static str = "worktree.open_in_editor";
+    type Params = WorktreeOpenInEditorParams;
+    type Result = WorktreeOpenInEditorResult;
 }
