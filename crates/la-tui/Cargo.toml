@@ -29,6 +29,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tempfile = { workspace = true }
 
 [[bin]]
 name = "la"

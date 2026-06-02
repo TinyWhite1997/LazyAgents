@@ -1066,3 +1066,384 @@ async fn first_attach_with_none_resume_is_live_only_no_ring_replay() {
     daemon.handle.shutdown();
     let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
+
+// ----------------------------------------------------------------------
+// WEK-29 / M2.6: backend grey-state + error classification
+// ----------------------------------------------------------------------
+
+/// Probe-only adapter that never actually spawns — used to drive the
+/// pre-flight check in `sessions.create` and the per-backend payload on
+/// `daemon.health` without bringing a real CLI into the test loop.
+struct ProbeOnlyAdapter {
+    id: &'static str,
+    probe_result: la_adapter::ProbeResult,
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for ProbeOnlyAdapter {
+    fn descriptor(&self) -> la_adapter::AdapterDescriptor {
+        la_adapter::AdapterDescriptor {
+            id: self.id,
+            display_name: self.id,
+            default_program: self.id,
+            docs_url: "https://example.com/install",
+        }
+    }
+    async fn probe(&self) -> la_adapter::ProbeResult {
+        self.probe_result.clone()
+    }
+    fn spawn_spec(&self, _req: &SpawnRequest) -> Result<SpawnSpec, la_adapter::AdapterError> {
+        // Unreachable when the dispatcher's pre-flight does its job —
+        // any failure here would be the bug we're testing for.
+        panic!("spawn_spec invoked on ProbeOnlyAdapter for {}", self.id);
+    }
+    fn encode_user_input(&self, _text: &str) -> bytes::Bytes {
+        bytes::Bytes::new()
+    }
+}
+
+async fn bootstrap_daemon_with_adapters(
+    adapters: HashMap<String, Arc<dyn AgentAdapter>>,
+) -> TestDaemon {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let runtime_dir = tempdir.path().join("runtime");
+    let state_dir = tempdir.path().join("state");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let socket = runtime_dir.join("lad-1.sock");
+    let config = DaemonConfig {
+        state_dir,
+        socket_discovery: SocketDiscovery::with_override(socket.clone()),
+        adapters,
+        // Shrink the probe cadence so the test doesn't have to wait 60 s
+        // for the second pulse — the initial inline probe is enough for
+        // the assertions, but a short cadence keeps the loop honest if
+        // we ever extend the test to assert refresh behaviour.
+        probe_interval: Duration::from_millis(500),
+        ..DaemonConfig::default()
+    };
+    let daemon = Daemon::bind(config).await.expect("bind daemon");
+    let (handle, join) = daemon.spawn();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if connect(&Endpoint::uds(&socket)).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    TestDaemon {
+        socket,
+        handle,
+        join,
+        _tempdir: tempdir,
+    }
+}
+
+async fn recv_error_for(
+    conn: &mut la_ipc::Connection<tokio::net::UnixStream>,
+    expected_id: i64,
+) -> la_proto::jsonrpc::RpcError {
+    loop {
+        let msg = timeout(PROBE_TIMEOUT, conn.recv())
+            .await
+            .expect("recv timeout")
+            .expect("recv io")
+            .expect("eof");
+        if let Message::Response(resp) = msg {
+            assert_eq!(resp.id, RequestId::Num(expected_id));
+            return match resp.outcome {
+                la_proto::jsonrpc::ResponseOutcome::Error(e) => e,
+                la_proto::jsonrpc::ResponseOutcome::Result(v) => {
+                    panic!("expected RPC error, got result {v:?}")
+                }
+            };
+        }
+    }
+}
+
+#[tokio::test]
+async fn sessions_create_refuses_uninstalled_backend_with_business_code() {
+    // Two adapters: a `codex` stand-in that probes NotInstalled, and a
+    // healthy `shtest` so we can confirm only the offender is blocked.
+    let project = tempfile::tempdir().expect("project tmp");
+    let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+    adapters.insert(
+        "codex".to_string(),
+        Arc::new(ProbeOnlyAdapter {
+            id: "codex",
+            probe_result: la_adapter::ProbeResult::NotInstalled {
+                hint: "no `codex` on $PATH".into(),
+            },
+        }),
+    );
+    adapters.insert(
+        "shtest".to_string(),
+        Arc::new(ShellAdapter {
+            script: "echo ok; sleep 0.1".to_string(),
+        }),
+    );
+
+    let daemon = bootstrap_daemon_with_adapters(adapters).await;
+    let mut conn = client(&daemon.socket).await;
+
+    // Hit `codex` → expect -33101 ADAPTER_NOT_INSTALLED, NOT a generic
+    // INTERNAL_ERROR or a SpawnFailed surfacing later in the lifecycle.
+    let bad = SessionsCreateParams {
+        project_dir: project.path().to_string_lossy().to_string(),
+        backend: "codex".to_string(),
+        args: vec![],
+        prompt: None,
+        worktree: false,
+    };
+    send_request(&mut conn, 7, "sessions.create", &bad).await;
+    let err = recv_error_for(&mut conn, 7).await;
+    assert_eq!(
+        err.code,
+        la_proto::error_codes::ADAPTER_NOT_INSTALLED,
+        "wrong error code for an uninstalled backend: got {err:?}",
+    );
+    assert!(
+        err.message.contains("codex"),
+        "error message should reference the backend id, got {:?}",
+        err.message
+    );
+
+    // The healthy backend still spawns — pre-flight only short-circuits
+    // the offender.
+    let good = SessionsCreateParams {
+        project_dir: project.path().to_string_lossy().to_string(),
+        backend: "shtest".to_string(),
+        args: vec![],
+        prompt: None,
+        worktree: false,
+    };
+    send_request(&mut conn, 8, "sessions.create", &good).await;
+    let _: SessionsCreateResult =
+        serde_json::from_value(recv_response_for(&mut conn, 8).await).expect("decode shtest");
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+#[tokio::test]
+async fn sessions_create_refuses_unauthenticated_backend_with_business_code() {
+    let project = tempfile::tempdir().expect("project tmp");
+    let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+    adapters.insert(
+        "opencode".to_string(),
+        Arc::new(ProbeOnlyAdapter {
+            id: "opencode",
+            probe_result: la_adapter::ProbeResult::Unauthenticated {
+                docs_url: "https://example.com/login".into(),
+            },
+        }),
+    );
+    let daemon = bootstrap_daemon_with_adapters(adapters).await;
+    let mut conn = client(&daemon.socket).await;
+
+    let bad = SessionsCreateParams {
+        project_dir: project.path().to_string_lossy().to_string(),
+        backend: "opencode".to_string(),
+        args: vec![],
+        prompt: None,
+        worktree: false,
+    };
+    send_request(&mut conn, 9, "sessions.create", &bad).await;
+    let err = recv_error_for(&mut conn, 9).await;
+    assert_eq!(
+        err.code,
+        la_proto::error_codes::ADAPTER_UNAUTHENTICATED,
+        "wrong error code for an unauthenticated backend: got {err:?}",
+    );
+    assert!(
+        err.message.contains("login"),
+        "error message should surface the login doc link, got {:?}",
+        err.message
+    );
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+#[tokio::test]
+async fn daemon_health_carries_per_backend_status_payload() {
+    use la_proto::methods::{EventTopic, EventsSubscribeParams, EventsSubscribeResult};
+    use la_proto::notifications::{BackendHealthStatus, DaemonHealthParams};
+
+    let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+    adapters.insert(
+        "claude".to_string(),
+        Arc::new(ProbeOnlyAdapter {
+            id: "claude",
+            probe_result: la_adapter::ProbeResult::Available {
+                version: "2.1.158".into(),
+            },
+        }),
+    );
+    adapters.insert(
+        "codex".to_string(),
+        Arc::new(ProbeOnlyAdapter {
+            id: "codex",
+            probe_result: la_adapter::ProbeResult::NotInstalled {
+                hint: "not on PATH".into(),
+            },
+        }),
+    );
+    let daemon = bootstrap_daemon_with_adapters(adapters).await;
+    let mut conn = client(&daemon.socket).await;
+
+    // Subscribe to daemon.health and wait for at least one pulse.
+    let sub = EventsSubscribeParams {
+        topics: vec![EventTopic::DaemonHealth],
+    };
+    send_request(&mut conn, 1, "events.subscribe", &sub).await;
+    let _: EventsSubscribeResult =
+        serde_json::from_value(recv_response_for(&mut conn, 1).await).expect("decode sub");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got: Option<DaemonHealthParams> = None;
+    while tokio::time::Instant::now() < deadline && got.is_none() {
+        match tokio::time::timeout(Duration::from_millis(500), conn.recv()).await {
+            Ok(Ok(Some(Message::Notification(n)))) if n.method == "daemon.health" => {
+                let p: DaemonHealthParams =
+                    serde_json::from_value(n.params.expect("params")).expect("decode health");
+                if !p.backends.is_empty() {
+                    got = Some(p);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let health = got.expect("never received a daemon.health pulse with backends populated");
+    assert_eq!(health.backends.len(), 2);
+    let claude = health
+        .backends
+        .iter()
+        .find(|b| b.id == "claude")
+        .expect("claude not present");
+    assert_eq!(claude.status, BackendHealthStatus::Available);
+    assert_eq!(claude.version.as_deref(), Some("2.1.158"));
+    let codex = health
+        .backends
+        .iter()
+        .find(|b| b.id == "codex")
+        .expect("codex not present");
+    assert_eq!(codex.status, BackendHealthStatus::NotInstalled);
+    assert!(codex.reason.is_some());
+    assert!(codex.docs_url.is_some());
+    assert!(
+        health.errors_last_5m >= 1,
+        "at least one non-available backend should count as an error: {health:?}",
+    );
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+/// WEK-29 review fix: a TUI that subscribes *after* the daemon's
+/// initial probe round must NOT have to wait the full probe interval
+/// for a fresh `daemon.health` pulse — the daemon should immediately
+/// push the cached snapshot on the new connection. This pins that
+/// behaviour with a deliberately long probe interval so the snapshot
+/// replay (not the next ticker tick) is the only thing that could
+/// satisfy the assertion within the test deadline.
+#[tokio::test]
+async fn events_subscribe_immediately_pushes_cached_daemon_health_snapshot() {
+    use la_proto::methods::{EventTopic, EventsSubscribeParams, EventsSubscribeResult};
+    use la_proto::notifications::{BackendHealthStatus, DaemonHealthParams};
+
+    let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+    adapters.insert(
+        "codex".to_string(),
+        Arc::new(ProbeOnlyAdapter {
+            id: "codex",
+            probe_result: la_adapter::ProbeResult::NotInstalled {
+                hint: "not on PATH".into(),
+            },
+        }),
+    );
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let runtime_dir = tempdir.path().join("runtime");
+    let state_dir = tempdir.path().join("state");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let socket = runtime_dir.join("lad-1.sock");
+    let config = DaemonConfig {
+        state_dir,
+        socket_discovery: SocketDiscovery::with_override(socket.clone()),
+        adapters,
+        // 30 s ⇒ if the new-subscriber snapshot replay is missing, the
+        // wait-for-pulse loop below times out long before the next
+        // ticker tick. Tightly-bounded probe intervals (like the
+        // 500 ms used in the other WEK-29 tests) would mask the bug.
+        probe_interval: Duration::from_secs(30),
+        ..DaemonConfig::default()
+    };
+    let daemon = Daemon::bind(config).await.expect("bind daemon");
+    let (handle, join) = daemon.spawn();
+    let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < bootstrap_deadline {
+        if connect(&Endpoint::uds(&socket)).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Give the inline first probe a moment to populate the registry
+    // before we connect — otherwise we'd race the spawn-and-probe and
+    // could observe an empty cache, which is honestly a *different* bug
+    // than the one this test pins.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let test = async {
+        let mut conn = client(&socket).await;
+        let sub = EventsSubscribeParams {
+            topics: vec![EventTopic::DaemonHealth],
+        };
+        send_request(&mut conn, 1, "events.subscribe", &sub).await;
+        // The dispatcher responds to subscribe *then* pushes the
+        // snapshot; both messages may arrive in either order across
+        // the wire, so accept whichever shows first.
+        let mut got_ack = false;
+        let mut got_health: Option<DaemonHealthParams> = None;
+        // 2 s is well under the 30 s probe interval — anything we
+        // receive in this window came from the immediate snapshot
+        // replay, not the next probe tick.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !(got_ack && got_health.is_some()) {
+            match tokio::time::timeout(Duration::from_millis(500), conn.recv()).await {
+                Ok(Ok(Some(Message::Response(r)))) if r.id == RequestId::Num(1) => {
+                    let v = match r.outcome {
+                        la_proto::jsonrpc::ResponseOutcome::Result(v) => v,
+                        la_proto::jsonrpc::ResponseOutcome::Error(e) => {
+                            panic!("subscribe error: {e:?}")
+                        }
+                    };
+                    let _: EventsSubscribeResult =
+                        serde_json::from_value(v).expect("decode subscribe");
+                    got_ack = true;
+                }
+                Ok(Ok(Some(Message::Notification(n)))) if n.method == "daemon.health" => {
+                    let p: DaemonHealthParams =
+                        serde_json::from_value(n.params.expect("params")).expect("decode health");
+                    if !p.backends.is_empty() {
+                        got_health = Some(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(got_ack, "never received events.subscribe response");
+        let health =
+            got_health.expect("expected an immediate daemon.health snapshot after subscribe");
+        assert_eq!(health.backends.len(), 1, "single registered adapter");
+        assert_eq!(health.backends[0].id, "codex");
+        assert_eq!(health.backends[0].status, BackendHealthStatus::NotInstalled);
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(5), test).await;
+
+    handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), join).await;
+    outcome.expect("subscribe-snapshot test deadline exceeded");
+}

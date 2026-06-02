@@ -24,6 +24,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::dispatcher::{serve_connection, AdapterRegistry, ConnectionContext};
+use crate::health::{spawn_loop, HealthRegistry, ProbeLoopConfig, DEFAULT_PROBE_INTERVAL};
 use crate::paths::{ensure_runtime_dir, SocketDiscovery, SocketLocation};
 use crate::signals::DEFAULT_SHUTDOWN_DEADLINE;
 
@@ -58,6 +59,10 @@ pub struct DaemonConfig {
     pub server_version: String,
     /// Hard cap on the graceful shutdown sequence (architecture §6.4).
     pub shutdown_deadline: Duration,
+    /// How often the daemon re-probes each adapter and re-broadcasts
+    /// `daemon.health` (WEK-29 / M2.6). Tests typically shrink this so
+    /// they don't have to wait the full 60 s between rounds.
+    pub probe_interval: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -69,6 +74,7 @@ impl Default for DaemonConfig {
             manager: ManagerConfig::default(),
             server_version: crate::SERVER_VERSION.to_string(),
             shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
+            probe_interval: DEFAULT_PROBE_INTERVAL,
         }
     }
 }
@@ -82,6 +88,9 @@ pub struct Daemon {
     ctx: ConnectionContext,
     shutdown: Arc<Notify>,
     shutdown_deadline: Duration,
+    /// Health probe loop join handle — awaited on graceful shutdown so
+    /// the last SQLite upsert isn't truncated mid-write.
+    health_loop: Option<JoinHandle<()>>,
 }
 
 impl Daemon {
@@ -96,6 +105,7 @@ impl Daemon {
             manager: manager_config,
             server_version,
             shutdown_deadline,
+            probe_interval,
         } = config;
 
         let socket = socket_discovery.resolve();
@@ -140,12 +150,30 @@ impl Daemon {
         let listener = Listener::bind(&endpoint).await?;
 
         let shutdown = Arc::new(Notify::new());
+        let registry = AdapterRegistry::from_map(adapters);
+        let health_registry = HealthRegistry::new();
         let ctx = ConnectionContext {
             manager: manager.clone(),
-            adapters: AdapterRegistry::from_map(adapters),
+            adapters: registry.clone(),
+            health: health_registry.clone(),
             server_version,
             shutdown: shutdown.clone(),
         };
+
+        // Spawn the WEK-29 probe + broadcast loop. Holds clones of
+        // every component (registry / storage / bus / manager handle)
+        // and is awaited on graceful shutdown so the last upsert
+        // lands before the SQLite handle closes.
+        let probe_cfg = ProbeLoopConfig {
+            adapters: registry.pairs(),
+            registry: health_registry,
+            storage: manager.storage().clone(),
+            bus: manager.bus(),
+            manager: manager.clone(),
+            interval: probe_interval,
+            shutdown: shutdown.clone(),
+        };
+        let health_loop = Some(spawn_loop(probe_cfg));
 
         Ok(Self {
             manager,
@@ -154,6 +182,7 @@ impl Daemon {
             ctx,
             shutdown,
             shutdown_deadline,
+            health_loop,
         })
     }
 
@@ -188,6 +217,7 @@ impl Daemon {
             ctx,
             shutdown,
             shutdown_deadline,
+            health_loop,
         } = self;
 
         tracing::info!(socket = %socket.socket_path.display(), "lad listening");
@@ -305,6 +335,19 @@ impl Daemon {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Health probe loop watches the same `shutdown` Notify, but
+        // `Notify::notify_waiters` doesn't latch — a notification that
+        // fires before the loop reaches `notified().await` is lost. We
+        // therefore abort the join handle explicitly and then `.await`
+        // it so the task actually unwinds before we close storage.
+        // The loop has no critical mid-step state (every step is a
+        // single SQLite upsert + a broadcast publish), so abort-at-an-
+        // .await-point is graceful enough.
+        if let Some(h) = health_loop {
+            h.abort();
+            let _ = h.await;
         }
 
         manager.storage().close().await;

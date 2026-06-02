@@ -8,6 +8,7 @@
 //! crossterm I/O to those layers.
 
 use std::io;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use crossterm::event::{
@@ -25,10 +26,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 
-use crate::app::{App, AppOutcome, Focus, Modal, Tab};
+use crate::app::{App, AppMsg, AppOutcome, Focus, Modal, Tab};
+use crate::health_sub::HealthEvent;
 use crate::input::{translate, HitBoxes};
 use crate::key_hints::{format_hint_bar, HintRegistry};
-use crate::sidebar::{render_sidebar, Selection};
+use crate::sidebar::{render_backends, render_sidebar, Selection};
 use crate::source::SessionSource;
 use crate::status::render_status;
 use crate::tabs::render_tabs;
@@ -36,9 +38,20 @@ use crate::tabs::render_tabs;
 /// Run the TUI event loop until the user quits. Returns Ok(()) on normal
 /// exit; any I/O or terminal-setup error is propagated so the binary can
 /// log it and exit nonzero.
-pub fn run<S: SessionSource>(mut app: App<S>) -> io::Result<()> {
+pub fn run<S: SessionSource>(app: App<S>) -> io::Result<()> {
+    run_with_health(app, None)
+}
+
+/// Same as [`run`] but threads in an external [`HealthEvent`] channel —
+/// used by the `la` binary to forward `daemon.health` notifications
+/// from [`crate::health_sub::spawn`] into the App as `BackendsUpdate`
+/// messages.
+pub fn run_with_health<S: SessionSource>(
+    mut app: App<S>,
+    health_rx: Option<Receiver<HealthEvent>>,
+) -> io::Result<()> {
     let mut terminal = setup_terminal()?;
-    let res = event_loop(&mut terminal, &mut app);
+    let res = event_loop(&mut terminal, &mut app, health_rx);
     restore_terminal(&mut terminal)?;
     res
 }
@@ -70,6 +83,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
 fn event_loop<S: SessionSource>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<S>,
+    health_rx: Option<Receiver<HealthEvent>>,
 ) -> io::Result<()> {
     let mut hit = HitBoxes {
         tabs: Vec::new(),
@@ -81,9 +95,16 @@ fn event_loop<S: SessionSource>(
         terminal.draw(|frame| {
             hit = draw(frame, app);
         })?;
-        // Poll so we can refresh the screen periodically once the daemon
-        // is wired to push status updates. For now, 250ms is a placeholder
-        // — most input still arrives event-driven.
+        // Drain any pending health events between renders so a fresh
+        // `daemon.health` snapshot is reflected on the very next frame.
+        if let Some(rx) = health_rx.as_ref() {
+            while let Ok(HealthEvent::Backends(badges)) = rx.try_recv() {
+                let _ = app.handle(AppMsg::BackendsUpdate(badges));
+            }
+        }
+        // Poll so the screen refreshes periodically; the 250ms cap also
+        // bounds how long a backends snapshot can sit in the channel
+        // before the next frame consumes it.
         if !crossterm::event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -137,9 +158,30 @@ pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
 
     match app.tab {
         Tab::Sessions => {
+            // Split the left column: Backends panel on top, Sessions list
+            // below. The Backends panel is sized to fit the current
+            // snapshot (1 short header line per available backend, up to
+            // 3 lines per grey-stated one). Caps at 12 rows so a fleet
+            // of unhealthy backends doesn't crowd the session list.
+            let backends_rows = if app.backends.is_empty() {
+                3
+            } else {
+                let raw: usize = app
+                    .backends
+                    .iter()
+                    .map(|b| 1 + b.reason.is_some() as usize + b.docs_url.is_some() as usize)
+                    .sum();
+                // +2 for the panel border (top + bottom).
+                (raw + 2).clamp(4, 12)
+            };
+            let sidebar_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(backends_rows as u16), Constraint::Min(3)])
+                .split(sidebar_area);
+            render_backends(frame, sidebar_split[0], &app.backends);
             render_sidebar(
                 frame,
-                sidebar_area,
+                sidebar_split[1],
                 &app.sidebar,
                 app.focus == Focus::Sidebar,
             );

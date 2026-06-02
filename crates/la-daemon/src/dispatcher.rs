@@ -50,6 +50,12 @@ use tokio::task::JoinSet;
 pub struct ConnectionContext {
     pub manager: SessionManager,
     pub adapters: AdapterRegistry,
+    /// Cached probe results per backend, refreshed by the daemon's
+    /// background `daemon.health` loop (`WEK-29`). Connection handlers
+    /// read this to refuse `sessions.create` against an unavailable
+    /// backend with the right `-33101` / `-33102` code before the call
+    /// even reaches `la-core`.
+    pub health: crate::health::HealthRegistry,
     pub server_version: String,
     /// When `notified()`, every active connection should drop into a
     /// graceful close: stop reading new requests, finish what's in flight,
@@ -80,6 +86,16 @@ impl AdapterRegistry {
     /// initialize handshake (`ServerCapabilities.adapters`).
     pub fn names(&self) -> Vec<String> {
         self.inner.keys().cloned().collect()
+    }
+
+    /// `(id, adapter)` pairs — used by the health probe loop in
+    /// `WEK-29` so it can run `adapter.probe()` against every
+    /// registered backend without re-wrapping the inner `HashMap`.
+    pub fn pairs(&self) -> Vec<(String, Arc<dyn AgentAdapter>)> {
+        self.inner
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 }
 
@@ -372,7 +388,7 @@ async fn dispatch(
         )),
         "events.subscribe" => {
             let params: EventsSubscribeParams = decode_params(req)?;
-            handle_events_subscribe(state, params).await
+            handle_events_subscribe(state, ctx, params).await
         }
         SessionsList::NAME => {
             let params: SessionsListParams = decode_params(req)?;
@@ -427,31 +443,70 @@ fn ok<R: serde::Serialize>(r: R) -> Result<serde_json::Value, RpcError> {
 
 async fn handle_events_subscribe(
     state: &ConnState,
+    ctx: &ConnectionContext,
     params: EventsSubscribeParams,
 ) -> Result<serde_json::Value, RpcError> {
-    let mut topics = state.topics.write().await;
     let mut effective = Vec::new();
-    for t in &params.topics {
-        match t {
-            EventTopic::SessionState => {
-                topics.session_state = true;
-                effective.push(*t);
-            }
-            EventTopic::DaemonHealth => {
-                topics.daemon_health = true;
-                effective.push(*t);
-            }
-            EventTopic::SessionOutput | EventTopic::SessionGap => {
-                // Per-session topics are delivered through sessions.attach,
-                // not the global bus; ack but don't echo them back so
-                // clients don't think they have a global subscription.
-            }
-            EventTopic::CronFired => {
-                // Cron isn't implemented until M3; quietly omit from the
-                // effective set (architecture §3 documented behaviour).
+    let mut send_health_snapshot = false;
+    {
+        let mut topics = state.topics.write().await;
+        for t in &params.topics {
+            match t {
+                EventTopic::SessionState => {
+                    topics.session_state = true;
+                    effective.push(*t);
+                }
+                EventTopic::DaemonHealth => {
+                    // Only replay the snapshot on a fresh subscribe. A
+                    // re-subscribe (already flagged true) is a no-op so we
+                    // don't double-push.
+                    if !topics.daemon_health {
+                        send_health_snapshot = true;
+                    }
+                    topics.daemon_health = true;
+                    effective.push(*t);
+                }
+                EventTopic::SessionOutput | EventTopic::SessionGap => {
+                    // Per-session topics are delivered through sessions.attach,
+                    // not the global bus; ack but don't echo them back so
+                    // clients don't think they have a global subscription.
+                }
+                EventTopic::CronFired => {
+                    // Cron isn't implemented until M3; quietly omit from the
+                    // effective set (architecture §3 documented behaviour).
+                }
             }
         }
     }
+
+    // WEK-29 review fix: the broadcast bus does NOT replay messages sent
+    // before this connection subscribed, so a TUI that connects after the
+    // daemon's initial probe would otherwise wait up to
+    // `DEFAULT_PROBE_INTERVAL` (60 s) for the next pulse before grey-
+    // stating an uninstalled backend. Push the cached snapshot directly
+    // on this connection so the very next `daemon.health` notification
+    // the client sees carries the current backends.
+    if send_health_snapshot {
+        let backends = ctx.health.snapshot().await;
+        let params = la_proto::notifications::DaemonHealthParams {
+            queue_depth: 0,
+            running: ctx.manager.active_count().await as u32,
+            errors_last_5m: backends
+                .iter()
+                .filter(|b| b.status != la_proto::notifications::BackendHealthStatus::Available)
+                .count() as u32,
+            backends,
+        };
+        match Notification::new(DaemonHealth::NAME, &params) {
+            Ok(n) => {
+                if let Err(err) = state.send.send(&Message::Notification(n)).await {
+                    tracing::debug!(%err, "initial daemon.health send failed");
+                }
+            }
+            Err(err) => tracing::warn!(%err, "encode initial daemon.health failed"),
+        }
+    }
+
     ok(EventsSubscribeResult { topics: effective })
 }
 
@@ -513,6 +568,19 @@ async fn handle_sessions_create(
             format!("no adapter registered for backend {:?}", params.backend),
         )
     })?;
+
+    // WEK-29 pre-flight: if the latest cached probe says the backend
+    // isn't installed or the user isn't authenticated, fail fast with
+    // the right business code instead of letting the spawn explode with
+    // a generic `AdapterSpawnFailed`. The TUI uses these codes to keep
+    // its sidebar entry grey-stated rather than offering a `create`
+    // entry point — so the dispatcher must not silently flip to "kind
+    // of okay" when health says otherwise.
+    if let Some(probe) = ctx.health.probe_for(&params.backend).await {
+        if crate::health::is_blocking(&probe) {
+            return Err(probe_to_rpc(&params.backend, &probe));
+        }
+    }
 
     let project_id = ensure_project(state, &params.project_dir).await?;
 
@@ -685,6 +753,35 @@ fn core_to_rpc(err: CoreError) -> RpcError {
     // so the JSON-RPC body matches what la-core wrote into the variant.
     let message = err.to_string();
     RpcError::new(err.kind().code(), message)
+}
+
+/// Map a cached [`la_adapter::ProbeResult`] onto the right business-code
+/// RPC error for the `sessions.create` pre-flight check.
+///
+/// Only the variants for which `health::is_blocking` returns `true`
+/// reach here in production; the unreachable arms are written defensively
+/// so a future refactor (e.g. blocking on `Error` too) won't silently
+/// degrade to `INTERNAL_ERROR`.
+fn probe_to_rpc(backend: &str, probe: &la_adapter::ProbeResult) -> RpcError {
+    use la_adapter::ProbeResult as P;
+    match probe {
+        P::NotInstalled { hint } => RpcError::new(
+            error_codes::ADAPTER_NOT_INSTALLED,
+            format!("{backend}: {hint}"),
+        ),
+        P::Unauthenticated { docs_url } => RpcError::new(
+            error_codes::ADAPTER_UNAUTHENTICATED,
+            format!("{backend}: not authenticated; see {docs_url}"),
+        ),
+        P::Error { detail } => RpcError::new(
+            error_codes::ADAPTER_PROTOCOL_DRIFT,
+            format!("{backend}: {detail}"),
+        ),
+        P::Available { .. } => RpcError::new(
+            error_codes::INTERNAL_ERROR,
+            format!("{backend}: probe_to_rpc called for Available — bug"),
+        ),
+    }
 }
 
 fn storage_to_rpc(err: la_storage::StorageError) -> RpcError {

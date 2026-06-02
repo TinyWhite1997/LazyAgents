@@ -25,6 +25,107 @@
       "type": "integer",
       "format": "uint32",
       "minimum": 0.0
+    },
+    "backends": {
+      "description": "Per-backend probe snapshot — additive in M2.6 (`WEK-29`). Clients that don't understand the field simply ignore it; daemons that never probe leave it empty.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/BackendHealth"
+      }
+    }
+  },
+  "definitions": {
+    "BackendHealth": {
+      "description": "Probe state for a single registered adapter, broadcast as part of `daemon.health` so the TUI can render grey-state sidebar entries (architecture §4.3 / `WEK-29`).\n\nThe `status` enum mirrors the variants of [`crate::methods::SessionState`] in spirit but is independent: one is a *session* lifecycle, the other is a *backend* installation state. The two never collapse.",
+      "type": "object",
+      "required": [
+        "display_name",
+        "id",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "description": "Stable adapter id, e.g. `\"claude\"` / `\"codex\"` / `\"opencode\"`.",
+          "type": "string"
+        },
+        "display_name": {
+          "description": "Human-readable label suitable for sidebar rendering.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Probe outcome (`available` / `not_installed` / `unauthenticated` / `protocol_drift` / `error`).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/BackendHealthStatus"
+            }
+          ]
+        },
+        "version": {
+          "description": "Parsed CLI version when the last probe was `Available`; otherwise `None`. Required by `WEK-29` 验收: \"日志包含 backend version\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "One-line reason suitable for UI surface — never sensitive (no stderr dumps, no command lines). For `Available` ⇒ `None`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "docs_url": {
+          "description": "Best-effort docs link for the failure (login page for `Unauthenticated`, install page for `NotInstalled`, upgrade page for `ProtocolDrift`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_probed_at": {
+          "description": "RFC3339 timestamp of the most recent probe attempt. Empty on the first pulse before any probe has run.",
+          "type": "string"
+        }
+      }
+    },
+    "BackendHealthStatus": {
+      "description": "Wire representation of a backend's classified probe state.",
+      "oneOf": [
+        {
+          "description": "Installed, runs, authenticated, version parsed.",
+          "type": "string",
+          "enum": [
+            "available"
+          ]
+        },
+        {
+          "description": "Executable not on `$PATH` (or at the configured override path).",
+          "type": "string",
+          "enum": [
+            "not_installed"
+          ]
+        },
+        {
+          "description": "Executable exists but the user has not logged in.",
+          "type": "string",
+          "enum": [
+            "unauthenticated"
+          ]
+        },
+        {
+          "description": "Backend version returned output the adapter could not parse — usually means the CLI shipped a breaking change and the adapter needs an upgrade.",
+          "type": "string",
+          "enum": [
+            "protocol_drift"
+          ]
+        },
+        {
+          "description": "Anything else (timeout, permission denied, transport failure).",
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        }
+      ]
     }
   }
 }

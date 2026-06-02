@@ -14,6 +14,7 @@
 //! by [`crate::input`]). This decoupling makes the App testable without
 //! a terminal.
 
+use crate::model::BackendBadge;
 use crate::sidebar::{Selection, SidebarState};
 use crate::source::SessionSource;
 use crate::status::Status;
@@ -106,6 +107,10 @@ pub enum AppMsg {
     /// Replace the sidebar snapshot (called whenever the source's data
     /// changes — initial load, archive event, etc.).
     RefreshSessions,
+    /// Replace the backend health snapshot (driven by `daemon.health`
+    /// notifications — WEK-29). The TUI consumes this to grey-state
+    /// unavailable backends in the dedicated Backends panel.
+    BackendsUpdate(Vec<BackendBadge>),
 }
 
 /// What the runner should do after a message has been handled.
@@ -126,6 +131,11 @@ pub struct App<S: SessionSource> {
     pub focus: Focus,
     pub modal: Option<Modal>,
     pub status: Status,
+    /// Latest snapshot of every registered backend's probe state
+    /// (architecture §4.3 / WEK-29). Empty until the first
+    /// `daemon.health` arrives. The rendering layer reads it to display
+    /// the Backends panel above the project list.
+    pub backends: Vec<BackendBadge>,
 }
 
 impl<S: SessionSource> App<S> {
@@ -145,6 +155,7 @@ impl<S: SessionSource> App<S> {
                 next_cron_label: None,
                 right_context: String::new(),
             },
+            backends: Vec::new(),
         };
         app.refresh_sessions();
         app
@@ -206,6 +217,14 @@ impl<S: SessionSource> App<S> {
             }
             AppMsg::StatusUpdate(s) => self.status = s,
             AppMsg::RefreshSessions => self.refresh_sessions(),
+            AppMsg::BackendsUpdate(b) => {
+                // Sort by id so the rendered order is stable across
+                // pulses (the daemon already sorts, but a paranoid TUI
+                // can't hurt).
+                let mut sorted = b;
+                sorted.sort_by(|a, b| a.id.cmp(&b.id));
+                self.backends = sorted;
+            }
         }
         AppOutcome::Continue
     }

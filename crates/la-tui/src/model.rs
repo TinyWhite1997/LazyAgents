@@ -10,6 +10,7 @@
 //! and is wire-agnostic.
 
 use la_proto::methods::{SessionState, SessionSummary};
+use la_proto::notifications::{BackendHealth as WireBackendHealth, BackendHealthStatus};
 
 /// Backend identifier as it should appear in the sidebar badge.
 ///
@@ -193,6 +194,75 @@ impl ProjectGroup {
     pub const ARCHIVED_ID: &'static str = "__archived__";
 }
 
+/// UI-side projection of a [`la_proto::notifications::BackendHealth`].
+///
+/// The wire type carries everything the TUI needs, but it speaks JSON-RPC
+/// snake_case and has fields the sidebar doesn't render (`last_probed_at`
+/// for now). Keeping a slim UI-side shape lets the sidebar stay agnostic
+/// to the protocol version and lets tests build fixtures without quoting
+/// strings into a JSON envelope first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendBadge {
+    /// Stable adapter id (`"claude"` / `"codex"` / `"opencode"`).
+    pub id: String,
+    /// Human-readable label shown in the sidebar header.
+    pub display_name: String,
+    pub status: BackendHealthStatus,
+    /// One-line reason; non-empty only for non-Available states.
+    pub reason: Option<String>,
+    /// Docs / install / login link for the user to follow when the
+    /// backend is grey-stated. None for Available.
+    pub docs_url: Option<String>,
+    /// Version string for Available backends (e.g. `"2.1.158"`).
+    pub version: Option<String>,
+}
+
+impl BackendBadge {
+    /// Bridge from the wire payload pushed via `daemon.health`.
+    pub fn from_wire(w: &WireBackendHealth) -> Self {
+        Self {
+            id: w.id.clone(),
+            display_name: w.display_name.clone(),
+            status: w.status,
+            reason: w.reason.clone(),
+            docs_url: w.docs_url.clone(),
+            version: w.version.clone(),
+        }
+    }
+
+    /// `true` when the backend cannot accept a fresh `sessions.create`
+    /// because the CLI is missing or the user is not authenticated. The
+    /// sidebar uses this to dim the badge and the surrounding hint bar
+    /// suppresses the `n` (new session) entry for it.
+    pub fn is_unavailable(&self) -> bool {
+        !matches!(self.status, BackendHealthStatus::Available)
+    }
+
+    /// Glyph shown next to the backend name. Each variant has its own
+    /// dedicated character so screenshots of the sidebar stay greppable.
+    pub fn glyph(&self) -> &'static str {
+        match self.status {
+            BackendHealthStatus::Available => "●",
+            BackendHealthStatus::NotInstalled => "○",
+            BackendHealthStatus::Unauthenticated => "◐",
+            BackendHealthStatus::ProtocolDrift => "▲",
+            BackendHealthStatus::Error => "✗",
+        }
+    }
+
+    /// Short label suitable for inline display (`"available"` /
+    /// `"not installed"` / etc.).
+    pub fn status_label(&self) -> &'static str {
+        match self.status {
+            BackendHealthStatus::Available => "available",
+            BackendHealthStatus::NotInstalled => "not installed",
+            BackendHealthStatus::Unauthenticated => "not logged in",
+            BackendHealthStatus::ProtocolDrift => "protocol drift",
+            BackendHealthStatus::Error => "error",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +319,61 @@ mod tests {
             archived: false,
         };
         assert_eq!(s.display_title(), "Fix login bug");
+    }
+
+    #[test]
+    fn backend_badge_from_wire_carries_status_and_links() {
+        let wire = WireBackendHealth {
+            id: "codex".into(),
+            display_name: "Codex CLI".into(),
+            status: BackendHealthStatus::NotInstalled,
+            version: None,
+            reason: Some("`codex` not on $PATH".into()),
+            docs_url: Some("https://example.com/install/codex".into()),
+            last_probed_at: "2026-06-02T00:00:00Z".into(),
+        };
+        let badge = BackendBadge::from_wire(&wire);
+        assert!(badge.is_unavailable());
+        assert_eq!(badge.glyph(), "○");
+        assert_eq!(badge.status_label(), "not installed");
+        assert_eq!(badge.reason.as_deref(), Some("`codex` not on $PATH"));
+        assert_eq!(
+            badge.docs_url.as_deref(),
+            Some("https://example.com/install/codex")
+        );
+    }
+
+    #[test]
+    fn backend_badge_available_is_not_grey_state() {
+        let badge = BackendBadge::from_wire(&WireBackendHealth {
+            id: "claude".into(),
+            display_name: "Claude Code".into(),
+            status: BackendHealthStatus::Available,
+            version: Some("2.1.158".into()),
+            reason: None,
+            docs_url: None,
+            last_probed_at: "2026-06-02T00:00:00Z".into(),
+        });
+        assert!(!badge.is_unavailable());
+        assert_eq!(badge.glyph(), "●");
+        assert_eq!(badge.version.as_deref(), Some("2.1.158"));
+    }
+
+    #[test]
+    fn backend_badge_protocol_drift_surfaces_upgrade_hint() {
+        let badge = BackendBadge::from_wire(&WireBackendHealth {
+            id: "opencode".into(),
+            display_name: "OpenCode".into(),
+            status: BackendHealthStatus::ProtocolDrift,
+            version: Some("9.9.9-future".into()),
+            reason: Some("could not parse version line".into()),
+            docs_url: Some("https://opencode.ai/docs/".into()),
+            last_probed_at: "2026-06-02T00:00:00Z".into(),
+        });
+        assert!(badge.is_unavailable());
+        // ProtocolDrift is distinct from NotInstalled / Unauthenticated
+        // so screenshots stay greppable — pin the glyph here.
+        assert_eq!(badge.glyph(), "▲");
+        assert_eq!(badge.status_label(), "protocol drift");
     }
 }
