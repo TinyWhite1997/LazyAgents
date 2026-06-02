@@ -3,6 +3,26 @@
 //! See module docs in `lib.rs` for the architectural picture; this file is
 //! the actual `tokio::select!` loop, the clock-skew detector, and the
 //! [`SchedulerHandle`] callers use to drive it.
+//!
+//! ## §5.3 contract unification
+//!
+//! The architecture spec's catch-up policy applies *uniformly* to any path
+//! where the loop discovers missed wall-time fires, not just daemon restart.
+//! Three paths can produce a gap between `last_fired_at` and "now":
+//!
+//! 1. **Daemon restart** — `install_entry` is called with `last_fired_at`
+//!    persisted from the prior session. Always exercises catch-up.
+//! 2. **Clock skew (laptop suspend, NTP step)** — `recompute_all_after_skew`
+//!    runs after the 60-s skew tick trips; every entry whose `last_fired_at`
+//!    is now in the past must replay its policy across the gap.
+//! 3. **Steady-state starvation** — `fire_due_entries` is woken late because
+//!    some other entry held the lock, or the OS scheduler ran us behind.
+//!    Anything strictly between `top.fire_at` and `now` is "missed" and
+//!    must be processed by the entry's policy, not silently dropped.
+//!
+//! All three funnel through [`Scheduler::process_missed_fires`] so the same
+//! `apply_catchup` resolver decides skip/coalesce/replay and the same
+//! `catchup_degraded` flag fires when `MAX_CATCHUP` is breached.
 
 use std::sync::Arc;
 
@@ -129,6 +149,35 @@ pub struct Scheduler {
     cmd_rx: mpsc::Receiver<Command>,
     fire_tx: mpsc::Sender<FireEvent>,
     diag_tx: mpsc::Sender<SchedulerEvent>,
+}
+
+/// Inputs to [`Scheduler::process_missed_fires`]. Packed into a struct so the
+/// three caller sites (install / skew-recompute / fire-starvation) share one
+/// signature and the code-review diff is trivial when we add a field.
+struct MissedFireInputs<'a> {
+    id: &'a str,
+    spec: &'a CronSpec,
+    mode: CatchupMode,
+    min_replay_interval: ChronoDuration,
+    /// The high-water mark to walk forward from (exclusive). Catch-up
+    /// enumerates `(last_fired_at, end]`.
+    last_fired_at: DateTime<Utc>,
+    /// The "now" boundary fires are walked to (inclusive). Always wall time.
+    end: DateTime<Utc>,
+    /// Wall time the fires are being emitted on (becomes `FireEvent.fired_at`).
+    fired_at: DateTime<Utc>,
+}
+
+/// Snapshot row taken under the heap lock by `recompute_all_after_skew` so
+/// the per-entry catch-up loop can run without holding the lock. Named
+/// instead of a tuple to keep `Vec<…>` readable and silence clippy's
+/// `type_complexity` lint.
+struct SkewWorkItem {
+    id: CronId,
+    spec: CronSpec,
+    mode: CatchupMode,
+    throttle: ChronoDuration,
+    last_fired: Option<DateTime<Utc>>,
 }
 
 impl Scheduler {
@@ -288,27 +337,18 @@ impl Scheduler {
         last_fired_at: Option<DateTime<Utc>>,
     ) -> Result<u64, Error> {
         let now = self.clock.wall_now();
-        // Drain any missed fires into the event stream synchronously — these
-        // come from the daemon restart path, so we want them in the channel
-        // before the first natural fire.
         if let Some(last) = last_fired_at {
             if last < now {
-                let missed = spec.fires_between(last, now, MISSED_FIRES_PROBE_CAP);
-                if !missed.is_empty() {
-                    let outcome = apply_catchup(&missed, catchup_mode, min_replay_interval)?;
-                    for fire in outcome.fires {
-                        let event = FireEvent {
-                            cron_id: id.clone(),
-                            scheduled_at: fire.scheduled_at,
-                            fired_at: now,
-                            coalesced_count: fire.coalesced_count,
-                            catchup_degraded: outcome.degraded_to_skip,
-                        };
-                        if self.fire_tx.send(event).await.is_err() {
-                            return Err(Error::Invariant("fire channel closed"));
-                        }
-                    }
-                }
+                self.process_missed_fires(MissedFireInputs {
+                    id: &id,
+                    spec: &spec,
+                    mode: catchup_mode,
+                    min_replay_interval,
+                    last_fired_at: last,
+                    end: now,
+                    fired_at: now,
+                })
+                .await?;
             }
         }
         let next = spec.next_after(now);
@@ -324,8 +364,11 @@ impl Scheduler {
         Ok(version)
     }
 
-    /// Emit every entry whose `fire_at <= now`, recompute their next fire,
-    /// and reinsert. Called only from the timer arm of the select.
+    /// Emit every entry whose `fire_at <= now`. If the loop was starved (so
+    /// `now > top.fire_at` by more than one tick), the gap between
+    /// `entry.last_fired_at` (or `top.fire_at`) and `now` is handed to the
+    /// per-entry catch-up policy before recomputing the next fire — the
+    /// "steady-state starvation" path from the module docs.
     async fn fire_due_entries(&self, now: DateTime<Utc>) {
         loop {
             // Pop one due entry at a time so each fire becomes its own event
@@ -342,19 +385,25 @@ impl Scheduler {
             };
             let Some(top) = popped else { return };
 
-            // Need to grab the spec + policy to compute the next fire.
-            let (spec, mode, throttle) = {
+            // Snapshot the policy + spec + watermark under the lock; we drop
+            // the guard before pushing events so the loop stays responsive.
+            let (spec, mode, throttle, last_fired_at) = {
                 let guard = self.table.lock().await;
                 let Some(e) = guard.get(&top.id) else {
                     // Deleted between peek and lookup; skip.
                     continue;
                 };
-                (e.spec.clone(), e.catchup_mode, e.min_replay_interval)
+                (
+                    e.spec.clone(),
+                    e.catchup_mode,
+                    e.min_replay_interval,
+                    e.last_fired_at,
+                )
             };
 
-            // For the natural fire we always emit one event; if multiple
-            // fires are already past (e.g. we were starved by a long lock),
-            // we let the next loop iteration pull them too.
+            // Always emit the fire we popped. `coalesced_count = 1` because
+            // any merging happens inside `process_missed_fires` over the
+            // *gap*, not on the top entry itself.
             let event = FireEvent {
                 cron_id: top.id.clone(),
                 scheduled_at: top.fire_at,
@@ -366,26 +415,143 @@ impl Scheduler {
                 warn!("fire channel closed; dropping further events");
                 return;
             }
-            // Compute the *next* fire from now (not from top.fire_at): if we
-            // were late, every fire strictly between top.fire_at and now is
-            // covered by the policy that handled the previous starvation.
-            // For the steady-state path this is identical to `after(top.fire_at)`.
+
+            // Starvation gap: process anything strictly between the entry we
+            // just fired and `now`. The watermark we walk forward from is
+            // `top.fire_at` itself, NOT `last_fired_at`, because `top` has
+            // now been emitted — `fires_between` is exclusive on the lower
+            // bound so this naturally skips it.
+            //
+            // For the steady-state path (popped entry's fire_at == now)
+            // `fires_between(top.fire_at, now)` is empty and this is free.
+            let _ = last_fired_at; // future use: cross-check with persisted high-water.
+            if top.fire_at < now {
+                if let Err(e) = self
+                    .process_missed_fires(MissedFireInputs {
+                        id: &top.id,
+                        spec: &spec,
+                        mode,
+                        min_replay_interval: throttle,
+                        last_fired_at: top.fire_at,
+                        end: now,
+                        fired_at: now,
+                    })
+                    .await
+                {
+                    warn!(error = %e, cron_id = %top.id, "starvation catch-up failed");
+                    return;
+                }
+            }
+
+            // Next natural fire is computed from `now`: anything between
+            // `top.fire_at` and `now` has already been resolved above, so
+            // walking from `top.fire_at` would replay them again.
             let next = spec.next_after(now);
-            let _ = mode; // unused per-fire, kept in signature for future replay-burst.
-            let _ = throttle;
             let mut guard = self.table.lock().await;
             guard.refresh_next_fire(&top.id, next, Some(top.fire_at));
         }
     }
 
-    /// Re-anchor every entry's next_fire after a clock skew. Old `last_fired_at`
-    /// is preserved so any in-flight catch-up still resolves correctly.
+    /// After a clock-skew trip, re-anchor every entry's `next_fire_at` AND
+    /// run each entry's catch-up policy across the skew gap. Without the
+    /// second step, `coalesce` / `replay` users would silently lose their
+    /// missed fires whenever a laptop wakes from suspend — exactly the
+    /// scenario §5.2's skew detector is designed to *handle*, not just
+    /// detect. Returns the number of entries that were re-anchored.
     async fn recompute_all_after_skew(&self) -> usize {
         let now = self.clock.wall_now();
+
+        // Snapshot the catch-up inputs under the lock, then release it so we
+        // can push events without contending with the main loop.
+        let work: Vec<SkewWorkItem> = {
+            let guard = self.table.lock().await;
+            guard
+                .entries
+                .values()
+                .map(|e| SkewWorkItem {
+                    id: e.id.clone(),
+                    spec: e.spec.clone(),
+                    mode: e.catchup_mode,
+                    throttle: e.min_replay_interval,
+                    last_fired: e.last_fired_at,
+                })
+                .collect()
+        };
+        let count = work.len();
+
+        for item in &work {
+            if let Some(last) = item.last_fired {
+                if last < now {
+                    if let Err(e) = self
+                        .process_missed_fires(MissedFireInputs {
+                            id: &item.id,
+                            spec: &item.spec,
+                            mode: item.mode,
+                            min_replay_interval: item.throttle,
+                            last_fired_at: last,
+                            end: now,
+                            fired_at: now,
+                        })
+                        .await
+                    {
+                        warn!(error = %e, cron_id = %item.id, "skew catch-up failed");
+                    }
+                }
+            }
+        }
+
+        // Now re-anchor next_fire_at from `now` for every entry — same as
+        // before, but it runs *after* catch-up so the heap reflects the
+        // post-gap state. `last_fired_at` is bumped to `now` for any entry
+        // we just emitted catch-up fires for, so the next starvation pass
+        // doesn't replay them.
         let mut guard = self.table.lock().await;
-        let n = guard.entries.len();
-        guard.recompute_all(now);
-        n
+        let now_after = self.clock.wall_now();
+        for item in work {
+            let next = guard
+                .entries
+                .get(&item.id)
+                .and_then(|e| e.spec.next_after(now_after));
+            // If we emitted catch-up fires for this entry, advance its
+            // last_fired_at watermark so subsequent ticks don't double-fire.
+            let new_last = match item.last_fired {
+                Some(l) if l < now_after => Some(now_after),
+                _ => None, // refresh_next_fire(None) leaves last_fired_at untouched.
+            };
+            guard.refresh_next_fire(&item.id, next, new_last);
+        }
+
+        count
+    }
+
+    /// Shared catch-up emitter (§5.3). Walks the spec for missed fires in
+    /// `(inputs.last_fired_at, inputs.end]`, runs the resolver, and pushes
+    /// one `FireEvent` per resolved emission onto the fire channel.
+    ///
+    /// Returns `Err(Error::Invariant)` if the fire channel has been closed
+    /// by the consumer — the loop treats that as a fatal exit signal.
+    async fn process_missed_fires(&self, inputs: MissedFireInputs<'_>) -> Result<(), Error> {
+        let missed =
+            inputs
+                .spec
+                .fires_between(inputs.last_fired_at, inputs.end, MISSED_FIRES_PROBE_CAP);
+        if missed.is_empty() {
+            return Ok(());
+        }
+        let outcome = apply_catchup(&missed, inputs.mode, inputs.min_replay_interval)?;
+        for fire in outcome.fires {
+            let event = FireEvent {
+                cron_id: inputs.id.to_string(),
+                scheduled_at: fire.scheduled_at,
+                fired_at: inputs.fired_at,
+                coalesced_count: fire.coalesced_count,
+                catchup_degraded: outcome.degraded_to_skip,
+            };
+            if self.fire_tx.send(event).await.is_err() {
+                return Err(Error::Invariant("fire channel closed"));
+            }
+        }
+        Ok(())
     }
 }
 

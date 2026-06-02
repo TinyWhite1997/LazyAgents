@@ -93,14 +93,14 @@ async fn seven_day_timeline_skip_mode() {
     clock.inject_wall_skew(Duration::hours(5));
     advance_in_steps(StdDuration::from_secs(120), StdDuration::from_secs(30)).await;
 
-    // The recompute should have rescheduled `next_fire_at` past the gap.
-    // skip mode means the catch-up resolver discards the missed fires —
-    // however, our skew recompute path doesn't *call* the catch-up resolver
-    // (it just re-anchors), so no spurious fires should appear from skew.
+    // The recompute + per-entry catch-up runs across the skew gap, but for
+    // `skip` mode `apply_catchup` emits zero fires by definition — so no
+    // back-fill events appear. (Coalesce/replay variants are covered by
+    // skew_with_coalesce_emits_one_merged_fire and the replay counterpart.)
     let post_skew = drain_fires(&mut ch.fires).await;
     assert!(
         post_skew.is_empty(),
-        "skew recompute must not back-fill missed fires (skip mode): {post_skew:#?}",
+        "skip mode must not back-fill missed fires after skew: {post_skew:#?}",
     );
 
     ch.handle.shutdown().await.unwrap();
@@ -470,6 +470,180 @@ async fn clock_skew_below_threshold_is_silent() {
 
     let diag = timeout(StdDuration::from_millis(100), ch.diagnostics.recv()).await;
     assert!(diag.is_err(), "no diagnostic should fire for 20 s skew");
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// §5.3 unified catch-up — skew-recompute and starvation must also apply the
+// per-entry catch-up policy (Software Architect review blockers).
+// ---------------------------------------------------------------------------
+
+/// Laptop-suspend / NTP-step scenario: when wall time jumps forward by
+/// several hours, a `coalesce` user's cron MUST emit one merged catch-up
+/// fire covering the gap. Prior to the fix the skew path only re-anchored
+/// `next_fire_at` and silently dropped every missed fire — invisible to UI
+/// and inconsistent with §5.3's "coalesce is the default" contract.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn skew_with_coalesce_emits_one_merged_fire() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (clock, mut ch) = start_at(wall);
+
+    let spec = CronSpec::parse("0 * * * *", "UTC").unwrap(); // hourly at :00
+    ch.handle
+        .upsert(
+            "coalesce-suspend",
+            spec,
+            CatchupMode::Coalesce,
+            Duration::zero(),
+            // Pretend last fire was 12:00 (== now at install).
+            Some(wall),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    // Install path emits nothing (no gap yet) — confirm before we shake the clock.
+    let pre = drain_fires(&mut ch.fires).await;
+    assert!(pre.is_empty(), "no fires expected before skew: {pre:#?}");
+
+    // Inject a +5h wall jump and let the 60s skew tick observe it.
+    clock.inject_wall_skew(Duration::hours(5));
+    advance_in_steps(StdDuration::from_secs(120), StdDuration::from_secs(30)).await;
+
+    let fires = drain_fires(&mut ch.fires).await;
+    assert_eq!(
+        fires.len(),
+        1,
+        "coalesce skew must emit exactly one merged fire, got {fires:#?}",
+    );
+    let ev = &fires[0];
+    assert_eq!(ev.cron_id, "coalesce-suspend");
+    // 5 missed hours: 13:00, 14:00, 15:00, 16:00, 17:00.
+    assert_eq!(ev.coalesced_count, 5);
+    assert!(!ev.catchup_degraded);
+
+    // Drain (and discard) the diagnostic so the channel doesn't fill.
+    let _ = timeout(StdDuration::from_millis(50), ch.diagnostics.recv()).await;
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// Same scenario, `replay` policy: every missed hour fires once after the
+/// skew, in order, without `catchup_degraded`. Covers the same blocker as
+/// the coalesce variant — proves the skew path honours per-entry policy
+/// rather than collapsing to skip.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn skew_with_replay_emits_every_missed_fire() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (clock, mut ch) = start_at(wall);
+
+    let spec = CronSpec::parse("0 * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "replay-suspend",
+            spec,
+            CatchupMode::Replay,
+            Duration::zero(),
+            Some(wall),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let _ = drain_fires(&mut ch.fires).await;
+
+    clock.inject_wall_skew(Duration::hours(5));
+    advance_in_steps(StdDuration::from_secs(120), StdDuration::from_secs(30)).await;
+
+    let fires = drain_fires(&mut ch.fires).await;
+    assert_eq!(
+        fires.len(),
+        5,
+        "replay skew must emit every missed hourly fire, got {fires:#?}",
+    );
+    for f in &fires {
+        assert_eq!(f.coalesced_count, 1);
+        assert!(!f.catchup_degraded);
+        assert_eq!(f.cron_id, "replay-suspend");
+    }
+    let scheduled_at: Vec<_> = fires.iter().map(|f| f.scheduled_at).collect();
+    let expected: Vec<_> = (13..=17)
+        .map(|h| Utc.with_ymd_and_hms(2026, 1, 1, h, 0, 0).unwrap())
+        .collect();
+    assert_eq!(scheduled_at, expected);
+
+    let _ = timeout(StdDuration::from_millis(50), ch.diagnostics.recv()).await;
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// Steady-state starvation: the fire path is woken late (long lock held
+/// elsewhere or OS scheduler delay) so `now > top.fire_at + cadence`. The
+/// pre-fix loop computed `next_after(now)` and silently dropped every
+/// natural fire that landed in the starvation gap. The fix routes those
+/// gap fires through the per-entry catch-up policy.
+///
+/// We exercise the path by installing a per-minute cron with `coalesce`
+/// and using a separate hold task to stall the scheduler's table lock
+/// well past several fire times — when the hold releases, the loop wakes
+/// at `now = install + 5min` with `top.fire_at = install + 1min`, so 4
+/// fires landed in the gap. Coalesce policy must emit:
+///   - 1 normal fire for `top.fire_at` (12:01)
+///   - 1 merged catch-up fire for 12:02..12:05 with coalesced_count == 4
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn starved_loop_runs_catchup_policy() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, mut ch) = start_at(wall);
+
+    let spec = CronSpec::parse("* * * * *", "UTC").unwrap(); // every minute
+    ch.handle
+        .upsert(
+            "minutely-coalesce",
+            spec,
+            CatchupMode::Coalesce,
+            Duration::zero(),
+            None,
+        )
+        .await
+        .unwrap();
+    // Let the scheduler reach the sleep_until on the 12:01 fire.
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    // Jump simulated wall+mono time forward by 5 minutes in one step. The
+    // scheduler's sleep_until(deadline=12:01) was set with the original
+    // anchor; advancing by 5 minutes resolves it immediately, but by the
+    // time the loop's wall_now() runs in the fire arm, it observes 12:05.
+    advance(StdDuration::from_secs(5 * 60)).await;
+    tokio::task::yield_now().await;
+    // Give the loop a few extra polls to drain its inner pop loop.
+    advance(StdDuration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+
+    let fires = drain_fires(&mut ch.fires).await;
+    // Expected: normal 12:01 fire + one coalesced fire merging 12:02..12:05.
+    assert_eq!(
+        fires.len(),
+        2,
+        "starved coalesce must emit popped fire + merged catch-up, got {fires:#?}",
+    );
+
+    let normal = &fires[0];
+    assert_eq!(normal.cron_id, "minutely-coalesce");
+    assert_eq!(
+        normal.scheduled_at,
+        Utc.with_ymd_and_hms(2026, 1, 1, 12, 1, 0).unwrap()
+    );
+    assert_eq!(normal.coalesced_count, 1);
+    assert!(!normal.catchup_degraded);
+
+    let merged = &fires[1];
+    assert_eq!(merged.cron_id, "minutely-coalesce");
+    assert_eq!(
+        merged.scheduled_at,
+        Utc.with_ymd_and_hms(2026, 1, 1, 12, 5, 0).unwrap()
+    );
+    assert_eq!(merged.coalesced_count, 4, "12:02..12:05 = 4 missed fires");
+    assert!(!merged.catchup_degraded);
 
     ch.handle.shutdown().await.unwrap();
 }
