@@ -42,10 +42,18 @@
 //! - [`detach_notice`] — transient "会话仍在后台运行" toast surfaced when the
 //!   user detaches from a live session.
 //!
+//! Crons tab (M3.4):
+//! - [`crons`] — list state + editor form + cron-expression preview
+//!   (`下次：明日 02:00`) + dry-run modal that lists the next 5 fire times.
+//!   The preview shares the workspace-pinned `cron` + `chrono-tz` versions
+//!   with [`la-scheduler::cron_spec`], so the editor's preview is
+//!   byte-identical to what the daemon will eventually schedule.
+//!
 //! The binary entry point is in `src/bin/la.rs`.
 
 pub mod app;
 pub mod composer;
+pub mod crons;
 pub mod detach_notice;
 pub mod diff_view;
 pub mod health_sub;
@@ -62,6 +70,7 @@ pub mod vte_term;
 
 pub use app::{App, AppMsg, Focus, Tab};
 pub use composer::{Composer, ComposerAction, ComposerView};
+pub use crons::{Cron, CronPreview, CronSource, CronsState, EditField, FieldEdit, MockCronSource};
 pub use detach_notice::{DetachNotice, DetachNoticeView};
 pub use diff_view::{
     DiffAction, DiffEvent, DiffFileState, DiffFocus, DiffKey, DiffModal, DiffPayload, DiffSource,

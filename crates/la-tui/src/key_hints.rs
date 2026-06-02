@@ -82,15 +82,7 @@ impl HintRegistry {
         }
         match tab {
             Tab::Sessions => Self::for_sessions(focus, selection),
-            // Crons tab placeholder until M3. We still want `Tab` / `?` /
-            // `q` to be teachable so the user is not stranded on an empty
-            // tab — but we deliberately do NOT advertise cron-management
-            // keys we cannot honour yet.
-            Tab::Crons => {
-                let mut out = Self::globals();
-                out.sort_by_key(|h| std::cmp::Reverse(h.importance));
-                out
-            }
+            Tab::Crons => Self::for_crons(focus),
         }
     }
 
@@ -173,7 +165,46 @@ impl HintRegistry {
                 // 选择在 M1.7 落 daemon 之前没有 handler，所以这里**不**
                 // advertise — 等 backend chooser 上线再加回来。
             ],
+            Modal::ConfirmEnableCron { .. } => vec![
+                Hint::new("y", "enable cron", Importance::Primary),
+                Hint::new("n / Esc", "cancel", Importance::High),
+            ],
+            Modal::ConfirmDeleteCron { .. } => vec![
+                Hint::new("y", "delete cron", Importance::Primary),
+                Hint::new("n / Esc", "cancel", Importance::High),
+            ],
+            Modal::DryRunCron { .. } => vec![
+                Hint::new("Esc", "close", Importance::Primary),
+                Hint::new("⏎", "close", Importance::High),
+            ],
         }
+    }
+
+    /// Crons-tab hints. The Crons tab has two focus contexts (list +
+    /// editor); we surface the most-used keys for each so the bottom
+    /// bar mirrors the WEK-35 acceptance keys (`n`, `d`, `space`, `r`).
+    fn for_crons(focus: Focus) -> Vec<Hint> {
+        let mut out = match focus {
+            Focus::Sidebar => vec![
+                Hint::new("⏎", "edit", Importance::Primary),
+                Hint::new("n", "new", Importance::High),
+                Hint::new("d", "delete", Importance::High),
+                Hint::new("Space", "enable/disable", Importance::High),
+                Hint::new("r", "trigger now", Importance::Medium),
+                Hint::new("R", "dry-run (next 5)", Importance::Medium),
+                Hint::new("j/k", "down/up", Importance::Medium),
+                Hint::new("g/G", "top/bottom", Importance::Low),
+                Hint::new("Tab", "edit pane", Importance::Low),
+            ],
+            Focus::Main => vec![
+                Hint::new("⏎", "save", Importance::Primary),
+                Hint::new("Esc", "discard draft", Importance::High),
+                Hint::new("Tab", "next field", Importance::High),
+            ],
+        };
+        out.extend(Self::globals());
+        out.sort_by_key(|h| std::cmp::Reverse(h.importance));
+        out
     }
 
     fn globals() -> Vec<Hint> {
@@ -324,6 +355,8 @@ mod tests {
             sidebar: Rect::default(),
             sidebar_scroll_offset: 0,
             tab_bar_row: 0,
+            tab: Tab::Sessions,
+            focus: Focus::Sidebar,
         };
 
         let contexts = [
@@ -373,6 +406,8 @@ mod tests {
             sidebar: Rect::default(),
             sidebar_scroll_offset: 0,
             tab_bar_row: 0,
+            tab: Tab::Sessions,
+            focus: Focus::Sidebar,
         };
         let modals = [
             Modal::ConfirmDelete {
@@ -381,6 +416,20 @@ mod tests {
             Modal::FullHints,
             Modal::NewSession {
                 project_id: "p1".into(),
+            },
+            Modal::ConfirmEnableCron {
+                cron_id: "c1".into(),
+                cron_name: "n".into(),
+                budget_label: "b".into(),
+                next_label: "x".into(),
+            },
+            Modal::ConfirmDeleteCron {
+                cron_id: "c1".into(),
+                cron_name: "n".into(),
+            },
+            Modal::DryRunCron {
+                cron_id: "c1".into(),
+                fires: vec!["t".into()],
             },
         ];
         for m in &modals {
@@ -423,6 +472,9 @@ mod tests {
             "q" => Some(KeyCode::Char('q')),
             "y" => Some(KeyCode::Char('y')),
             "?" => Some(KeyCode::Char('?')),
+            "r" => Some(KeyCode::Char('r')),
+            "R" => Some(KeyCode::Char('R')),
+            "Space" => Some(KeyCode::Char(' ')),
             _ => None,
         }
     }

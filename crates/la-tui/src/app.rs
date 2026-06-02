@@ -14,6 +14,7 @@
 //! by [`crate::input`]). This decoupling makes the App testable without
 //! a terminal.
 
+use crate::crons::{CronSource, CronsState, FieldEdit};
 use crate::model::BackendBadge;
 use crate::sidebar::{Selection, SidebarState};
 use crate::source::SessionSource;
@@ -47,6 +48,10 @@ impl Tab {
 
 /// Which pane currently owns focus. M1.5 only has Sidebar; Main is
 /// reserved for the conversation pane that M1.6 will add.
+///
+/// The Crons tab (M3.4) reuses the same enum: `Sidebar` == cron list,
+/// `Main` == editor form. Keeping the two tabs on the same Focus state
+/// is enough because at any moment the user is on exactly one tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Sidebar,
@@ -64,6 +69,24 @@ pub enum Modal {
     /// `sessions.create`). The actual chooser UI lands with the daemon; for
     /// M1.5 we just acknowledge the request so the key path is visible.
     NewSession { project_id: String },
+    /// `space` on a disabled cron, first enable only (WEK-35 / M3.4):
+    /// shows the cost budget plus next trigger time and forces an
+    /// explicit confirmation before the daemon picks the cron up. The
+    /// fields are pre-computed by the App so the renderer can stay
+    /// declarative.
+    ConfirmEnableCron {
+        cron_id: String,
+        cron_name: String,
+        budget_label: String,
+        next_label: String,
+    },
+    /// `d` on a cron row → confirm delete. We do NOT reuse
+    /// `ConfirmDelete` to avoid the input router routing the wrong
+    /// source.delete()/cron source.delete() call.
+    ConfirmDeleteCron { cron_id: String, cron_name: String },
+    /// `R` on a cron row → list the next 5 fire times so the user can
+    /// sanity-check the expression before enabling. Read-only modal.
+    DryRunCron { cron_id: String, fires: Vec<String> },
 }
 
 /// All input the App reacts to. The input layer translates raw events
@@ -115,6 +138,42 @@ pub enum AppMsg {
     /// notifications — WEK-29). The TUI consumes this to grey-state
     /// unavailable backends in the dedicated Backends panel.
     BackendsUpdate(Vec<BackendBadge>),
+
+    // --- Crons tab (WEK-35 / M3.4) ---------------------------------
+    //
+    // The Crons tab has its own focus model: when the user is in the
+    // cron list these messages drive list navigation; once focus is on
+    // the editor pane they drive the per-field buffer instead. The App
+    // gates routing on `self.focus` so the input layer doesn't have to
+    // know the difference.
+    CronListDown,
+    CronListUp,
+    CronListTop,
+    CronListBottom,
+    /// `n` — start a new cron in the editor pane.
+    CronNew,
+    /// `d` — request delete confirmation for the selected cron.
+    CronDelete,
+    /// `space` — toggle enabled. Opens the first-enable confirm modal
+    /// when the transition is "disabled → enabled".
+    CronToggleEnabled,
+    /// `r` — fire the selected cron once. No-op if the list is empty.
+    CronTriggerNow,
+    /// `R` — open the dry-run modal showing the next 5 fire times.
+    CronDryRun,
+    /// Move focus into the editor pane (Tab / `i`) or back to the list
+    /// (Esc with no draft). Idempotent.
+    CronFocusEditor,
+    CronFocusList,
+    /// Switch the field cursor inside the editor (Tab / Shift-Tab).
+    CronFieldNext,
+    CronFieldPrev,
+    /// One keystroke into the active field.
+    CronFieldEdit(FieldEdit),
+    /// `Ctrl+S` / `Enter` from list — commit the in-flight draft.
+    CronSaveDraft,
+    /// `Esc` from the editor with a draft open — discard it.
+    CronCancelDraft,
 }
 
 /// What the runner should do after a message has been handled.
@@ -128,9 +187,11 @@ pub enum AppOutcome {
 }
 
 /// Top-level application.
-pub struct App<S: SessionSource> {
+pub struct App<S: SessionSource, C: CronSource = crate::crons::MockCronSource> {
     source: S,
+    cron_source: C,
     pub sidebar: SidebarState,
+    pub crons: CronsState,
     pub tab: Tab,
     pub focus: Focus,
     pub modal: Option<Modal>,
@@ -140,16 +201,34 @@ pub struct App<S: SessionSource> {
     /// `daemon.health` arrives. The rendering layer reads it to display
     /// the Backends panel above the project list.
     pub backends: Vec<BackendBadge>,
+    /// Set by the App whenever a user-driven side effect needs to
+    /// surface a toast to the runner ("triggered now", "saved", "no
+    /// changes to save"). The runner is free to ignore it — it exists
+    /// to keep tests deterministic without poking at private state.
+    pub last_toast: Option<String>,
 }
 
-impl<S: SessionSource> App<S> {
+impl<S: SessionSource> App<S, crate::crons::MockCronSource> {
+    /// Convenience constructor that pairs an arbitrary session source
+    /// with the in-memory mock cron source. Live wiring will swap in an
+    /// IPC-backed cron source via [`App::with_sources`] (M3.5).
+    pub fn new(source: S) -> Self {
+        Self::with_sources(source, crate::crons::MockCronSource::fixture())
+    }
+}
+
+impl<S: SessionSource, C: CronSource> App<S, C> {
     /// Construct with the given source. Loads an initial snapshot into
     /// the sidebar so the very first frame shows real data instead of an
     /// empty pane.
-    pub fn new(source: S) -> Self {
+    pub fn with_sources(source: S, cron_source: C) -> Self {
+        let mut crons = CronsState::new();
+        crons.set_crons(cron_source.snapshot());
         let mut app = Self {
             source,
+            cron_source,
             sidebar: SidebarState::new(),
+            crons,
             tab: Tab::Sessions,
             focus: Focus::Sidebar,
             modal: None,
@@ -160,6 +239,7 @@ impl<S: SessionSource> App<S> {
                 right_context: String::new(),
             },
             backends: Vec::new(),
+            last_toast: None,
         };
         app.refresh_sessions();
         app
@@ -167,6 +247,15 @@ impl<S: SessionSource> App<S> {
 
     pub fn source(&self) -> &S {
         &self.source
+    }
+
+    pub fn cron_source(&self) -> &C {
+        &self.cron_source
+    }
+
+    /// Refresh the cron snapshot from the source (after an upsert/delete).
+    pub fn refresh_crons(&mut self) {
+        self.crons.set_crons(self.cron_source.snapshot());
     }
 
     /// Pull a fresh snapshot from the source and hand it to the sidebar.
@@ -178,6 +267,9 @@ impl<S: SessionSource> App<S> {
     /// Apply one input message and return whether the runner should
     /// continue.
     pub fn handle(&mut self, msg: AppMsg) -> AppOutcome {
+        // Per-message toast slate: every dispatch starts clean so a
+        // surviving toast from a previous frame can't leak forward.
+        self.last_toast = None;
         // Modal short-circuits — while a modal is open, only its keys are
         // valid (PRD §5.6 上下文驱动).
         if let Some(modal) = self.modal.clone() {
@@ -185,9 +277,18 @@ impl<S: SessionSource> App<S> {
         }
         match msg {
             AppMsg::Quit => return AppOutcome::Quit,
-            AppMsg::NextTab => self.tab = self.tab.next(),
-            AppMsg::PrevTab => self.tab = self.tab.prev(),
-            AppMsg::SetTab(t) => self.tab = t,
+            AppMsg::NextTab => {
+                self.tab = self.tab.next();
+                self.focus = Focus::Sidebar;
+            }
+            AppMsg::PrevTab => {
+                self.tab = self.tab.prev();
+                self.focus = Focus::Sidebar;
+            }
+            AppMsg::SetTab(t) => {
+                self.tab = t;
+                self.focus = Focus::Sidebar;
+            }
             AppMsg::SidebarDown => {
                 self.sidebar.move_down();
             }
@@ -215,7 +316,17 @@ impl<S: SessionSource> App<S> {
             AppMsg::NewSession => self.on_new_session(),
             AppMsg::ImportDiscovered => self.on_import_discovered(),
             AppMsg::Confirm | AppMsg::Cancel => {
-                // No-op outside a modal.
+                // Outside a modal: `Esc` on the Crons editor pane drops
+                // the user back to the list (and the draft, if any).
+                if matches!(msg, AppMsg::Cancel)
+                    && self.tab == Tab::Crons
+                    && self.focus == Focus::Main
+                {
+                    if self.crons.cancel_edit() {
+                        self.last_toast = Some("draft discarded".into());
+                    }
+                    self.focus = Focus::Sidebar;
+                }
             }
             AppMsg::ToggleFullHints => {
                 self.modal = Some(Modal::FullHints);
@@ -229,6 +340,43 @@ impl<S: SessionSource> App<S> {
                 let mut sorted = b;
                 sorted.sort_by(|a, b| a.id.cmp(&b.id));
                 self.backends = sorted;
+            }
+
+            // --- Crons tab dispatch ---------------------------------
+            AppMsg::CronListDown => {
+                self.crons.move_cursor(1);
+            }
+            AppMsg::CronListUp => {
+                self.crons.move_cursor(-1);
+            }
+            AppMsg::CronListTop => self.crons.move_top(),
+            AppMsg::CronListBottom => self.crons.move_bottom(),
+            AppMsg::CronNew => self.on_cron_new(),
+            AppMsg::CronDelete => self.on_cron_delete(),
+            AppMsg::CronToggleEnabled => self.on_cron_toggle(),
+            AppMsg::CronTriggerNow => self.on_cron_trigger_now(),
+            AppMsg::CronDryRun => self.on_cron_dry_run(),
+            AppMsg::CronFocusEditor => {
+                if self.tab == Tab::Crons && self.crons.selected().is_some() {
+                    self.focus = Focus::Main;
+                }
+            }
+            AppMsg::CronFocusList => {
+                if self.tab == Tab::Crons {
+                    self.focus = Focus::Sidebar;
+                }
+            }
+            AppMsg::CronFieldNext => self.crons.field_next(),
+            AppMsg::CronFieldPrev => self.crons.field_prev(),
+            AppMsg::CronFieldEdit(edit) => {
+                self.crons.field_input(edit);
+            }
+            AppMsg::CronSaveDraft => self.on_cron_save(),
+            AppMsg::CronCancelDraft => {
+                if self.crons.cancel_edit() {
+                    self.last_toast = Some("draft discarded".into());
+                }
+                self.focus = Focus::Sidebar;
             }
         }
         AppOutcome::Continue
@@ -253,6 +401,33 @@ impl<S: SessionSource> App<S> {
                 self.modal = None;
             }
             (Modal::NewSession { .. }, AppMsg::Cancel) => {
+                self.modal = None;
+            }
+            (Modal::ConfirmEnableCron { cron_id, .. }, AppMsg::Confirm) => {
+                self.cron_source.set_enabled(&cron_id, true);
+                self.modal = None;
+                self.refresh_crons();
+                self.last_toast = Some("cron enabled".into());
+            }
+            (Modal::ConfirmEnableCron { cron_id, .. }, AppMsg::Cancel) => {
+                // User backed out — flip the in-memory state back to
+                // disabled so the list reflects what's actually on the
+                // daemon.
+                self.cron_source.set_enabled(&cron_id, false);
+                self.modal = None;
+                self.refresh_crons();
+            }
+            (Modal::ConfirmDeleteCron { cron_id, .. }, AppMsg::Confirm) => {
+                self.cron_source.delete(&cron_id);
+                self.modal = None;
+                self.refresh_crons();
+                self.last_toast = Some("cron deleted".into());
+            }
+            (Modal::ConfirmDeleteCron { .. }, AppMsg::Cancel) => {
+                self.modal = None;
+            }
+            (Modal::DryRunCron { .. }, AppMsg::Cancel)
+            | (Modal::DryRunCron { .. }, AppMsg::Confirm) => {
                 self.modal = None;
             }
             // Inside a modal, Quit still wins (so the user is never
@@ -351,6 +526,147 @@ impl<S: SessionSource> App<S> {
         self.source.import_discovered(&sid);
         self.refresh_sessions();
     }
+
+    // -----------------------------------------------------------------
+    // Crons tab handlers (WEK-35 / M3.4)
+    //
+    // Each helper translates one user-visible intent into a single
+    // CronSource call plus a snapshot refresh. The handlers consciously
+    // refuse to do work when there's no selection (`r`/`d`/`space` on an
+    // empty list are silent), matching the "hint == 真实绑定" rule from
+    // the Sessions tab.
+    // -----------------------------------------------------------------
+
+    fn on_cron_new(&mut self) {
+        // Use a UUIDv7-shaped placeholder so the editor's "name" buffer
+        // has something to render. The id field is hidden from the UI;
+        // the live source rewrites it on `upsert`.
+        let temp_id = format!("draft-{}", self.crons.crons().len() + 1);
+        self.crons.begin_new(temp_id);
+        self.focus = Focus::Main;
+    }
+
+    fn on_cron_delete(&mut self) {
+        let Some(cron) = self.crons.selected() else {
+            return;
+        };
+        self.modal = Some(Modal::ConfirmDeleteCron {
+            cron_id: cron.id.clone(),
+            cron_name: cron.name.clone(),
+        });
+    }
+
+    fn on_cron_toggle(&mut self) {
+        // Special case: editor focus + draft means the user pressed
+        // space while typing into the prompt buffer — route to the
+        // buffer instead of toggling.
+        if self.focus == Focus::Main && self.crons.draft().is_some() {
+            self.crons.field_input(FieldEdit::Insert(' '));
+            return;
+        }
+        let Some((id, now_enabled)) = self.crons.toggle_enabled() else {
+            return;
+        };
+        if now_enabled {
+            // First-enable confirmation: pre-compute the cost-budget and
+            // next-fire labels so the renderer can stay declarative.
+            let cron = match self.crons.crons().iter().find(|c| c.id == id) {
+                Some(c) => c.clone(),
+                None => return,
+            };
+            let budget_label = cron
+                .cost_budget_usd_per_day
+                .map(|v| format!("${v:.2}/day"))
+                .unwrap_or_else(|| "inherits global default".to_string());
+            // Use the (already-refreshed) preview so the modal label is
+            // byte-identical to the inline "下次：…" hint the user just
+            // saw — no risk of the two disagreeing.
+            let next_label = match self.crons.preview().next {
+                Some(n) => crate::crons::human_label(n, self.crons.now(), &cron.tz),
+                None => "下次：—".to_string(),
+            };
+            self.modal = Some(Modal::ConfirmEnableCron {
+                cron_id: id,
+                cron_name: cron.name,
+                budget_label,
+                next_label,
+            });
+        } else {
+            // Disabling is one-step; persist immediately.
+            self.cron_source.set_enabled(&id, false);
+            self.refresh_crons();
+            self.last_toast = Some("cron disabled".into());
+        }
+    }
+
+    fn on_cron_trigger_now(&mut self) {
+        let Some(id) = self.crons.selected_id().map(str::to_string) else {
+            return;
+        };
+        self.cron_source.trigger_now(&id);
+        self.last_toast = Some(format!("triggered {id}"));
+    }
+
+    fn on_cron_dry_run(&mut self) {
+        let Some(cron) = self.crons.selected().cloned() else {
+            return;
+        };
+        // Use the editor's preview directly — same `cron::Schedule` call
+        // the scheduler will use, per the WEK-35 acceptance.
+        let preview = self.crons.preview();
+        let fires = if preview.error.is_some() {
+            vec![format!(
+                "invalid: {}",
+                preview.error.as_deref().unwrap_or("?")
+            )]
+        } else {
+            preview
+                .all_fires()
+                .into_iter()
+                .map(|t| t.with_timezone(&parse_tz(&cron.tz)).to_rfc3339())
+                .collect()
+        };
+        self.modal = Some(Modal::DryRunCron {
+            cron_id: cron.id.clone(),
+            fires,
+        });
+    }
+
+    fn on_cron_save(&mut self) {
+        let Some(draft) = self.crons.draft().cloned() else {
+            self.last_toast = Some("no draft to save".into());
+            return;
+        };
+        // Validate first — the optimistic local commit must NOT happen
+        // for a draft the daemon will refuse. Reuse the editor's
+        // already-computed preview rather than re-parsing.
+        let preview =
+            crate::crons::CronPreview::compute(&draft.cron_expr, &draft.tz, self.crons.now());
+        if preview.error.is_some() {
+            self.last_toast = Some(format!(
+                "save aborted: {}",
+                preview.error.as_deref().unwrap_or("invalid cron")
+            ));
+            return;
+        }
+        // Commit + persist. `commit_draft` clears the in-flight draft and
+        // returns the committed cron so we can hand it to the source.
+        let committed = self
+            .crons
+            .commit_draft()
+            .expect("draft was Some moments ago");
+        self.cron_source.upsert(committed);
+        self.refresh_crons();
+        self.focus = Focus::Sidebar;
+        self.last_toast = Some("saved".into());
+    }
+}
+
+/// Resolve an IANA tz string for the dry-run RFC3339 rendering. Falls
+/// back to UTC on a bad spec — the modal is informational only and a
+/// bad tz means we already showed an error in the editor.
+fn parse_tz(s: &str) -> chrono_tz::Tz {
+    s.parse().unwrap_or(chrono_tz::UTC)
 }
 
 #[cfg(test)]
