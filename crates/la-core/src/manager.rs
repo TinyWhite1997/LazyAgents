@@ -38,6 +38,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::error::CoreResult;
 use crate::event_bus::{BusEvent, EventBus};
 use crate::session::{SessionId, SessionRuntime, SessionStateChange, SignalFn};
+use crate::worktree::{project_slug, WorktreeManager, WorktreePlan};
 use crate::{CoreError, DEFAULT_RUNNING_PROMOTE, DEFAULT_WAITING_IDLE};
 
 /// Tunables that callers (mostly tests) want to override.
@@ -61,6 +62,13 @@ pub struct ManagerConfig {
     /// Off by default in tests because it forces a SQLite round-trip per
     /// chunk; on in production so the transcript survives daemon restart.
     pub persist_chunks: bool,
+    /// Optional worktree manager. When `Some`, `SessionManager::spawn`
+    /// honours [`WorktreeSpawnOptions`] by provisioning a per-session
+    /// `git worktree` before forking the PTY child and running the
+    /// optional `.lazyagents/hooks/post-create.sh` hook afterwards.
+    /// When `None`, every spawn behaves as if `worktree=false` (the
+    /// pre-WEK-27 path).
+    pub worktree: Option<Arc<WorktreeManager>>,
 }
 
 impl Default for ManagerConfig {
@@ -72,6 +80,7 @@ impl Default for ManagerConfig {
             running_promote: DEFAULT_RUNNING_PROMOTE,
             initial_pty: PtySize::default(),
             persist_chunks: true,
+            worktree: None,
         }
     }
 }
@@ -88,6 +97,33 @@ pub struct SpawnedSession {
     pub project_id: String,
     pub initial_state: SessionState,
     pub pid: Option<u32>,
+    /// Worktree path the child was spawned into when `worktree=true`,
+    /// echoed so the dispatcher can return it in `SessionsCreateResult`
+    /// without a follow-up query. `None` for sessions that share the
+    /// project root.
+    pub worktree_path: Option<std::path::PathBuf>,
+    /// Per-session branch (`la/session-<sid>`), if a worktree was
+    /// provisioned. `None` mirrors `worktree_path`.
+    pub worktree_branch: Option<String>,
+    /// Resolved base branch the worktree was forked from. `None` when
+    /// no worktree was provisioned.
+    pub base_branch: Option<String>,
+    /// Outcome of the optional `.lazyagents/hooks/post-create.sh` hook
+    /// — see [`WorktreeManager::run_post_create_hook`]. `None` when no
+    /// worktree was provisioned (the hook never runs).
+    pub post_create_hook_status: Option<crate::worktree::HookStatus>,
+}
+
+/// Knobs passed to [`SessionManager::spawn`] when the caller wants a
+/// per-session worktree. `None` ⇒ legacy behaviour (session shares the
+/// project root). `Some` requires [`ManagerConfig::worktree`] to also be
+/// `Some`; otherwise the manager returns an internal error rather than
+/// silently fall back to the no-worktree path.
+#[derive(Debug, Clone)]
+pub struct WorktreeSpawnOptions {
+    /// Project working tree to fork from. Usually the same path the
+    /// adapter would use as `cwd` for a no-worktree spawn.
+    pub repo_root: std::path::PathBuf,
 }
 
 /// The composed daemon façade. Cheap to clone — internally an `Arc`.
@@ -147,31 +183,92 @@ impl SessionManager {
         self.inner.registry.lock().await.len()
     }
 
-    /// Spawn a new session.
-    ///
-    /// Steps (in order, each idempotent if it fails before the next):
-    /// 1. Adapter builds the [`SpawnSpec`].
-    /// 2. We persist a `starting` row to SQLite so a daemon crash mid-
-    ///    spawn leaves a recoverable trace for the orphan reaper.
-    /// 3. We spawn the PTY child and immediately update the storage row
-    ///    with its pid.
-    /// 4. We register the in-memory runtime and start the output pump.
-    /// 5. We publish a `session.state{starting}` event for any subscriber.
+    /// Spawn a new session sharing the project root (no per-session
+    /// worktree). Equivalent to
+    /// [`spawn_with_options`](Self::spawn_with_options) with `worktree =
+    /// None`; kept as a separate entry point because most tests and the
+    /// pre-WEK-27 code paths don't care about worktree provisioning.
     pub async fn spawn(
         &self,
         adapter: &dyn AgentAdapter,
         project_id: String,
         request: SpawnRequest,
     ) -> CoreResult<SpawnedSession> {
+        self.spawn_with_options(adapter, project_id, request, None)
+            .await
+    }
+
+    /// Spawn a new session, optionally provisioning a per-session git
+    /// worktree.
+    ///
+    /// Steps (in order, each atomic before the next):
+    /// 1. **Worktree** (if `worktree.is_some()`): resolve base branch,
+    ///    `git worktree add -b la/session-<sid> <base_sha>`. Failure
+    ///    short-circuits before the session row is written, per WEK-8
+    ///    brief §2.2 — half-written rows are forbidden.
+    /// 2. Adapter builds the [`SpawnSpec`]. `request.cwd` is overridden
+    ///    with the worktree path when one was provisioned.
+    /// 3. Persist a `starting` row to SQLite (with the worktree fields
+    ///    populated if applicable).
+    /// 4. Spawn the PTY child and update the row with its pid.
+    /// 5. Register the in-memory runtime and start the output pump.
+    /// 6. Run the optional `.lazyagents/hooks/post-create.sh` hook (60 s
+    ///    budget). Hook failure is advisory and persisted as a separate
+    ///    `post_create_hook_status` column — it does NOT mutate the
+    ///    session state machine (brief amendment R4).
+    /// 7. Publish a `session.state{starting}` event for subscribers.
+    pub async fn spawn_with_options(
+        &self,
+        adapter: &dyn AgentAdapter,
+        project_id: String,
+        mut request: SpawnRequest,
+        worktree: Option<WorktreeSpawnOptions>,
+    ) -> CoreResult<SpawnedSession> {
         let backend_id = adapter.descriptor().id.to_string();
-        let spec = adapter.spawn_spec(&request)?;
-
         let id = SessionId(la_storage::new_id());
-        // Snapshot the spec into the storage row so the import / orphan
-        // path can reconstruct enough context to display.
-        let spawn_args = spawn_args_json(&spec);
 
-        self.inner
+        // ----- Step 1: provision worktree (atomic; nothing else runs
+        // until this either succeeds or rolls back) -----
+        let worktree_plan = if let Some(opts) = worktree {
+            let wt_mgr = self.inner.config.worktree.as_ref().ok_or_else(|| {
+                CoreError::Internal(
+                    "WorktreeSpawnOptions supplied but ManagerConfig.worktree is None".to_string(),
+                )
+            })?;
+            let base = wt_mgr.resolve_base_branch(&opts.repo_root).await?;
+            let slug = project_slug(&opts.repo_root);
+            let plan = wt_mgr.create(&opts.repo_root, &slug, &id.0, base).await?;
+            // Adapter spawns into the worktree, not the project root.
+            request.cwd = plan.path.clone();
+            Some((wt_mgr.clone(), opts.repo_root, plan))
+        } else {
+            None
+        };
+
+        let spec = match adapter.spawn_spec(&request) {
+            Ok(spec) => spec,
+            Err(err) => {
+                if let Some((wt_mgr, repo_root, plan)) = &worktree_plan {
+                    rollback_worktree(wt_mgr, repo_root, plan).await;
+                }
+                return Err(err.into());
+            }
+        };
+
+        let spawn_args = spawn_args_json(&spec);
+        let (worktree_path_str, worktree_branch_str, base_branch_str) = worktree_plan
+            .as_ref()
+            .map(|(_, _, p)| {
+                (
+                    Some(p.path.to_string_lossy().into_owned()),
+                    Some(p.branch.clone()),
+                    Some(p.base_branch.clone()),
+                )
+            })
+            .unwrap_or((None, None, None));
+
+        if let Err(err) = self
+            .inner
             .storage
             .sessions()
             .create(NewSession {
@@ -182,18 +279,43 @@ impl SessionManager {
                 title: None,
                 state: state_str(SessionState::Starting).to_string(),
                 pid: None,
-                worktree_path: None,
-                worktree_branch: None,
-                base_branch: None,
+                worktree_path: worktree_path_str.clone(),
+                worktree_branch: worktree_branch_str.clone(),
+                base_branch: base_branch_str.clone(),
                 spawn_args,
                 origin: "user".to_string(),
+                post_create_hook_status: None,
             })
-            .await?;
+            .await
+        {
+            if let Some((wt_mgr, repo_root, plan)) = &worktree_plan {
+                rollback_worktree(wt_mgr, repo_root, plan).await;
+            }
+            return Err(err.into());
+        }
 
         let pty_size = pty_size_from_spec(&spec, self.inner.config.initial_pty);
         let cmd = command_from_spec(&spec);
 
-        let child = la_pty::spawn(cmd, pty_size)?;
+        let child = match la_pty::spawn(cmd, pty_size) {
+            Ok(child) => child,
+            Err(err) => {
+                // PTY spawn failed after the row is persisted: leave a
+                // dead `starting` row for the orphan reaper, but roll
+                // back the worktree so the disk doesn't leak. The
+                // sessions row stays so the user can see what failed.
+                if let Some((wt_mgr, repo_root, plan)) = &worktree_plan {
+                    rollback_worktree(wt_mgr, repo_root, plan).await;
+                    let _ = self
+                        .inner
+                        .storage
+                        .sessions()
+                        .clear_worktree(id.as_str(), false)
+                        .await;
+                }
+                return Err(err.into());
+            }
+        };
         let parts = child.into_parts();
         let pid = parts.pid;
 
@@ -257,12 +379,48 @@ impl SessionManager {
         };
         tokio::spawn(pump.run());
 
+        // Run the post-create hook after the PTY child is alive and the
+        // session is in the registry, so the user can interact with the
+        // adapter even while their `pnpm install` / `direnv allow` runs.
+        // Hook failure is advisory (brief amendment R4): we never roll
+        // back the worktree, never tear down the spawn, never mutate
+        // `SessionStatus`. The outcome is persisted as a separate
+        // column for the TUI to render as a badge.
+        let post_create_hook_status =
+            if let Some((wt_mgr, repo_root, plan)) = worktree_plan.as_ref() {
+                let status = wt_mgr
+                    .run_post_create_hook(repo_root, plan, &backend_id, id.as_str())
+                    .await;
+                if let Err(err) = self
+                    .inner
+                    .storage
+                    .sessions()
+                    .set_post_create_hook_status(id.as_str(), status.as_str())
+                    .await
+                {
+                    tracing::warn!(
+                        session = %id.0,
+                        %err,
+                        "post_create_hook_status persist failed"
+                    );
+                }
+                Some(status)
+            } else {
+                None
+            };
+
         Ok(SpawnedSession {
             id,
             backend: backend_id,
             project_id,
             initial_state: SessionState::Starting,
             pid,
+            worktree_path: worktree_plan.as_ref().map(|(_, _, p)| p.path.clone()),
+            worktree_branch: worktree_plan.as_ref().map(|(_, _, p)| p.branch.clone()),
+            base_branch: worktree_plan
+                .as_ref()
+                .map(|(_, _, p)| p.base_branch.clone()),
+            post_create_hook_status,
         })
     }
 
@@ -402,13 +560,78 @@ impl SessionManager {
 
     /// Archive a session row. Refuses if the session is still in the
     /// active registry — the caller must signal-then-wait first.
+    ///
+    /// WEK-27: if the session owned a worktree, this also tears the
+    /// directory down. The branch is preserved when it carries commits
+    /// the user might want to recover (`KeepBranchIfDirty`); otherwise
+    /// it's deleted. `worktree_path` is cleared from the row so the
+    /// next `sessions.list` doesn't promise something that no longer
+    /// exists on disk.
     pub async fn archive(&self, id: &SessionId) -> CoreResult<()> {
         if self.inner.registry.lock().await.contains_key(id) {
             return Err(CoreError::SessionBusy);
         }
+        // Snapshot the row BEFORE archive so we can drive worktree
+        // cleanup with the original three columns. Doing it after the
+        // archive would race against the read, and the row mutation is
+        // small enough that the double-fetch isn't worth optimising.
+        let row = self.inner.storage.sessions().get(id.as_str()).await?;
         let archived = self.inner.storage.sessions().archive(id.as_str()).await?;
         if !archived {
             return Err(CoreError::SessionNotFound(id.0.clone()));
+        }
+        if let (Some(wt_mgr), Some(row)) = (self.inner.config.worktree.as_ref(), row.as_ref()) {
+            if let (Some(wt_path), Some(branch), Some(base_branch)) = (
+                row.worktree_path.as_deref(),
+                row.worktree_branch.as_deref(),
+                row.base_branch.as_deref(),
+            ) {
+                let repo_root = self
+                    .inner
+                    .storage
+                    .projects()
+                    .get(&row.project_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|p| std::path::PathBuf::from(p.root_path));
+                if let Some(repo_root) = repo_root {
+                    let handle =
+                        WorktreeManager::handle_from_row(repo_root, wt_path, branch, base_branch);
+                    match wt_mgr
+                        .cleanup(&handle, crate::worktree::CleanupMode::KeepBranchIfDirty)
+                        .await
+                    {
+                        Ok(branch_preserved) => {
+                            // Clear the path only after the worktree
+                            // is actually gone. WEK-8 §2.4 row 2: when
+                            // KeepBranchIfDirty kept the branch (the
+                            // agent committed something), the row's
+                            // `worktree_branch` column must survive so
+                            // the TUI can later offer `git checkout`.
+                            // `branch_preserved` is the bit cleanup
+                            // already computed — no need to re-derive
+                            // it here. On failure we keep the triple so
+                            // a future sweep can retry.
+                            let _ = self
+                                .inner
+                                .storage
+                                .sessions()
+                                .clear_worktree(id.as_str(), branch_preserved)
+                                .await;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                session = %id.0,
+                                %err,
+                                "worktree cleanup on archive failed; \
+                                 keeping worktree triple on row so a \
+                                 future sweep can retry"
+                            );
+                        }
+                    }
+                }
+            }
         }
         self.publish_state(SessionStateChange {
             id: id.clone(),
@@ -711,6 +934,36 @@ fn state_str(s: SessionState) -> &'static str {
         SessionState::Exited => "exited",
         SessionState::Errored => "errored",
         SessionState::Archived => "archived",
+    }
+}
+
+/// Best-effort worktree rollback used by every error site in
+/// [`SessionManager::spawn_with_options`]. Errors are logged but never
+/// surfaced — the caller is already returning a typed `CoreError` and
+/// the worktree's only debt to the filesystem is the directory + branch
+/// pair, both of which `WorktreeManager::cleanup(_, Force)` handles
+/// idempotently.
+async fn rollback_worktree(
+    wt_mgr: &WorktreeManager,
+    repo_root: &std::path::Path,
+    plan: &WorktreePlan,
+) {
+    let handle = crate::worktree::WorktreeManager::handle_from_row(
+        repo_root.to_path_buf(),
+        &plan.path.to_string_lossy(),
+        &plan.branch,
+        &plan.base_branch,
+    );
+    if let Err(err) = wt_mgr
+        .cleanup(&handle, crate::worktree::CleanupMode::Force)
+        .await
+    {
+        tracing::warn!(
+            wt = %plan.path.display(),
+            branch = %plan.branch,
+            %err,
+            "worktree rollback failed (best-effort)"
+        );
     }
 }
 

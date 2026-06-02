@@ -34,11 +34,16 @@ pub mod error;
 pub mod event_bus;
 pub mod manager;
 pub mod session;
+pub mod worktree;
 
 pub use error::CoreError;
 pub use event_bus::{BusEvent, EventBus, Topic};
 pub use manager::{ManagerConfig, SessionManager, SpawnedSession};
 pub use session::{SessionId, SessionStateChange};
+pub use worktree::{
+    CleanupMode, HookStatus, WorktreeHandle, WorktreeManager, WorktreePlan,
+    POST_CREATE_HOOK_TIMEOUT,
+};
 
 /// Default idle threshold after which a `Running` session is reported as
 /// `Waiting` (no PTY output observed for this long).

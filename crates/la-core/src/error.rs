@@ -55,6 +55,39 @@ pub enum CoreError {
     /// variants fit (e.g. an `Other` IO error during orphan scan).
     #[error("internal: {0}")]
     Internal(String),
+
+    // ---------- Worktree provisioning (M2 / WEK-27) ----------
+    //
+    // The session manager calls `WorktreeManager::create` when
+    // `SessionsCreateParams.worktree = true`. Every typed failure that
+    // can stop a worktree from being provisioned is its own variant so
+    // the dispatcher can map it to the right `-33110..-33119` code and
+    // the TUI can show an actionable hint without parsing strings.
+    /// `project_dir` is not (inside) a git repository.
+    #[error("not a git repo: {path}")]
+    NotAGitRepo { path: String },
+    /// `git worktree add` refused because the worktree slot is busy —
+    /// dirty index, lock file held, sibling worktree already checked out
+    /// at the requested branch.
+    #[error("worktree busy: {reason}")]
+    WorktreeBusy { reason: String },
+    /// `la/session-<sid>` branch already exists. Should be impossible
+    /// under normal sid generation; treat as state damage.
+    #[error("branch already exists: {branch}")]
+    BranchCollision { branch: String },
+    /// Filesystem failure (ENOSPC, EACCES, …) while creating or removing
+    /// the worktree directory.
+    #[error("worktree io: {0}")]
+    WorktreeIo(#[source] std::io::Error),
+    /// `git` binary missing or too old to support `worktree add -b`
+    /// (< 2.20). `hint` carries the install / upgrade advice.
+    #[error("git unavailable: {hint}")]
+    GitUnavailable { hint: String },
+    /// Catch-all for `git worktree add` failures that don't match the
+    /// typed patterns. `stderr` is the trimmed first 4 KiB of git's
+    /// stderr so the user can self-diagnose without daemon log access.
+    #[error("worktree provision failed: {stderr}")]
+    WorktreeProvision { stderr: String },
 }
 
 impl CoreError {
@@ -82,6 +115,12 @@ impl CoreError {
             CoreError::NotAttached => K::NotAttached,
             CoreError::SessionBusy => K::SessionBusy,
             CoreError::Internal(_) => K::Internal,
+            CoreError::NotAGitRepo { .. } => K::WorktreeNotAGitRepo,
+            CoreError::WorktreeBusy { .. } => K::WorktreeBusy,
+            CoreError::BranchCollision { .. } => K::WorktreeBranchCollision,
+            CoreError::WorktreeIo(_) => K::WorktreeIo,
+            CoreError::GitUnavailable { .. } => K::WorktreeGitUnavailable,
+            CoreError::WorktreeProvision { .. } => K::WorktreeProvisionFailed,
         }
     }
 }

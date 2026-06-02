@@ -764,6 +764,24 @@ fn error_kind_to_code_table_is_pinned() {
             ErrorKind::AdapterUnsupportedOption,
             error_codes::ADAPTER_UNSUPPORTED_OPTION,
         ),
+        (
+            ErrorKind::WorktreeNotAGitRepo,
+            error_codes::WORKTREE_NOT_A_GIT_REPO,
+        ),
+        (ErrorKind::WorktreeBusy, error_codes::WORKTREE_BUSY),
+        (
+            ErrorKind::WorktreeBranchCollision,
+            error_codes::WORKTREE_BRANCH_COLLISION,
+        ),
+        (ErrorKind::WorktreeIo, error_codes::WORKTREE_IO),
+        (
+            ErrorKind::WorktreeGitUnavailable,
+            error_codes::WORKTREE_GIT_UNAVAILABLE,
+        ),
+        (
+            ErrorKind::WorktreeProvisionFailed,
+            error_codes::WORKTREE_PROVISION_FAILED,
+        ),
         (ErrorKind::StorageBusy, error_codes::STORAGE_BUSY),
         (ErrorKind::StorageConflict, error_codes::STORAGE_CONFLICT),
         (ErrorKind::StorageFailed, error_codes::STORAGE_FAILED),

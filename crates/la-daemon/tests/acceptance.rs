@@ -718,6 +718,65 @@ async fn shutdown_kills_term_ignoring_child_within_hard_cap() {
     );
 }
 
+/// WEK-27 regression: a daemon with an active worktree-sweep loop
+/// MUST still finish `DaemonHandle::shutdown` inside §6.4's 10 s
+/// ceiling. The first attempt at the sweep loop joined it AFTER the
+/// SIGKILL escalation, which pushed the wall-clock to ~11 s on CI.
+/// Shrink the sweep interval so the loop is actively running, then
+/// shut down and assert the join completes well under the ceiling.
+#[tokio::test]
+async fn shutdown_finishes_within_cap_with_active_worktree_sweep_loop() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let runtime_dir = tempdir.path().join("runtime");
+    let state_dir = tempdir.path().join("state");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let socket = runtime_dir.join("lad-1.sock");
+
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(ShellAdapter {
+        script: "true".to_string(),
+    });
+    let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+    adapters.insert("shtest".to_string(), adapter);
+
+    let config = DaemonConfig {
+        state_dir,
+        socket_discovery: SocketDiscovery::with_override(socket.clone()),
+        adapters,
+        // Make the sweep loop fire roughly every tick of the test so
+        // it's actively running when shutdown lands — otherwise the
+        // first iteration's `sleep(WORKTREE_SWEEP_INTERVAL)` would
+        // soak up the test entirely.
+        worktree_sweep_interval: Duration::from_millis(100),
+        ..DaemonConfig::default()
+    };
+    let daemon = Daemon::bind(config).await.expect("bind");
+    let (handle, join) = daemon.spawn();
+
+    // Let the sweep loop spin at least once before we ask for
+    // shutdown, so the test is exercising "abort a tick that's
+    // already past its first `await`".
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let started = std::time::Instant::now();
+    handle.shutdown();
+    let joined = timeout(Duration::from_secs(11), join).await;
+    let elapsed = started.elapsed();
+    assert!(
+        joined.is_ok(),
+        "daemon shutdown didn't finish within §6.4's 10s+epsilon \
+         with worktree sweep loop active (elapsed {elapsed:?})"
+    );
+    // No live sessions in this test → shutdown should be FAST. Allow
+    // generous slack for CI noise but flag if the sweep loop adds
+    // material wall-time back into the path.
+    assert!(
+        elapsed <= Duration::from_secs(2),
+        "shutdown took {elapsed:?} with sweep loop active — should be \
+         under 2 s when no live sessions need draining"
+    );
+}
+
 /// `lad daemonize` end-to-end: spawn the actual binary, confirm the
 /// socket appears, then send SIGTERM and confirm cleanup.
 ///

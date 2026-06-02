@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use la_adapter::AgentAdapter;
-use la_core::{ManagerConfig, SessionManager};
+use la_core::{ManagerConfig, SessionManager, WorktreeManager};
 use la_ipc::transport::{Endpoint, Listener};
 use la_storage::{Storage, StorageConfig};
 use tokio::sync::Notify;
@@ -27,6 +27,17 @@ use crate::dispatcher::{serve_connection, AdapterRegistry, ConnectionContext};
 use crate::health::{spawn_loop, HealthRegistry, ProbeLoopConfig, DEFAULT_PROBE_INTERVAL};
 use crate::paths::{ensure_runtime_dir, SocketDiscovery, SocketLocation};
 use crate::signals::DEFAULT_SHUTDOWN_DEADLINE;
+
+/// WEK-27 TTL for archived worktree sweep: rows whose `archived_at`
+/// is older than this are reaped on daemon startup and on each
+/// [`WORKTREE_SWEEP_INTERVAL`] tick. Issue body pins 7 days.
+pub const WORKTREE_SWEEP_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How often the daemon re-runs `WorktreeManager::sweep_expired`. Once
+/// an hour comfortably misses the 7-day TTL by several orders of
+/// magnitude, but keeps the loop responsive enough that a long-running
+/// daemon doesn't accumulate weeks of orphan worktrees.
+pub const WORKTREE_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Errors surfaced while spinning up a daemon.
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +74,14 @@ pub struct DaemonConfig {
     /// `daemon.health` (WEK-29 / M2.6). Tests typically shrink this so
     /// they don't have to wait the full 60 s between rounds.
     pub probe_interval: Duration,
+    /// WEK-27: TTL for the archived-worktree sweep loop. Defaults to
+    /// [`WORKTREE_SWEEP_TTL`] (7 days). Tests shrink it to a few ms so
+    /// the sweep predicate can be asserted without sleeping a week.
+    pub worktree_sweep_ttl: Duration,
+    /// WEK-27: how often the sweep loop wakes up. Defaults to
+    /// [`WORKTREE_SWEEP_INTERVAL`] (1 hour). Tests shrink this together
+    /// with `worktree_sweep_ttl` to drive the periodic path.
+    pub worktree_sweep_interval: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -75,6 +94,8 @@ impl Default for DaemonConfig {
             server_version: crate::SERVER_VERSION.to_string(),
             shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
             probe_interval: DEFAULT_PROBE_INTERVAL,
+            worktree_sweep_ttl: WORKTREE_SWEEP_TTL,
+            worktree_sweep_interval: WORKTREE_SWEEP_INTERVAL,
         }
     }
 }
@@ -91,6 +112,11 @@ pub struct Daemon {
     /// Health probe loop join handle — awaited on graceful shutdown so
     /// the last SQLite upsert isn't truncated mid-write.
     health_loop: Option<JoinHandle<()>>,
+    /// WEK-27 archived-worktree sweep loop. Same shutdown discipline
+    /// as `health_loop`: aborted on graceful shutdown so the daemon
+    /// doesn't tear the SQLite handle out from under an in-flight
+    /// query.
+    worktree_sweep_loop: Option<JoinHandle<()>>,
 }
 
 impl Daemon {
@@ -106,6 +132,8 @@ impl Daemon {
             server_version,
             shutdown_deadline,
             probe_interval,
+            worktree_sweep_ttl,
+            worktree_sweep_interval,
         } = config;
 
         let socket = socket_discovery.resolve();
@@ -115,6 +143,17 @@ impl Daemon {
         let database_path = state_dir.join("lad.sqlite");
         let storage_config = StorageConfig::new(database_path, state_dir.clone());
         let storage = Storage::open(storage_config).await?;
+
+        // WEK-27: provision the per-session worktree manager once at
+        // startup. We always construct it (the directory is created
+        // lazily on first use) and stash the Arc on `ManagerConfig` so
+        // `SessionManager::spawn_with_options` can honour
+        // `worktree=true` without a follow-up wiring step. Capability
+        // bit flips on the same path so the client knows the daemon
+        // will actually act on the flag.
+        let worktree_mgr = Arc::new(WorktreeManager::for_state_dir(&state_dir));
+        let mut manager_config = manager_config;
+        manager_config.worktree = Some(worktree_mgr.clone());
 
         // Refresh the backends table from the live adapter set so
         // `sessions.list` joins still resolve even on a fresh install.
@@ -146,6 +185,35 @@ impl Daemon {
             tracing::info!(count = reaped, "reaped orphan sessions on startup");
         }
 
+        // WEK-27 §2.4: best-effort `git worktree prune` per known
+        // project root on startup so the daemon picks up after a
+        // crashed predecessor that left orphan worktree entries in
+        // `<repo>/.git/worktrees/`. The call is non-fatal — a wedged
+        // repo logs and the daemon still boots.
+        if let Ok(projects) = storage.projects().list().await {
+            for p in projects {
+                worktree_mgr
+                    .prune_orphans(std::path::Path::new(&p.root_path))
+                    .await;
+            }
+        }
+
+        // WEK-27 §2.4 acceptance: 7-day TTL sweep of archived
+        // worktrees. Runs once on startup so a daemon that's been
+        // down past the TTL still catches up, then on a tick by the
+        // background loop below.
+        let (sweep_ok, sweep_err) = worktree_mgr
+            .sweep_expired(&storage, worktree_sweep_ttl)
+            .await;
+        if sweep_ok > 0 || sweep_err > 0 {
+            tracing::info!(
+                swept = sweep_ok,
+                failed = sweep_err,
+                ttl_secs = worktree_sweep_ttl.as_secs(),
+                "worktree sweep on startup"
+            );
+        }
+
         let endpoint = endpoint_for(&socket.socket_path);
         let listener = Listener::bind(&endpoint).await?;
 
@@ -175,6 +243,17 @@ impl Daemon {
         };
         let health_loop = Some(spawn_loop(probe_cfg));
 
+        // WEK-27 background sweep tick. Cheap (one indexed SELECT per
+        // tick when the workload is at rest), so the interval doesn't
+        // need to be tuned per-deployment.
+        let sweep_loop = Some(spawn_worktree_sweep_loop(WorktreeSweepLoopConfig {
+            worktree: worktree_mgr.clone(),
+            storage: manager.storage().clone(),
+            ttl: worktree_sweep_ttl,
+            interval: worktree_sweep_interval,
+            shutdown: shutdown.clone(),
+        }));
+
         Ok(Self {
             manager,
             socket,
@@ -183,6 +262,7 @@ impl Daemon {
             shutdown,
             shutdown_deadline,
             health_loop,
+            worktree_sweep_loop: sweep_loop,
         })
     }
 
@@ -218,6 +298,7 @@ impl Daemon {
             shutdown,
             shutdown_deadline,
             health_loop,
+            worktree_sweep_loop,
         } = self;
 
         tracing::info!(socket = %socket.socket_path.display(), "lad listening");
@@ -252,6 +333,24 @@ impl Daemon {
 
         // Tell connections to wind down; they observe `ctx.shutdown.notified()`.
         ctx.shutdown.notify_waiters();
+
+        // Stop the non-critical background loops *before* we start the
+        // §6.4 10 s countdown. Their `.await` could otherwise add real
+        // wall time on a CI box mid-tick (a sweep iteration that's
+        // chained 2–3 git invocations can take ~1 s before reaching
+        // an abort-point), and §6.4's shutdown ceiling applies only to
+        // the SIGTERM → SIGKILL escalation — not to bookkeeping tasks.
+        // Each `.await` is bounded so a pathologically slow unwind
+        // never blocks shutdown either.
+        const BACKGROUND_LOOP_JOIN_BUDGET: Duration = Duration::from_millis(200);
+        if let Some(h) = health_loop {
+            h.abort();
+            let _ = tokio::time::timeout(BACKGROUND_LOOP_JOIN_BUDGET, h).await;
+        }
+        if let Some(h) = worktree_sweep_loop {
+            h.abort();
+            let _ = tokio::time::timeout(BACKGROUND_LOOP_JOIN_BUDGET, h).await;
+        }
 
         // Best-effort: SIGTERM live sessions so PTY children get a chance
         // to clean up. The session manager's per-session pump observes
@@ -337,18 +436,10 @@ impl Daemon {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // Health probe loop watches the same `shutdown` Notify, but
-        // `Notify::notify_waiters` doesn't latch — a notification that
-        // fires before the loop reaches `notified().await` is lost. We
-        // therefore abort the join handle explicitly and then `.await`
-        // it so the task actually unwinds before we close storage.
-        // The loop has no critical mid-step state (every step is a
-        // single SQLite upsert + a broadcast publish), so abort-at-an-
-        // .await-point is graceful enough.
-        if let Some(h) = health_loop {
-            h.abort();
-            let _ = h.await;
-        }
+        // Health probe loop + worktree sweep loop were already torn
+        // down at the top of the shutdown sequence (before the §6.4
+        // 10 s countdown started) so they don't eat into the SIGKILL
+        // budget. Nothing more to do here besides closing storage.
 
         manager.storage().close().await;
         // Drop the listener to remove the socket file; the la-ipc Listener
@@ -410,4 +501,48 @@ async fn ensure_socket_unbound(path: &Path) -> Result<(), DaemonError> {
         let _ = path;
         Ok(())
     }
+}
+
+/// Knobs for [`spawn_worktree_sweep_loop`]. Kept as its own struct so
+/// integration tests can shrink the interval / TTL without re-wiring
+/// the whole daemon.
+struct WorktreeSweepLoopConfig {
+    worktree: Arc<WorktreeManager>,
+    storage: la_storage::Storage,
+    ttl: Duration,
+    interval: Duration,
+    shutdown: Arc<Notify>,
+}
+
+/// Spawn a background task that wakes every `interval` and asks the
+/// [`WorktreeManager`] to reap archived rows older than `ttl`. Mirrors
+/// the health-loop pattern: every step is a single SQLite read + a
+/// bounded number of git invocations, so abort-at-an-`.await`-point
+/// during shutdown is graceful enough.
+fn spawn_worktree_sweep_loop(cfg: WorktreeSweepLoopConfig) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let WorktreeSweepLoopConfig {
+            worktree,
+            storage,
+            ttl,
+            interval,
+            shutdown,
+        } = cfg;
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                _ = tokio::time::sleep(interval) => {
+                    let (ok, err) = worktree.sweep_expired(&storage, ttl).await;
+                    if ok > 0 || err > 0 {
+                        tracing::info!(
+                            swept = ok,
+                            failed = err,
+                            ttl_secs = ttl.as_secs(),
+                            "worktree sweep tick"
+                        );
+                    }
+                }
+            }
+        }
+    })
 }

@@ -166,9 +166,10 @@ impl<'a> SessionsRepo<'a> {
                 r#"
                 INSERT INTO sessions(
                     id, project_id, backend_id, external_id, title, state, pid,
-                    worktree_path, worktree_branch, base_branch, spawn_args, origin
+                    worktree_path, worktree_branch, base_branch, spawn_args, origin,
+                    post_create_hook_status
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 "#,
             )
             .bind(&session.id)
@@ -183,6 +184,7 @@ impl<'a> SessionsRepo<'a> {
             .bind(&session.base_branch)
             .bind(&spawn_args)
             .bind(&session.origin)
+            .bind(&session.post_create_hook_status)
             .execute(self.storage.writer_pool())
             .await
         })
@@ -197,7 +199,8 @@ impl<'a> SessionsRepo<'a> {
             r#"
             SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                    worktree_path, worktree_branch, base_branch, spawn_args, origin,
-                   transcript_path, transcript_bytes, created_at, updated_at, archived_at
+                   transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+                   post_create_hook_status
             FROM sessions
             WHERE id = ?1
             "#,
@@ -218,7 +221,8 @@ impl<'a> SessionsRepo<'a> {
                 r#"
                 SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                        worktree_path, worktree_branch, base_branch, spawn_args, origin,
-                       transcript_path, transcript_bytes, created_at, updated_at, archived_at
+                       transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+                       post_create_hook_status
                 FROM sessions
                 WHERE project_id = ?1
                 ORDER BY created_at DESC
@@ -233,7 +237,8 @@ impl<'a> SessionsRepo<'a> {
                 r#"
                 SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                        worktree_path, worktree_branch, base_branch, spawn_args, origin,
-                       transcript_path, transcript_bytes, created_at, updated_at, archived_at
+                       transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+                       post_create_hook_status
                 FROM sessions
                 WHERE project_id = ?1 AND archived_at IS NULL
                 ORDER BY created_at DESC
@@ -292,7 +297,8 @@ impl<'a> SessionsRepo<'a> {
             r#"
             SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                    worktree_path, worktree_branch, base_branch, spawn_args, origin,
-                   transcript_path, transcript_bytes, created_at, updated_at, archived_at
+                   transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+                   post_create_hook_status
             FROM sessions
             WHERE state IN ('starting', 'running', 'waiting')
             "#,
@@ -300,6 +306,122 @@ impl<'a> SessionsRepo<'a> {
         .fetch_all(self.storage.reader_pool())
         .await
         .map_err(Into::into)
+    }
+
+    /// All archived sessions whose `archived_at` is older than the given
+    /// cutoff. Drives the TTL sweep in
+    /// `la_core::worktree::WorktreeManager::sweep_expired` — partial
+    /// index `idx_sessions_archived_at` keeps this O(matches).
+    pub async fn list_archived_older_than(&self, cutoff_rfc3339: &str) -> Result<Vec<Session>> {
+        sqlx::query_as::<_, Session>(
+            r#"
+            SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
+                   worktree_path, worktree_branch, base_branch, spawn_args, origin,
+                   transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+                   post_create_hook_status
+            FROM sessions
+            WHERE archived_at IS NOT NULL AND archived_at < ?1
+            "#,
+        )
+        .bind(cutoff_rfc3339)
+        .fetch_all(self.storage.reader_pool())
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Archived rows that still own a worktree directory and whose
+    /// `archived_at` is older than `ttl_seconds` ago, computed inside
+    /// SQLite so callers don't need a wall-clock library. Used by
+    /// `la_core::worktree::WorktreeManager::sweep_expired` — narrower
+    /// than [`list_archived_older_than`] so we don't reconstruct
+    /// handles for rows whose worktree is already gone.
+    pub async fn list_archived_with_worktree_older_than_seconds(
+        &self,
+        ttl_seconds: i64,
+    ) -> Result<Vec<Session>> {
+        // SQLite `datetime('now', '-N seconds')` returns the same
+        // `YYYY-MM-DD HH:MM:SS` format that archive() writes, so a
+        // plain lexicographic `<` comparison is correct.
+        let modifier = format!("-{ttl_seconds} seconds");
+        sqlx::query_as::<_, Session>(
+            r#"
+            SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
+                   worktree_path, worktree_branch, base_branch, spawn_args, origin,
+                   transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+                   post_create_hook_status
+            FROM sessions
+            WHERE archived_at IS NOT NULL
+              AND worktree_path IS NOT NULL
+              AND archived_at < datetime('now', ?1)
+            "#,
+        )
+        .bind(modifier)
+        .fetch_all(self.storage.reader_pool())
+        .await
+        .map_err(Into::into)
+    }
+
+    /// All non-archived sessions belonging to `project_id` that still
+    /// own a worktree path. Helps the diff panel and prune logic find
+    /// every live worktree under a given project without scanning all
+    /// sessions.
+    pub async fn list_with_worktree_by_project(&self, project_id: &str) -> Result<Vec<Session>> {
+        sqlx::query_as::<_, Session>(
+            r#"
+            SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
+                   worktree_path, worktree_branch, base_branch, spawn_args, origin,
+                   transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+                   post_create_hook_status
+            FROM sessions
+            WHERE project_id = ?1
+              AND worktree_path IS NOT NULL
+              AND archived_at IS NULL
+            "#,
+        )
+        .bind(project_id)
+        .fetch_all(self.storage.reader_pool())
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Set `worktree_path` to NULL after cleanup. When
+    /// `keep_branch = false`, also nulls `worktree_branch`. Per WEK-8
+    /// §2.4 row 2, the branch column survives the archive whenever the
+    /// branch itself was preserved on disk — that's how the TUI can
+    /// later offer "checkout this archived session's work".
+    /// `base_branch` is always left intact for postmortem inspection;
+    /// callers that need to wipe everything can `delete` the row.
+    pub async fn clear_worktree(&self, id: &str, keep_branch: bool) -> Result<bool> {
+        let sql = if keep_branch {
+            "UPDATE sessions SET worktree_path = NULL, updated_at = datetime('now') WHERE id = ?1"
+        } else {
+            "UPDATE sessions SET worktree_path = NULL, worktree_branch = NULL, updated_at = datetime('now') WHERE id = ?1"
+        };
+        let result = retry_busy(|| async {
+            sqlx::query(sql)
+                .bind(id)
+                .execute(self.storage.writer_pool())
+                .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Update the `post_create_hook_status` column for a session. Only
+    /// the four CHECK-constrained values are accepted by SQLite; callers
+    /// should pass one of `'ok' | 'failed' | 'skipped' | 'timeout'`.
+    pub async fn set_post_create_hook_status(&self, id: &str, status: &str) -> Result<bool> {
+        let result = retry_busy(|| async {
+            sqlx::query(
+                "UPDATE sessions SET post_create_hook_status = ?2, updated_at = datetime('now') WHERE id = ?1",
+            )
+            .bind(id)
+            .bind(status)
+            .execute(self.storage.writer_pool())
+            .await
+        })
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn archive(&self, id: &str) -> Result<bool> {
@@ -517,7 +639,8 @@ async fn session_by_id(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<Opt
         r#"
         SELECT id, project_id, backend_id, external_id, title, state, exit_code, pid,
                worktree_path, worktree_branch, base_branch, spawn_args, origin,
-               transcript_path, transcript_bytes, created_at, updated_at, archived_at
+               transcript_path, transcript_bytes, created_at, updated_at, archived_at,
+               post_create_hook_status
         FROM sessions
         WHERE id = ?1
         "#,

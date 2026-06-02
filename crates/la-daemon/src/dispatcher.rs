@@ -128,7 +128,12 @@ where
     let caps = ServerCapabilities {
         adapters: ctx.adapters.names(),
         cron: false,
-        worktree: false,
+        // WEK-27: signal that `sessions.create { worktree: true }` is
+        // wired and honoured. `Daemon::bind` always constructs a
+        // `WorktreeManager`, so this is unconditionally `true` from M2
+        // onwards; if a future build wants to disable worktrees it
+        // should clear `ManagerConfig.worktree` AND drop this bit.
+        worktree: true,
         events: true,
     };
     let handshake = match server_handshake(
@@ -589,9 +594,22 @@ async fn handle_sessions_create(
     req.prompt = params.prompt;
     req.stdin_mode = StdinMode::Pty;
 
+    // WEK-27: pass worktree options through to the manager. The flag
+    // turns into a `WorktreeSpawnOptions { repo_root }` rooted at the
+    // project dir; if the manager wasn't configured with a worktree
+    // root we surface that as `Internal` (it's a daemon mis-wire, not
+    // a user error). The manager handles the rest atomically.
+    let worktree_opts = if params.worktree {
+        Some(la_core::manager::WorktreeSpawnOptions {
+            repo_root: std::path::PathBuf::from(&params.project_dir),
+        })
+    } else {
+        None
+    };
+
     let spawned = state
         .manager
-        .spawn(&*adapter, project_id, req)
+        .spawn_with_options(&*adapter, project_id, req, worktree_opts)
         .await
         .map_err(core_to_rpc)?;
 
@@ -599,10 +617,15 @@ async fn handle_sessions_create(
         rows: 32,
         cols: 120,
     };
+    let cwd = spawned
+        .worktree_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| params.project_dir.clone());
     ok(SessionsCreateResult {
         session_id: spawned.id.0.clone(),
         backend: spawned.backend,
-        cwd: params.project_dir,
+        cwd,
         initial_size: initial_pty,
         state: spawned.initial_state,
     })
