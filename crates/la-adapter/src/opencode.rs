@@ -42,6 +42,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::ext_time::file_mtime_rfc3339;
 use crate::{
     AdapterDescriptor, AdapterError, AdapterEvent, AgentAdapter, DiscoverHints, DiscoveredSession,
     ParserState, ProbeResult, SpawnRequest, SpawnSpec, StdinMode, StopAction, StopSequence,
@@ -308,7 +309,7 @@ impl AgentAdapter for OpencodeAdapter {
         &self,
         hints: &DiscoverHints,
     ) -> Result<Vec<DiscoveredSession>, AdapterError> {
-        let root = match sessions_root() {
+        let root = match hints.source_path_override.clone().or_else(sessions_root) {
             Some(p) => p,
             None => return Ok(Vec::new()),
         };
@@ -351,10 +352,16 @@ impl AgentAdapter for OpencodeAdapter {
                     continue;
                 }
             }
+            let created_at = meta
+                .created_at
+                .clone()
+                .or_else(|| file_mtime_rfc3339(&file));
             out.push(DiscoveredSession {
                 external_id: meta.id,
                 project_hint: meta.cwd.map(PathBuf::from),
                 title_hint: meta.title,
+                external_path: Some(file.clone()),
+                created_at,
             });
         }
 
@@ -395,6 +402,18 @@ struct SessionMetaPayload {
     cwd: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    /// Opencode persists the session's wall-clock start in one of
+    /// several keys depending on release; the adapter falls back to the
+    /// file's mtime when none match.
+    #[serde(
+        default,
+        alias = "created_at",
+        alias = "createdAt",
+        alias = "started_at",
+        alias = "startedAt",
+        alias = "timestamp"
+    )]
+    created_at: Option<String>,
 }
 
 /// Pull the first sem-ver-ish token out of `opencode --version` output.

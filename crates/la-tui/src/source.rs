@@ -27,7 +27,9 @@ pub trait SessionSource {
     ///
     /// Implementations MUST place the synthetic Archived group last when
     /// any archived session exists; the sidebar relies on that ordering for
-    /// PRD §5.3 ("末尾固定 Archived 分组").
+    /// PRD §5.3 ("末尾固定 Archived 分组"). The synthetic Discovered
+    /// group, when present, sits just above the Archived bucket so the
+    /// project-list order isn't disturbed.
     fn snapshot(&self) -> Vec<ProjectGroup>;
 
     /// Move a session into the Archived bucket. No-op if `session_id` is
@@ -40,6 +42,14 @@ pub trait SessionSource {
 
     /// Restore a previously archived session back to its project group.
     fn restore(&mut self, session_id: &str);
+
+    /// Promote a discovered (read-only) session into a native session
+    /// row. `session_id` here is the discovered row's `external_id` —
+    /// the daemon-backed implementation passes it through
+    /// `sessions.import`; the mock implementation just flips the row's
+    /// `discovered` flag so the snapshot moves it back under its
+    /// originating project. No-op for unknown / already-imported ids.
+    fn import_discovered(&mut self, _session_id: &str) {}
 }
 
 /// In-memory `SessionSource` used by tests and the binary's `--demo` mode.
@@ -105,6 +115,31 @@ impl MockSessionSource {
             title: title.map(str::to_string),
             run_state,
             archived: false,
+            discovered: false,
+        };
+        self.rows.insert(session_id, row);
+    }
+
+    /// Insert a discovered (read-only) session under the Discovered
+    /// bucket. The mock keeps the row's `project_id` set to its
+    /// originating project so `import_discovered` can flip the flag and
+    /// have the snapshot route the row back under its real project.
+    pub fn add_discovered_session(
+        &mut self,
+        session_id: impl Into<String>,
+        project_id: impl Into<String>,
+        backend: &str,
+        title: Option<&str>,
+    ) {
+        let session_id = session_id.into();
+        let row = SessionRow {
+            session_id: session_id.clone(),
+            project_id: project_id.into(),
+            backend: Backend::new(backend),
+            title: title.map(str::to_string),
+            run_state: RunState::Exited,
+            archived: false,
+            discovered: true,
         };
         self.rows.insert(session_id, row);
     }
@@ -153,6 +188,20 @@ impl MockSessionSource {
             RunState::Exited,
         );
         s.archive(&archived_id);
+        // One discovered session per backend so the bucket is non-empty
+        // in the demo binary (WEK-26).
+        s.add_discovered_session(
+            "discovered-codex-abc",
+            "p-a",
+            "codex",
+            Some("Codex chat (discovered)"),
+        );
+        s.add_discovered_session(
+            "discovered-claude-xyz",
+            "p-b",
+            "claude",
+            Some("Claude chat (discovered)"),
+        );
         s
     }
 }
@@ -174,8 +223,13 @@ impl SessionSource for MockSessionSource {
                 g
             })
             .collect();
+        let mut discovered = ProjectGroup::discovered();
         let mut archived = ProjectGroup::archived();
         for row in self.rows.values() {
+            if row.discovered {
+                discovered.sessions.push(row.clone());
+                continue;
+            }
             if row.archived {
                 archived.sessions.push(row.clone());
                 continue;
@@ -185,6 +239,9 @@ impl SessionSource for MockSessionSource {
             }
             // Sessions whose project_id is unknown are dropped silently
             // (test fixtures that point at non-registered projects).
+        }
+        if !discovered.sessions.is_empty() {
+            groups.push(discovered);
         }
         if !archived.sessions.is_empty() {
             groups.push(archived);
@@ -207,6 +264,12 @@ impl SessionSource for MockSessionSource {
             row.archived = false;
         }
     }
+
+    fn import_discovered(&mut self, session_id: &str) {
+        if let Some(row) = self.rows.get_mut(session_id) {
+            row.discovered = false;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -217,12 +280,41 @@ mod tests {
     fn fixture_snapshot_shape() {
         let src = MockSessionSource::fixture();
         let snap = src.snapshot();
-        assert_eq!(snap.len(), 3, "two projects + archived bucket");
+        assert_eq!(snap.len(), 4, "two projects + discovered + archived bucket");
         assert!(!snap[0].is_archived);
         assert!(snap.last().unwrap().is_archived, "archived pinned last");
+        let discovered = snap
+            .iter()
+            .find(|g| g.is_discovered())
+            .expect("discovered bucket exists");
+        assert_eq!(discovered.sessions.len(), 2);
+        assert!(discovered.sessions.iter().all(|s| s.discovered));
         assert_eq!(snap[0].sessions.len(), 2);
         assert_eq!(snap[1].sessions.len(), 2);
         assert_eq!(snap.last().unwrap().sessions.len(), 1);
+    }
+
+    #[test]
+    fn import_discovered_routes_row_back_under_its_project() {
+        let mut src = MockSessionSource::new();
+        src.add_project("p1", "p1", "/p1");
+        src.add_discovered_session("ext-1", "p1", "claude", Some("From disk"));
+        let before = src.snapshot();
+        assert!(before.iter().any(|g| g.is_discovered()));
+        assert!(before
+            .iter()
+            .find(|g| g.project_id == "p1")
+            .map(|g| g.sessions.is_empty())
+            .unwrap_or(false));
+        src.import_discovered("ext-1");
+        let after = src.snapshot();
+        assert!(
+            after.iter().all(|g| !g.is_discovered()),
+            "discovered bucket empties after import"
+        );
+        let p1 = after.iter().find(|g| g.project_id == "p1").unwrap();
+        assert_eq!(p1.sessions.len(), 1);
+        assert!(!p1.sessions[0].discovered);
     }
 
     #[test]

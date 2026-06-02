@@ -16,9 +16,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use la_proto::methods::{
-    EventsSubscribe, Initialize, Method, SessionsArchive, SessionsAttach, SessionsCreate,
-    SessionsDelete, SessionsDetach, SessionsImport, SessionsList, SessionsReplay, SessionsResize,
-    SessionsSignal, SessionsWrite, Shutdown,
+    AdaptersDiscover, EventsSubscribe, Initialize, Method, SessionsArchive, SessionsAttach,
+    SessionsCreate, SessionsDelete, SessionsDetach, SessionsImport, SessionsList, SessionsReplay,
+    SessionsResize, SessionsSignal, SessionsWrite, Shutdown,
 };
 use la_proto::notifications::{
     CronFired, DaemonHealth, NotificationMethod, SessionGap, SessionOutput, SessionStateNotice,
@@ -45,6 +45,7 @@ fn main() {
     write_method::<SessionsSignal>(&out_dir);
     write_method::<SessionsArchive>(&out_dir);
     write_method::<SessionsDelete>(&out_dir);
+    write_method::<AdaptersDiscover>(&out_dir);
     write_method::<SessionsImport>(&out_dir);
     write_method::<SessionsReplay>(&out_dir);
     write_method::<EventsSubscribe>(&out_dir);

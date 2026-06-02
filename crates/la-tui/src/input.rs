@@ -76,6 +76,7 @@ fn translate_key(code: KeyCode, mods: KeyModifiers, modal: Option<&Modal>) -> Op
         KeyCode::Char('d') => AppMsg::Delete,
         KeyCode::Char('a') => AppMsg::ArchiveOrRestore,
         KeyCode::Char('n') => AppMsg::NewSession,
+        KeyCode::Char('i') => AppMsg::ImportDiscovered,
         KeyCode::Esc => AppMsg::Cancel,
 
         // Ctrl-C is treated as Quit so muscle memory works even when the

@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AdaptersDiscoverParams",
+  "type": "object",
+  "properties": {
+    "backend": {
+      "description": "Restrict discovery to a single backend; `None` ⇒ every adapter.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_path": {
+      "description": "Override the adapter's default discovery root. Only meaningful when `backend` is set (each adapter has its own root).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "project_root": {
+      "description": "Restrict results to sessions whose recorded cwd matches this project root. `None` ⇒ no filter.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

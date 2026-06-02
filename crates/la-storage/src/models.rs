@@ -62,6 +62,11 @@ pub struct Session {
     /// NOT roll back the worktree or mutate `SessionStatus` — the TUI
     /// renders this as a separate badge.
     pub post_create_hook_status: Option<String>,
+    /// Absolute path to the backend's own transcript file for sessions
+    /// promoted via `sessions.import` (architecture §4.2 双轨). NULL on
+    /// native (`origin='user'` / `'cron:*'`) sessions; the daemon
+    /// promises never to mutate this file.
+    pub external_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +88,9 @@ pub struct NewSession {
     /// inserted; `WorktreeManager` calls
     /// [`super::SessionsRepo::set_post_create_hook_status`] to fill it in.
     pub post_create_hook_status: Option<String>,
+    /// See [`Session::external_path`]. Set by the `sessions.import`
+    /// path; left `None` on native session creation.
+    pub external_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]

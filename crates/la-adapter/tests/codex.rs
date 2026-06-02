@@ -267,6 +267,7 @@ async fn discover_reads_nested_rollout_layout() {
     std::env::set_var(SESSIONS_DIR_ENV, &root);
     let hints = DiscoverHints {
         project_root: Some(canon_a.clone()),
+        source_path_override: None,
     };
     let filtered = adapter.discover(&hints).await.expect("discover");
     std::env::remove_var(SESSIONS_DIR_ENV);

@@ -328,6 +328,7 @@ async fn orphan_reaper_marks_stale_rows_exited() {
             spawn_args: serde_json::json!({}),
             origin: "user".to_string(),
             post_create_hook_status: None,
+            external_path: None,
         })
         .await
         .expect("insert orphan");

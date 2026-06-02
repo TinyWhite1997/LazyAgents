@@ -13,7 +13,7 @@ pub use storage::{Storage, StorageConfig};
 
 pub const MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-pub const CURRENT_SCHEMA_VERSION: &str = "2";
+pub const CURRENT_SCHEMA_VERSION: &str = "3";
 pub const DEFAULT_TRANSCRIPT_SPILL_BYTES: i64 = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]

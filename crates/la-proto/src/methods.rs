@@ -42,6 +42,7 @@ pub const METHOD_NAMES: &[&str] = &[
     SessionsSignal::NAME,
     SessionsArchive::NAME,
     SessionsDelete::NAME,
+    AdaptersDiscover::NAME,
     SessionsImport::NAME,
     SessionsReplay::NAME,
     EventsSubscribe::NAME,
@@ -545,14 +546,93 @@ impl Method for SessionsDelete {
     type Result = SessionsDeleteResult;
 }
 
+// ---------- adapters.discover ----------
+
+/// Walk every registered adapter's on-disk session store and surface
+/// what exists, without altering it (architecture §4.2 双轨发现).
+///
+/// The daemon returns one entry per session the adapter found on disk;
+/// rows already promoted to native LazyAgents sessions (i.e. previously
+/// `sessions.import`-ed) are flagged via `already_imported = true` so
+/// the TUI can grey them out instead of offering import again.
+///
+/// `source_path` lets the client point a single adapter at a non-default
+/// discovery root (e.g. a fixture dir during tests). When `backend` is
+/// `None` the daemon iterates every registered adapter.
+pub enum AdaptersDiscover {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[schemars(rename = "AdaptersDiscoverParams")]
+pub struct AdaptersDiscoverParams {
+    /// Restrict discovery to a single backend; `None` ⇒ every adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Override the adapter's default discovery root. Only meaningful
+    /// when `backend` is set (each adapter has its own root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// Restrict results to sessions whose recorded cwd matches this
+    /// project root. `None` ⇒ no filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "AdaptersDiscoverResult")]
+pub struct AdaptersDiscoverResult {
+    pub discovered: Vec<DiscoveredSession>,
+}
+
+/// One pre-existing backend session surfaced from disk. Mirrors
+/// `la_adapter::DiscoveredSession` plus the daemon-side bookkeeping
+/// fields (`backend`, `external_path`, `already_imported`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DiscoveredSession {
+    pub backend: String,
+    pub external_id: String,
+    /// Absolute path to the backend's own transcript file (JSONL/JSON).
+    /// The daemon promises never to mutate it; the import path stores
+    /// it as a read-only reference (architecture §4.2 双轨).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_path: Option<String>,
+    /// Project root hint reported by the backend (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_hint: Option<String>,
+    /// Backend-provided title or first-line preview (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_hint: Option<String>,
+    /// RFC3339 creation timestamp recorded by the backend. Falls back
+    /// to the discovery file's mtime when the backend payload doesn't
+    /// carry one; `None` only when neither could be obtained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// `true` when the daemon's `sessions` table already contains a row
+    /// for this `(backend, external_id)`. TUI should grey-out import
+    /// affordance for these entries.
+    #[serde(default)]
+    pub already_imported: bool,
+}
+
+impl Method for AdaptersDiscover {
+    const NAME: &'static str = "adapters.discover";
+    type Params = AdaptersDiscoverParams;
+    type Result = AdaptersDiscoverResult;
+}
+
 // ---------- sessions.import ----------
 
-/// Discover sessions managed by the named backend on this host and import
-/// them as read-only references (architecture §4.2 双轨发现).
+/// Promote one or more backend-native sessions discovered by
+/// `adapters.discover` into the daemon's `sessions` table as read-only
+/// references (architecture §4.2 双轨发现).
+///
+/// `external_ids` (when set) restricts the import to a specific subset;
+/// `None` ⇒ import every session the adapter currently discovers. The
+/// daemon never copies the backend's transcript file — it only records
+/// the `external_id` + `external_path` so resume can re-attach the
+/// backend's own data store.
 ///
 /// `source_path` lets the client point the adapter at a non-default
-/// discovery root (e.g. `~/.claude/projects` overridden during testing);
-/// `None` ⇒ the adapter's built-in default.
+/// discovery root (e.g. `~/.claude/projects` overridden during testing).
 pub enum SessionsImport {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -561,6 +641,11 @@ pub struct SessionsImportParams {
     pub backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
+    /// Specific external ids to import; `None` ⇒ every discovered
+    /// session. Unknown ids are silently dropped so a stale TUI
+    /// snapshot never wedges an import call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -569,9 +654,14 @@ pub struct SessionsImportResult {
     pub imported: Vec<ImportedSession>,
 }
 
-/// A read-only reference to a backend-native session discovered on disk.
-/// The daemon assigns a fresh `session_id` so the rest of the system can
-/// reference it uniformly; `external_id` preserves the backend's own id.
+/// A read-only reference to a backend-native session promoted into the
+/// daemon's `sessions` table. The daemon assigns a fresh `session_id`
+/// so the rest of the system can reference it uniformly; `external_id`
+/// preserves the backend's own id.
+///
+/// Re-importing a session that already exists (same `backend` +
+/// `external_id`) is idempotent — `session_id` is the existing row's id
+/// and `already_existed` is `true`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ImportedSession {
     pub session_id: String,
@@ -586,6 +676,15 @@ pub struct ImportedSession {
     /// Backend-provided title or first-line preview (if any).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_hint: Option<String>,
+    /// Absolute path to the backend's own transcript file. Persisted on
+    /// the row so resume can re-attach the data store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_path: Option<String>,
+    /// `true` when this `(backend, external_id)` already had a row and
+    /// the daemon returned the existing `session_id` instead of
+    /// creating a new one.
+    #[serde(default)]
+    pub already_existed: bool,
 }
 
 impl Method for SessionsImport {
