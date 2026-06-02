@@ -143,6 +143,33 @@ async fn stale_hunk_ids_are_rejected_not_errored() {
     assert_eq!(outcome.rejected[0].reason, "stale");
 }
 
+/// Regression for Backend Architect's review finding: a call mixing a
+/// real hunk id with a stale one must surface the stale subset in
+/// `rejected[]` — the earlier per-file loop only accounted for the
+/// matched subset, so a stale id silently disappeared whenever any
+/// other id in the same call landed. The wire contract on
+/// `WorktreeMutationParams` promises every stale id round-trips.
+#[tokio::test]
+async fn mixed_real_and_stale_ids_partition_correctly() {
+    let (_td, repo) = make_repo().await;
+    tokio::fs::write(repo.join("README.md"), "hi\nstaged\n")
+        .await
+        .unwrap();
+    let eng = engine(&repo);
+    let diff = eng.diff_file("README.md", false, None).await.unwrap();
+    let real_id = diff.hunks[0].hunk_id.clone();
+    let stale_id = "00000000deadbeef".to_string();
+
+    let outcome = eng
+        .stage(&[real_id.clone(), stale_id.clone()])
+        .await
+        .expect("mixed call must not error");
+    assert_eq!(outcome.applied, vec![real_id]);
+    assert_eq!(outcome.rejected.len(), 1, "got {:?}", outcome.rejected);
+    assert_eq!(outcome.rejected[0].hunk_id, stale_id);
+    assert_eq!(outcome.rejected[0].reason, "stale");
+}
+
 #[tokio::test]
 async fn commit_lands_real_sha_and_clears_index() {
     let (_td, repo) = make_repo().await;

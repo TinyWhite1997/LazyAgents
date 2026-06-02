@@ -701,26 +701,35 @@ impl DiffEngine {
             }
         }
 
+        // Backfill: any caller-supplied id we never matched to a live
+        // hunk in any candidate file is `stale`. Doing this here means
+        // partial-stale calls (mix of real + stale ids) hand the TUI
+        // structured feedback for the stale subset instead of
+        // silently dropping it — the wire contract on
+        // `WorktreeMutationParams` promises this round-trip and the
+        // earlier per-file loop only ever accounted for the matched
+        // subset.
+        //
+        // Collect the matched set by value first so the subsequent
+        // mutable push into `rejected` doesn't fight the borrow
+        // checker.
+        let matched: std::collections::HashSet<String> = applied
+            .iter()
+            .cloned()
+            .chain(rejected.iter().map(|r| r.hunk_id.clone()))
+            .collect();
+        for id in hunk_ids {
+            if !matched.contains(id) {
+                rejected.push(HunkReject {
+                    hunk_id: id.clone(),
+                    reason: "stale",
+                });
+            }
+        }
+
         // Re-pull status so the caller sees the post-mutation FileEntry
         // snapshot in one round trip.
         let status = self.status().await?;
-        if applied.is_empty() && rejected.is_empty() && !hunk_ids.is_empty() {
-            // None of the supplied ids matched any live hunk → return
-            // all as stale (callers will treat this as a signal to
-            // refresh).
-            return Ok(MutationOutcome {
-                applied: vec![],
-                rejected: hunk_ids
-                    .iter()
-                    .map(|id| HunkReject {
-                        hunk_id: id.clone(),
-                        reason: "stale",
-                    })
-                    .collect(),
-                status: status.files,
-                affected_files: vec![],
-            });
-        }
         Ok(MutationOutcome {
             applied,
             rejected,

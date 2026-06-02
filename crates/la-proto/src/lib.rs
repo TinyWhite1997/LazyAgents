@@ -181,6 +181,16 @@ pub mod error_codes {
     /// synthesised patch. Typically means the file changed between the
     /// diff read and the apply attempt; retry after a fresh
     /// `worktree.status`.
+    ///
+    /// **Reserved for a future `force_full = true` override**, not
+    /// raised on the normal mutation path. Per-hunk patch rejections
+    /// from `worktree.stage` / `unstage` / `discard` ride back inside
+    /// the call's [`WorktreeMutationResult::rejected`] array with
+    /// `reason = "patch_rejected"`; that keeps the structured
+    /// partial-success / partial-failure feedback intact instead of
+    /// collapsing the whole call to one error. This code only
+    /// surfaces when a future caller asks the daemon to refuse the
+    /// whole batch on any rejected hunk.
     pub const WORKTREE_PATCH_REJECTED: i32 = -33125;
     /// `-33126` — no editor command could be resolved (no override, no
     /// `$VISUAL`, no `$EDITOR`, and `code` not on PATH).
