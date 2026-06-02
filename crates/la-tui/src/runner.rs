@@ -8,6 +8,7 @@
 //! crossterm I/O to those layers.
 
 use std::io;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use crossterm::event::{
@@ -25,7 +26,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 
-use crate::app::{App, AppOutcome, Focus, Modal, Tab};
+use crate::app::{App, AppMsg, AppOutcome, Focus, Modal, Tab};
+use crate::health_sub::HealthEvent;
 use crate::input::{translate, HitBoxes};
 use crate::key_hints::{format_hint_bar, HintRegistry};
 use crate::sidebar::{render_backends, render_sidebar, Selection};
@@ -36,9 +38,20 @@ use crate::tabs::render_tabs;
 /// Run the TUI event loop until the user quits. Returns Ok(()) on normal
 /// exit; any I/O or terminal-setup error is propagated so the binary can
 /// log it and exit nonzero.
-pub fn run<S: SessionSource>(mut app: App<S>) -> io::Result<()> {
+pub fn run<S: SessionSource>(app: App<S>) -> io::Result<()> {
+    run_with_health(app, None)
+}
+
+/// Same as [`run`] but threads in an external [`HealthEvent`] channel —
+/// used by the `la` binary to forward `daemon.health` notifications
+/// from [`crate::health_sub::spawn`] into the App as `BackendsUpdate`
+/// messages.
+pub fn run_with_health<S: SessionSource>(
+    mut app: App<S>,
+    health_rx: Option<Receiver<HealthEvent>>,
+) -> io::Result<()> {
     let mut terminal = setup_terminal()?;
-    let res = event_loop(&mut terminal, &mut app);
+    let res = event_loop(&mut terminal, &mut app, health_rx);
     restore_terminal(&mut terminal)?;
     res
 }
@@ -70,6 +83,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
 fn event_loop<S: SessionSource>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<S>,
+    health_rx: Option<Receiver<HealthEvent>>,
 ) -> io::Result<()> {
     let mut hit = HitBoxes {
         tabs: Vec::new(),
@@ -81,9 +95,21 @@ fn event_loop<S: SessionSource>(
         terminal.draw(|frame| {
             hit = draw(frame, app);
         })?;
-        // Poll so we can refresh the screen periodically once the daemon
-        // is wired to push status updates. For now, 250ms is a placeholder
-        // — most input still arrives event-driven.
+        // Drain any pending health events between renders so a fresh
+        // `daemon.health` snapshot is reflected on the very next frame.
+        if let Some(rx) = health_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(HealthEvent::Backends(badges)) => {
+                        let _ = app.handle(AppMsg::BackendsUpdate(badges));
+                    }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        // Poll so the screen refreshes periodically; the 250ms cap also
+        // bounds how long a backends snapshot can sit in the channel
+        // before the next frame consumes it.
         if !crossterm::event::poll(Duration::from_millis(250))? {
             continue;
         }

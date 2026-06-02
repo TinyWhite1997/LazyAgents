@@ -48,7 +48,18 @@ fn real_main() -> io::Result<()> {
         next_cron_label: Some("cron pane in M3".to_string()),
         right_context: bootstrap.status_context(&location.socket_path),
     }));
-    la_tui::runner::run(app)
+
+    // WEK-29: subscribe to `daemon.health` over IPC so the sidebar's
+    // Backends panel reflects the real probe state instead of staying
+    // on `no probe yet` until the daemon's next push (which the runner
+    // would never see without this subscription). The subscriber thread
+    // exits when the channel receiver is dropped at runner shutdown.
+    let health_rx = if bootstrap.connected {
+        Some(la_tui::health_sub::spawn(&location.socket_path))
+    } else {
+        None
+    };
+    la_tui::runner::run_with_health(app, health_rx)
 }
 
 /// Outcome of the startup bootstrap. Carries enough info for the status

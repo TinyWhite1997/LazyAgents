@@ -388,7 +388,7 @@ async fn dispatch(
         )),
         "events.subscribe" => {
             let params: EventsSubscribeParams = decode_params(req)?;
-            handle_events_subscribe(state, params).await
+            handle_events_subscribe(state, ctx, params).await
         }
         SessionsList::NAME => {
             let params: SessionsListParams = decode_params(req)?;
@@ -443,31 +443,72 @@ fn ok<R: serde::Serialize>(r: R) -> Result<serde_json::Value, RpcError> {
 
 async fn handle_events_subscribe(
     state: &ConnState,
+    ctx: &ConnectionContext,
     params: EventsSubscribeParams,
 ) -> Result<serde_json::Value, RpcError> {
-    let mut topics = state.topics.write().await;
     let mut effective = Vec::new();
-    for t in &params.topics {
-        match t {
-            EventTopic::SessionState => {
-                topics.session_state = true;
-                effective.push(*t);
-            }
-            EventTopic::DaemonHealth => {
-                topics.daemon_health = true;
-                effective.push(*t);
-            }
-            EventTopic::SessionOutput | EventTopic::SessionGap => {
-                // Per-session topics are delivered through sessions.attach,
-                // not the global bus; ack but don't echo them back so
-                // clients don't think they have a global subscription.
-            }
-            EventTopic::CronFired => {
-                // Cron isn't implemented until M3; quietly omit from the
-                // effective set (architecture §3 documented behaviour).
+    let mut send_health_snapshot = false;
+    {
+        let mut topics = state.topics.write().await;
+        for t in &params.topics {
+            match t {
+                EventTopic::SessionState => {
+                    topics.session_state = true;
+                    effective.push(*t);
+                }
+                EventTopic::DaemonHealth => {
+                    // Only replay the snapshot on a fresh subscribe. A
+                    // re-subscribe (already flagged true) is a no-op so we
+                    // don't double-push.
+                    if !topics.daemon_health {
+                        send_health_snapshot = true;
+                    }
+                    topics.daemon_health = true;
+                    effective.push(*t);
+                }
+                EventTopic::SessionOutput | EventTopic::SessionGap => {
+                    // Per-session topics are delivered through sessions.attach,
+                    // not the global bus; ack but don't echo them back so
+                    // clients don't think they have a global subscription.
+                }
+                EventTopic::CronFired => {
+                    // Cron isn't implemented until M3; quietly omit from the
+                    // effective set (architecture §3 documented behaviour).
+                }
             }
         }
     }
+
+    // WEK-29 review fix: the broadcast bus does NOT replay messages sent
+    // before this connection subscribed, so a TUI that connects after the
+    // daemon's initial probe would otherwise wait up to
+    // `DEFAULT_PROBE_INTERVAL` (60 s) for the next pulse before grey-
+    // stating an uninstalled backend. Push the cached snapshot directly
+    // on this connection so the very next `daemon.health` notification
+    // the client sees carries the current backends.
+    if send_health_snapshot {
+        let backends = ctx.health.snapshot().await;
+        let params = la_proto::notifications::DaemonHealthParams {
+            queue_depth: 0,
+            running: ctx.manager.active_count().await as u32,
+            errors_last_5m: backends
+                .iter()
+                .filter(|b| {
+                    b.status != la_proto::notifications::BackendHealthStatus::Available
+                })
+                .count() as u32,
+            backends,
+        };
+        match Notification::new(DaemonHealth::NAME, &params) {
+            Ok(n) => {
+                if let Err(err) = state.send.send(&Message::Notification(n)).await {
+                    tracing::debug!(%err, "initial daemon.health send failed");
+                }
+            }
+            Err(err) => tracing::warn!(%err, "encode initial daemon.health failed"),
+        }
+    }
+
     ok(EventsSubscribeResult { topics: effective })
 }
 

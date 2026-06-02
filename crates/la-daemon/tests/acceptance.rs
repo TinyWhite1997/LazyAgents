@@ -1340,3 +1340,114 @@ async fn daemon_health_carries_per_backend_status_payload() {
     daemon.handle.shutdown();
     let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
+
+/// WEK-29 review fix: a TUI that subscribes *after* the daemon's
+/// initial probe round must NOT have to wait the full probe interval
+/// for a fresh `daemon.health` pulse — the daemon should immediately
+/// push the cached snapshot on the new connection. This pins that
+/// behaviour with a deliberately long probe interval so the snapshot
+/// replay (not the next ticker tick) is the only thing that could
+/// satisfy the assertion within the test deadline.
+#[tokio::test]
+async fn events_subscribe_immediately_pushes_cached_daemon_health_snapshot() {
+    use la_proto::methods::{EventTopic, EventsSubscribeParams, EventsSubscribeResult};
+    use la_proto::notifications::{BackendHealthStatus, DaemonHealthParams};
+
+    let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+    adapters.insert(
+        "codex".to_string(),
+        Arc::new(ProbeOnlyAdapter {
+            id: "codex",
+            probe_result: la_adapter::ProbeResult::NotInstalled {
+                hint: "not on PATH".into(),
+            },
+        }),
+    );
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let runtime_dir = tempdir.path().join("runtime");
+    let state_dir = tempdir.path().join("state");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let socket = runtime_dir.join("lad-1.sock");
+    let config = DaemonConfig {
+        state_dir,
+        socket_discovery: SocketDiscovery::with_override(socket.clone()),
+        adapters,
+        // 30 s ⇒ if the new-subscriber snapshot replay is missing, the
+        // wait-for-pulse loop below times out long before the next
+        // ticker tick. Tightly-bounded probe intervals (like the
+        // 500 ms used in the other WEK-29 tests) would mask the bug.
+        probe_interval: Duration::from_secs(30),
+        ..DaemonConfig::default()
+    };
+    let daemon = Daemon::bind(config).await.expect("bind daemon");
+    let (handle, join) = daemon.spawn();
+    let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < bootstrap_deadline {
+        if connect(&Endpoint::uds(&socket)).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Give the inline first probe a moment to populate the registry
+    // before we connect — otherwise we'd race the spawn-and-probe and
+    // could observe an empty cache, which is honestly a *different* bug
+    // than the one this test pins.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let test = async {
+        let mut conn = client(&socket).await;
+        let sub = EventsSubscribeParams {
+            topics: vec![EventTopic::DaemonHealth],
+        };
+        send_request(&mut conn, 1, "events.subscribe", &sub).await;
+        // The dispatcher responds to subscribe *then* pushes the
+        // snapshot; both messages may arrive in either order across
+        // the wire, so accept whichever shows first.
+        let mut got_ack = false;
+        let mut got_health: Option<DaemonHealthParams> = None;
+        // 2 s is well under the 30 s probe interval — anything we
+        // receive in this window came from the immediate snapshot
+        // replay, not the next probe tick.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !(got_ack && got_health.is_some()) {
+            match tokio::time::timeout(Duration::from_millis(500), conn.recv()).await {
+                Ok(Ok(Some(Message::Response(r)))) if r.id == RequestId::Num(1) => {
+                    let v = match r.outcome {
+                        la_proto::jsonrpc::ResponseOutcome::Result(v) => v,
+                        la_proto::jsonrpc::ResponseOutcome::Error(e) => {
+                            panic!("subscribe error: {e:?}")
+                        }
+                    };
+                    let _: EventsSubscribeResult =
+                        serde_json::from_value(v).expect("decode subscribe");
+                    got_ack = true;
+                }
+                Ok(Ok(Some(Message::Notification(n)))) if n.method == "daemon.health" => {
+                    let p: DaemonHealthParams =
+                        serde_json::from_value(n.params.expect("params"))
+                            .expect("decode health");
+                    if !p.backends.is_empty() {
+                        got_health = Some(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(got_ack, "never received events.subscribe response");
+        let health = got_health
+            .expect("expected an immediate daemon.health snapshot after subscribe");
+        assert_eq!(health.backends.len(), 1, "single registered adapter");
+        assert_eq!(health.backends[0].id, "codex");
+        assert_eq!(
+            health.backends[0].status,
+            BackendHealthStatus::NotInstalled
+        );
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(5), test).await;
+
+    handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), join).await;
+    outcome.expect("subscribe-snapshot test deadline exceeded");
+}
