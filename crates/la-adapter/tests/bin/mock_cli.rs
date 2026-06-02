@@ -157,10 +157,7 @@ fn codex_login(args: &[String], mode: &str) -> ExitCode {
         // `login status`: non-zero exit with NO unauth keyword. The
         // adapter must NOT misclassify this as Unauthenticated.
         "login_unsupported" => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "error: unrecognized subcommand 'status'"
-            );
+            let _ = writeln!(std::io::stderr(), "error: unrecognized subcommand 'status'");
             ExitCode::from(2)
         }
         other => {

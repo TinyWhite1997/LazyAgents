@@ -153,7 +153,11 @@ impl AgentAdapter for CodexAdapter {
                     ),
                 }
             }
-            Err(e) => return ProbeResult::Error { detail: format!("spawn: {e}") },
+            Err(e) => {
+                return ProbeResult::Error {
+                    detail: format!("spawn: {e}"),
+                }
+            }
         };
 
         let output = match timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
@@ -305,10 +309,7 @@ impl AgentAdapter for CodexAdapter {
         };
 
         let mut out: Vec<DiscoveredSession> = Vec::new();
-        let want_root = hints
-            .project_root
-            .as_deref()
-            .map(canonicalize_or_keep);
+        let want_root = hints.project_root.as_deref().map(canonicalize_or_keep);
 
         if !root.exists() {
             return Ok(out);
@@ -569,10 +570,7 @@ mod tests {
 
     #[test]
     fn unauthenticated_detector() {
-        assert!(looks_unauthenticated(
-            "Not logged in\n",
-            ""
-        ));
+        assert!(looks_unauthenticated("Not logged in\n", ""));
         assert!(looks_unauthenticated(
             "",
             "Error: not logged in. Please run codex login."

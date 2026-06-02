@@ -130,9 +130,9 @@ async fn probe_keeps_available_when_login_status_unsupported() {
                 "expected 0.135.x version, got {version:?}"
             );
         }
-        other => panic!(
-            "login status unsupported must not be misreported as unauth — got {other:?}"
-        ),
+        other => {
+            panic!("login status unsupported must not be misreported as unauth — got {other:?}")
+        }
     }
 }
 
@@ -223,10 +223,8 @@ async fn discover_reads_nested_rollout_layout() {
     let day = root.join("2026").join("06").join("02");
     fs::create_dir_all(&day).unwrap();
 
-    let file_a = day
-        .join("rollout-2026-06-02T10-00-00-019e0000-0000-0000-0000-000000000000.jsonl");
-    let file_b = day
-        .join("rollout-2026-06-02T11-00-00-019e0000-0000-0000-0000-000000000001.jsonl");
+    let file_a = day.join("rollout-2026-06-02T10-00-00-019e0000-0000-0000-0000-000000000000.jsonl");
+    let file_b = day.join("rollout-2026-06-02T11-00-00-019e0000-0000-0000-0000-000000000001.jsonl");
 
     fs::write(
         &file_a,
