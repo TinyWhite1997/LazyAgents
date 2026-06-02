@@ -10,10 +10,11 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Parsed shape of the `failure_backoff` column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureBackoff {
     /// Exponential: `base * factor^(n-1)`, clamped to `cap`, where `n` is
     /// the consecutive-failure count after the failing run.

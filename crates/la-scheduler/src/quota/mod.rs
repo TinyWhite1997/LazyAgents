@@ -42,7 +42,10 @@ pub mod loadavg;
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+pub use backoff::FailureBackoff;
 
 /// Per-cron quota configuration as stored on the `crons` row (architecture
 /// §5.4 + storage migration 0004). All integer fields are `u32` because
@@ -63,6 +66,14 @@ pub struct CronQuota {
     /// Current value of the persisted counter. Bumped on terminal failure
     /// by the run executor; reset to zero on a `completed` run.
     pub consecutive_failures: u32,
+    /// Parsed `failure_backoff` DSL (architecture §5.4 "连续失败时延后下一次
+    /// 触发"). The gate uses this together with
+    /// [`QuotaSnapshot::last_terminal_failure_at`] to defer the fire until
+    /// `last_terminal_failure_at + backoff.delay_for(consecutive_failures)`.
+    /// `None` means "no backoff configured" (gate is inactive on this rail);
+    /// callers should fall back to the DDL default if parsing the stored
+    /// string failed rather than disabling the rail silently.
+    pub failure_backoff: Option<FailureBackoff>,
     /// Mirrors `crons.enabled`. A `false` value short-circuits to
     /// [`AdmissionDecision::RefusePaused`] regardless of the other fields,
     /// because an auto-pause writer (or a user toggle) has already decided
@@ -79,6 +90,7 @@ impl Default for CronQuota {
             cost_budget_usd_per_day: None,
             pause_on_consecutive_failures: 5,
             consecutive_failures: 0,
+            failure_backoff: Some(FailureBackoff::default()),
             enabled: true,
         }
     }
@@ -112,19 +124,41 @@ impl Default for GlobalQuota {
 /// caller (la-daemon) computes these from the SQLite repos and the in-
 /// memory "global running" counter; the gate does not query anything.
 ///
-/// `cost_window_usd_today` should treat NULL `cost_usd_est` rows as 0.
+/// `window_cost_today` should treat NULL `cost_usd_est` rows as 0.
 /// `running_for_cron` and `running_global` should count only in-flight
 /// rows (`status IN ('pending','spawning','running') AND finished_at IS NULL`).
+///
+/// ## Audit-row counting contract
+///
+/// `window_runs_today` and `window_cost_today` MUST exclude rows the gate
+/// itself wrote for quota refusals (`error_kind LIKE 'quota_%'`). If they
+/// were included, a high-frequency cron that hit `max_runs_per_day` would
+/// keep writing refusal audit rows on every subsequent tick, and each new
+/// audit row would extend the window count above the cap — the cron would
+/// be permanently denied even after the original admitted runs roll out
+/// of the 24h window. The repo helper
+/// `RunsRepo::count_since_for_cron` enforces this filter; do not bypass
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuotaSnapshot {
     pub running_for_cron: u32,
     pub running_global: u32,
-    /// Rows in the 24h rolling window for this cron, including audit rows.
+    /// Admitted rows in the 24h rolling window for this cron (audit rows
+    /// for quota refusals are excluded — see the contract above).
     pub window_runs_today: u32,
-    /// Sum of `cost_usd_est` in the 24h rolling window.
+    /// Sum of `cost_usd_est` over the same admitted set.
     pub window_cost_today: f64,
     /// 1-min loadavg if obtainable on the host; `None` on Windows/unsupported.
     pub current_loadavg_1m: Option<f64>,
+    /// Wall-clock "now" used by the backoff rail to decide whether the
+    /// `failure_backoff` window has elapsed. Pass `Utc::now()` in production
+    /// and a deterministic value in tests.
+    pub now: DateTime<Utc>,
+    /// Finished-at timestamp of the most recent terminal failure for this
+    /// cron (`status IN ('failed','timed_out')`). `None` means the cron has
+    /// never failed (or its last terminal status was a success / cancelled
+    /// / budget_exceeded) — backoff rail is inactive in that case.
+    pub last_terminal_failure_at: Option<DateTime<Utc>>,
 }
 
 /// What the gate decided. The caller decides what *side-effects* to take
@@ -133,10 +167,13 @@ pub struct QuotaSnapshot {
 /// `RefuseXxx` → insert a `runs.status='cancelled'` audit row with the
 /// reason tag from [`AdmissionDecision::error_kind`].
 ///
-/// `RefuseDeferLoadavg` is distinct from `Refuse*` because the architecture
-/// (§5.4 "推迟触发") says cpu_load_throttle *defers* rather than
-/// *cancels*. The caller may choose to audit it as cancelled or to silently
-/// skip — see [`AdmissionDecision::is_deferral`].
+/// Two variants signal deferral rather than permanent refusal (see
+/// [`AdmissionDecision::is_deferral`]): `RefuseDeferLoadavg` (the host is
+/// overloaded right now) and `RefuseDeferBackoff` (the per-cron
+/// `failure_backoff` window has not yet elapsed since the last terminal
+/// failure). The caller MAY choose to skip writing audit rows for these
+/// to avoid log spam, but the default `rejected_status` / `error_kind`
+/// returned here will still produce a valid row if it does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AdmissionDecision {
     Admit,
@@ -164,6 +201,13 @@ pub enum AdmissionDecision {
         threshold: f64,
         sampled: f64,
     },
+    /// `failure_backoff` rail: the most recent terminal failure plus the
+    /// computed backoff delay falls in the future. `retry_after` is the
+    /// wall-clock instant the gate will admit again, all else equal.
+    RefuseDeferBackoff {
+        retry_after: DateTime<Utc>,
+        consecutive_failures: u32,
+    },
 }
 
 impl AdmissionDecision {
@@ -173,10 +217,14 @@ impl AdmissionDecision {
     }
 
     /// `true` when the gate intends a deferral rather than a permanent
-    /// refusal. Today only the loadavg path qualifies — every other
-    /// `Refuse*` is "this fire is dead, audit it".
+    /// refusal. Today the loadavg and failure-backoff rails qualify —
+    /// every other `Refuse*` is "this fire is dead, audit it".
     pub fn is_deferral(self) -> bool {
-        matches!(self, AdmissionDecision::RefuseDeferLoadavg { .. })
+        matches!(
+            self,
+            AdmissionDecision::RefuseDeferLoadavg { .. }
+                | AdmissionDecision::RefuseDeferBackoff { .. }
+        )
     }
 
     /// Machine-readable reason tag for `runs.error_kind`. `None` for
@@ -193,6 +241,7 @@ impl AdmissionDecision {
             AdmissionDecision::RefuseRunsPerDay { .. } => Some("quota_max_runs_per_day"),
             AdmissionDecision::RefuseBudgetExceeded { .. } => Some("quota_cost_budget_exceeded"),
             AdmissionDecision::RefuseDeferLoadavg { .. } => Some("quota_cpu_load_throttle"),
+            AdmissionDecision::RefuseDeferBackoff { .. } => Some("quota_failure_backoff"),
         }
     }
 
@@ -203,14 +252,16 @@ impl AdmissionDecision {
             AdmissionDecision::Admit => None,
             AdmissionDecision::RefuseBudgetExceeded { .. } => Some("budget_exceeded"),
             // Every other refusal — paused, concurrency, runs/day, loadavg
-            // deferral — gets `cancelled` because the schema's `status`
-            // enum only special-cases the cost-budget path. The reason tag
-            // in `error_kind` lets the TUI distinguish them.
+            // deferral, backoff deferral — gets `cancelled` because the
+            // schema's `status` enum only special-cases the cost-budget
+            // path. The reason tag in `error_kind` lets the TUI
+            // distinguish them.
             AdmissionDecision::RefusePaused
             | AdmissionDecision::RefuseConcurrentPerCron { .. }
             | AdmissionDecision::RefuseConcurrentGlobal { .. }
             | AdmissionDecision::RefuseRunsPerDay { .. }
-            | AdmissionDecision::RefuseDeferLoadavg { .. } => Some("cancelled"),
+            | AdmissionDecision::RefuseDeferLoadavg { .. }
+            | AdmissionDecision::RefuseDeferBackoff { .. } => Some("cancelled"),
         }
     }
 
@@ -239,6 +290,13 @@ impl AdmissionDecision {
             AdmissionDecision::RefuseDeferLoadavg { threshold, sampled } => {
                 format!("cpu_load_throttle={threshold:.2} exceeded (loadavg_1m={sampled:.2})")
             }
+            AdmissionDecision::RefuseDeferBackoff {
+                retry_after,
+                consecutive_failures,
+            } => format!(
+                "failure_backoff deferring until {} (consecutive_failures={consecutive_failures})",
+                retry_after.to_rfc3339()
+            ),
         }
     }
 }
@@ -252,14 +310,18 @@ impl AdmissionDecision {
 /// 1. `enabled=false` — anything else is moot; a paused cron should not
 ///    fire. (Schema CHECK keeps `pause_on_consecutive_failures >= 1` so
 ///    the auto-pause path always has a non-zero threshold to compare.)
-/// 2. `global_max_concurrent_runs` — a blown global cap is a "stop the
+/// 2. `failure_backoff` — when the most recent terminal failure +
+///    backoff delay is still in the future, defer; this is the §5.4
+///    "连续失败时延后下一次触发" path. Evaluated before global/load
+///    so backoff is visible even on an otherwise idle host.
+/// 3. `global_max_concurrent_runs` — a blown global cap is a "stop the
 ///    world" signal; per-cron checks are downstream of it.
-/// 3. `cpu_load_throttle` — defer (not cancel) when the host is under
+/// 4. `cpu_load_throttle` — defer (not cancel) when the host is under
 ///    load; we'd rather not even audit-spam in this case but the caller
 ///    chooses.
-/// 4. `max_concurrent_runs` — per-cron concurrency.
-/// 5. `max_runs_per_day` — per-cron 24h rolling cap.
-/// 6. `cost_budget_usd_per_day` — circuit-breaker for adapter-reported
+/// 5. `max_concurrent_runs` — per-cron concurrency.
+/// 6. `max_runs_per_day` — per-cron 24h rolling cap.
+/// 7. `cost_budget_usd_per_day` — circuit-breaker for adapter-reported
 ///    spend.
 pub fn evaluate_admission(
     quota: &CronQuota,
@@ -268,6 +330,15 @@ pub fn evaluate_admission(
 ) -> AdmissionDecision {
     if !quota.enabled {
         return AdmissionDecision::RefusePaused;
+    }
+
+    if let Some(retry_after) = backoff_retry_after(quota, snapshot) {
+        if retry_after > snapshot.now {
+            return AdmissionDecision::RefuseDeferBackoff {
+                retry_after,
+                consecutive_failures: quota.consecutive_failures,
+            };
+        }
     }
 
     if global.global_max_concurrent_runs > 0
@@ -313,6 +384,24 @@ pub fn evaluate_admission(
     AdmissionDecision::Admit
 }
 
+/// Compute the wall-clock instant the backoff rail would next admit the
+/// cron, or `None` if the rail is inactive (no backoff configured, no
+/// prior failure, or zero consecutive failures). Public so the daemon's
+/// status-bar layer can show "next eligible at …" without re-deriving.
+pub fn backoff_retry_after(quota: &CronQuota, snapshot: &QuotaSnapshot) -> Option<DateTime<Utc>> {
+    let backoff = quota.failure_backoff?;
+    let last_failure = snapshot.last_terminal_failure_at?;
+    if quota.consecutive_failures == 0 {
+        return None;
+    }
+    let delay = backoff.delay_for(quota.consecutive_failures);
+    if delay.is_zero() {
+        return None;
+    }
+    let delta = chrono::Duration::from_std(delay).ok()?;
+    last_failure.checked_add_signed(delta)
+}
+
 /// The architecture stores quotas on the `crons` row but the `max_runtime_s`
 /// field is enforced *during* a run (timeout-kill), not at admission time.
 /// We expose it here as a typed helper so the run executor doesn't have to
@@ -337,6 +426,11 @@ pub fn should_auto_pause(threshold: u32, consecutive_failures_after_bump: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn t0() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap()
+    }
 
     fn snap() -> QuotaSnapshot {
         QuotaSnapshot {
@@ -345,6 +439,8 @@ mod tests {
             window_runs_today: 0,
             window_cost_today: 0.0,
             current_loadavg_1m: None,
+            now: t0(),
+            last_terminal_failure_at: None,
         }
     }
 
@@ -538,6 +634,10 @@ mod tests {
                 threshold: 4.0,
                 sampled: 5.0,
             },
+            AdmissionDecision::RefuseDeferBackoff {
+                retry_after: t0(),
+                consecutive_failures: 3,
+            },
         ] {
             assert!(decision.is_refusal());
             assert!(decision.error_kind().is_some());
@@ -549,6 +649,137 @@ mod tests {
         assert!(admit.error_kind().is_none());
         assert!(admit.rejected_status().is_none());
         assert!(admit.error_detail().is_empty());
+    }
+
+    #[test]
+    fn backoff_rail_defers_inside_window_and_admits_once_past_it() {
+        // 60s base, 2x factor, 1h cap; after 1 failure → 60s window.
+        let mut q = quota();
+        q.consecutive_failures = 1;
+        let mut s = snap();
+        s.last_terminal_failure_at = Some(t0());
+
+        // 30s after the failure: still inside the 60s window → defer.
+        s.now = t0() + chrono::Duration::seconds(30);
+        let decision = evaluate_admission(&q, &global(), &s);
+        match decision {
+            AdmissionDecision::RefuseDeferBackoff {
+                retry_after,
+                consecutive_failures,
+            } => {
+                assert_eq!(retry_after, t0() + chrono::Duration::seconds(60));
+                assert_eq!(consecutive_failures, 1);
+                assert!(decision.is_deferral());
+            }
+            other => panic!("expected RefuseDeferBackoff, got {other:?}"),
+        }
+
+        // 60s after the failure: window edge — admitted.
+        s.now = t0() + chrono::Duration::seconds(60);
+        assert_eq!(
+            evaluate_admission(&q, &global(), &s),
+            AdmissionDecision::Admit
+        );
+
+        // 90s after: well past the window → admitted.
+        s.now = t0() + chrono::Duration::seconds(90);
+        assert_eq!(
+            evaluate_admission(&q, &global(), &s),
+            AdmissionDecision::Admit
+        );
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_across_consecutive_failures() {
+        // failure 1 → 60s, failure 2 → 120s, failure 6 → 1920s
+        let mut q = quota();
+        let mut s = snap();
+        s.last_terminal_failure_at = Some(t0());
+
+        q.consecutive_failures = 2;
+        s.now = t0() + chrono::Duration::seconds(119);
+        assert!(matches!(
+            evaluate_admission(&q, &global(), &s),
+            AdmissionDecision::RefuseDeferBackoff { .. }
+        ));
+        s.now = t0() + chrono::Duration::seconds(120);
+        assert_eq!(
+            evaluate_admission(&q, &global(), &s),
+            AdmissionDecision::Admit
+        );
+
+        q.consecutive_failures = 6;
+        s.now = t0() + chrono::Duration::seconds(1919);
+        assert!(matches!(
+            evaluate_admission(&q, &global(), &s),
+            AdmissionDecision::RefuseDeferBackoff { .. }
+        ));
+        s.now = t0() + chrono::Duration::seconds(1920);
+        assert_eq!(
+            evaluate_admission(&q, &global(), &s),
+            AdmissionDecision::Admit
+        );
+    }
+
+    #[test]
+    fn backoff_inactive_when_no_failure_or_no_config() {
+        let mut s = snap();
+        s.last_terminal_failure_at = Some(t0());
+        // consecutive_failures = 0 → rail inactive even after a failure
+        // (means the last terminal status was non-failure; reset happened).
+        let q = quota();
+        s.now = t0();
+        assert_eq!(
+            evaluate_admission(&q, &global(), &s),
+            AdmissionDecision::Admit
+        );
+
+        // failure_backoff = None → rail inactive
+        let q_no_backoff = CronQuota {
+            failure_backoff: None,
+            consecutive_failures: 99,
+            ..CronQuota::default()
+        };
+        s.now = t0() + chrono::Duration::seconds(1);
+        assert_eq!(
+            evaluate_admission(&q_no_backoff, &global(), &s),
+            AdmissionDecision::Admit
+        );
+
+        // last_terminal_failure_at = None → rail inactive even with counter > 0
+        let q_pending = CronQuota {
+            consecutive_failures: 99,
+            ..CronQuota::default()
+        };
+        let mut s2 = snap();
+        s2.last_terminal_failure_at = None;
+        s2.now = t0() + chrono::Duration::seconds(1);
+        assert_eq!(
+            evaluate_admission(&q_pending, &global(), &s2),
+            AdmissionDecision::Admit
+        );
+    }
+
+    #[test]
+    fn backoff_evaluated_before_global_concurrency_and_loadavg() {
+        // Configure backoff to defer, AND blow global concurrency AND
+        // loadavg — the refusal we surface is the backoff one because it
+        // ranks higher in priority order.
+        let mut q = quota();
+        q.consecutive_failures = 1;
+        let g = GlobalQuota {
+            global_max_concurrent_runs: 1,
+            cpu_load_throttle: Some(4.0),
+        };
+        let mut s = snap();
+        s.last_terminal_failure_at = Some(t0());
+        s.now = t0() + chrono::Duration::seconds(10);
+        s.running_global = 5;
+        s.current_loadavg_1m = Some(99.0);
+        assert!(matches!(
+            evaluate_admission(&q, &g, &s),
+            AdmissionDecision::RefuseDeferBackoff { .. }
+        ));
     }
 
     #[test]
@@ -568,5 +799,23 @@ mod tests {
             ..CronQuota::default()
         };
         assert_eq!(max_runtime(&q0), None);
+    }
+
+    #[test]
+    fn backoff_retry_after_matches_evaluate_decision() {
+        let mut q = quota();
+        q.consecutive_failures = 3;
+        let mut s = snap();
+        s.last_terminal_failure_at = Some(t0());
+        // 3 failures with default expo(1m,2,1h): 60 * 2^(3-1) = 240s
+        let expected = t0() + chrono::Duration::seconds(240);
+        assert_eq!(backoff_retry_after(&q, &s), Some(expected));
+        s.now = expected - chrono::Duration::seconds(1);
+        match evaluate_admission(&q, &global(), &s) {
+            AdmissionDecision::RefuseDeferBackoff { retry_after, .. } => {
+                assert_eq!(retry_after, expected);
+            }
+            other => panic!("expected backoff defer, got {other:?}"),
+        }
     }
 }

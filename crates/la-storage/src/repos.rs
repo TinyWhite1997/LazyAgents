@@ -506,15 +506,24 @@ impl<'a> RunsRepo<'a> {
     }
 
     /// Count rows for `cron_id` whose `scheduled_at >= since` (typically
-    /// `now - 24h`). Counts every triggered fire including audit rows for
-    /// rejected admissions and `coalesced` consolidations, since the user
-    /// asked for "how many times in the last 24h did this cron try to fire."
-    /// Matches arch §5.4 "24h 滚动窗口硬上限" semantics.
+    /// `now - 24h`).
+    ///
+    /// **Excludes quota-refusal audit rows** (`error_kind LIKE 'quota_%'`)
+    /// so the `max_runs_per_day` rail in [`la_scheduler::quota`] only
+    /// counts admitted attempts. If we included quota audit rows, a
+    /// high-frequency cron that hit the cap once would keep writing
+    /// refusal rows on every subsequent tick, and each new row would
+    /// extend the window count above the cap — the cron would be
+    /// permanently denied even after the original admitted runs roll out
+    /// of the 24h window. Audit rows still appear in
+    /// [`RunsRepo::list`] for the TUI.
     pub async fn count_since_for_cron(&self, cron_id: &str, since: &str) -> Result<i64> {
         let (count,): (i64,) = sqlx::query_as(
             r#"
             SELECT COUNT(*) FROM runs
-            WHERE cron_id = ?1 AND scheduled_at >= ?2
+            WHERE cron_id = ?1
+              AND scheduled_at >= ?2
+              AND (error_kind IS NULL OR error_kind NOT LIKE 'quota\_%' ESCAPE '\')
             "#,
         )
         .bind(cron_id)
@@ -527,11 +536,16 @@ impl<'a> RunsRepo<'a> {
     /// Sum `cost_usd_est` for `cron_id` since the given lexical timestamp.
     /// Rows with NULL cost are treated as 0 (the field is only populated
     /// when the adapter reports usage; absent costs don't consume budget).
+    /// Excludes quota-refusal audit rows for the same reason as
+    /// [`Self::count_since_for_cron`] — a quota refusal must not consume
+    /// the budget it was refused under.
     pub async fn sum_cost_since_for_cron(&self, cron_id: &str, since: &str) -> Result<f64> {
         let (sum,): (Option<f64>,) = sqlx::query_as(
             r#"
             SELECT COALESCE(SUM(cost_usd_est), 0.0) FROM runs
-            WHERE cron_id = ?1 AND scheduled_at >= ?2
+            WHERE cron_id = ?1
+              AND scheduled_at >= ?2
+              AND (error_kind IS NULL OR error_kind NOT LIKE 'quota\_%' ESCAPE '\')
             "#,
         )
         .bind(cron_id)
@@ -539,6 +553,26 @@ impl<'a> RunsRepo<'a> {
         .fetch_one(self.storage.reader_pool())
         .await?;
         Ok(sum.unwrap_or(0.0))
+    }
+
+    /// Most recent `finished_at` for a terminal-failure run of `cron_id`
+    /// (`status IN ('failed','timed_out')`). Feeds the
+    /// `failure_backoff` rail in [`la_scheduler::quota`].
+    /// Returns the raw SQLite lexical timestamp; callers parse it into
+    /// `chrono::DateTime<Utc>`.
+    pub async fn last_terminal_failure_at_for_cron(&self, cron_id: &str) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            r#"
+            SELECT MAX(finished_at) FROM runs
+            WHERE cron_id = ?1
+              AND finished_at IS NOT NULL
+              AND status IN ('failed', 'timed_out')
+            "#,
+        )
+        .bind(cron_id)
+        .fetch_optional(self.storage.reader_pool())
+        .await?;
+        Ok(row.and_then(|(v,)| v))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<RunRecord>> {

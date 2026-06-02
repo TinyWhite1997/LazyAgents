@@ -18,8 +18,10 @@
 //! `RefusePaused` with `runs.status='cancelled'`,
 //! `error_kind='quota_paused'`.
 
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use la_scheduler::quota::{
-    evaluate_admission, AdmissionDecision, CronQuota, GlobalQuota, QuotaSnapshot,
+    backoff, evaluate_admission, AdmissionDecision, CronQuota, FailureBackoff, GlobalQuota,
+    QuotaSnapshot,
 };
 use la_storage::{
     BackendUpsert, CronUpsert, NewProject, NewRejectedRun, NewRun, RunFinish, RunsListFilter,
@@ -98,11 +100,22 @@ fn quota_from(cron: &la_storage::Cron) -> CronQuota {
         cost_budget_usd_per_day: cron.cost_budget_usd_per_day,
         pause_on_consecutive_failures: u32::try_from(cron.pause_on_consecutive_failures).unwrap(),
         consecutive_failures: u32::try_from(cron.consecutive_failures).unwrap(),
+        failure_backoff: backoff::parse(&cron.failure_backoff).ok(),
         enabled: cron.enabled != 0,
     }
 }
 
-async fn snapshot_for(storage: &Storage, cron_id: &str, window_start: &str) -> QuotaSnapshot {
+fn parse_lex(ts: &str) -> DateTime<Utc> {
+    let naive = NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").expect("lexical ts");
+    Utc.from_utc_datetime(&naive)
+}
+
+async fn snapshot_for(
+    storage: &Storage,
+    cron_id: &str,
+    window_start: &str,
+    now: DateTime<Utc>,
+) -> QuotaSnapshot {
     let running_for_cron = storage
         .runs()
         .count_running_for_cron(cron_id)
@@ -119,12 +132,20 @@ async fn snapshot_for(storage: &Storage, cron_id: &str, window_start: &str) -> Q
         .sum_cost_since_for_cron(cron_id, window_start)
         .await
         .unwrap();
+    let last_terminal_failure_at = storage
+        .runs()
+        .last_terminal_failure_at_for_cron(cron_id)
+        .await
+        .unwrap()
+        .map(|s| parse_lex(&s));
     QuotaSnapshot {
         running_for_cron: u32::try_from(running_for_cron).unwrap(),
         running_global: u32::try_from(running_global).unwrap(),
         window_runs_today: u32::try_from(window_runs_today).unwrap(),
         window_cost_today,
         current_loadavg_1m: None,
+        now,
+        last_terminal_failure_at,
     }
 }
 
@@ -141,11 +162,12 @@ async fn third_trigger_is_refused_and_writes_audit_when_max_runs_per_day_is_two(
     // Use a fixed window-start so the test is deterministic; every run we
     // create below has scheduled_at >= "2000-01-01 00:00:00".
     let window_start = "2000-01-01 00:00:00";
+    let now = parse_lex("2000-01-01 05:17:00");
 
     // ---- Fire 1: admitted, recorded as running, then finished completed. ----
     let cron = storage.crons().get(cron_id).await.unwrap().unwrap();
     let quota = quota_from(&cron);
-    let snap = snapshot_for(&storage, cron_id, window_start).await;
+    let snap = snapshot_for(&storage, cron_id, window_start, now).await;
     let decision = evaluate_admission(&quota, &global, &snap);
     assert_eq!(
         decision,
@@ -183,7 +205,7 @@ async fn third_trigger_is_refused_and_writes_audit_when_max_runs_per_day_is_two(
         .unwrap();
 
     // ---- Fire 2: admitted (still 1 row in window), finished completed. ----
-    let snap = snapshot_for(&storage, cron_id, window_start).await;
+    let snap = snapshot_for(&storage, cron_id, window_start, now).await;
     assert_eq!(snap.window_runs_today, 1, "after fire 1, 1 row in window");
     let decision = evaluate_admission(&quota, &global, &snap);
     assert_eq!(
@@ -222,7 +244,7 @@ async fn third_trigger_is_refused_and_writes_audit_when_max_runs_per_day_is_two(
         .unwrap();
 
     // ---- Fire 3: REFUSED — 2 rows in window, cap is 2. ----
-    let snap = snapshot_for(&storage, cron_id, window_start).await;
+    let snap = snapshot_for(&storage, cron_id, window_start, now).await;
     assert_eq!(snap.window_runs_today, 2, "after fire 2, 2 rows in window");
     let decision = evaluate_admission(&quota, &global, &snap);
     assert!(
@@ -277,11 +299,16 @@ async fn third_trigger_is_refused_and_writes_audit_when_max_runs_per_day_is_two(
         .any(|r| r.status == "cancelled"
             && r.error_kind.as_deref() == Some("quota_max_runs_per_day")));
 
-    // After the refusal, snapshot now shows 3 rows in window — proving the
-    // audit row counts against the cap on subsequent fires too (so we don't
-    // sneak in a 4th attempt by exploiting the rejection bookkeeping).
-    let snap = snapshot_for(&storage, cron_id, window_start).await;
-    assert_eq!(snap.window_runs_today, 3);
+    // After the refusal, the snapshot window_runs_today stays at 2 — the
+    // quota-refusal audit row is filtered out of the per-day count, so a
+    // high-frequency cron that hits the cap once cannot perpetually
+    // self-extend its denial by writing more audit rows on every tick.
+    // (Audit rows still surface via runs.list above for the TUI.)
+    let snap = snapshot_for(&storage, cron_id, window_start, now).await;
+    assert_eq!(
+        snap.window_runs_today, 2,
+        "audit row for quota refusal must not consume the per-day cap"
+    );
 }
 
 #[tokio::test]
@@ -334,6 +361,8 @@ async fn auto_pause_writes_audit_with_quota_paused_after_threshold_reached() {
         window_runs_today: 0,
         window_cost_today: 0.0,
         current_loadavg_1m: None,
+        now: parse_lex("2000-01-01 06:17:00"),
+        last_terminal_failure_at: None,
     };
     let decision = evaluate_admission(&quota, &global, &snap);
     assert_eq!(decision, AdmissionDecision::RefusePaused);
@@ -442,7 +471,13 @@ async fn cost_budget_refusal_writes_budget_exceeded_status() {
 
     let cron = storage.crons().get(cron_id).await.unwrap().unwrap();
     let quota = quota_from(&cron);
-    let snap = snapshot_for(&storage, cron_id, "2000-01-01 00:00:00").await;
+    let snap = snapshot_for(
+        &storage,
+        cron_id,
+        "2000-01-01 00:00:00",
+        parse_lex("2000-01-01 03:05:00"),
+    )
+    .await;
     assert!(
         (snap.window_cost_today - 0.5).abs() < 1e-9,
         "window cost should reflect the seeded run"
@@ -477,5 +512,229 @@ async fn cost_budget_refusal_writes_budget_exceeded_status() {
     assert_eq!(
         audit.error_kind.as_deref(),
         Some("quota_cost_budget_exceeded")
+    );
+}
+
+/// Regression for the reviewer's blocker: a cron that has hit
+/// `max_runs_per_day=2` and accumulated several quota-refusal audit rows
+/// must regain admission once the original admitted runs roll out of the
+/// 24h sliding window. If `count_since_for_cron` ever stops excluding
+/// `quota_*` audit rows, this test fails — the cron stays locked out.
+#[tokio::test]
+async fn per_day_cap_recovers_after_admitted_runs_roll_out_of_window() {
+    let (_dir, storage) = open_storage().await;
+    let cron_id = "cron-wek33-recover";
+    seed_project_and_cron(&storage, cron_id, 2, 5).await;
+    let global = GlobalQuota {
+        global_max_concurrent_runs: 0,
+        cpu_load_throttle: None,
+    };
+
+    // Two admitted runs at T0.
+    for (i, t) in ["2026-06-01 00:00:00", "2026-06-01 00:30:00"]
+        .iter()
+        .enumerate()
+    {
+        let id = format!("run-admitted-{i}");
+        storage
+            .runs()
+            .create(NewRun {
+                id: id.clone(),
+                cron_id: Some(cron_id.into()),
+                session_id: None,
+                scheduled_at: (*t).into(),
+                started_at: Some((*t).into()),
+                status: "running".into(),
+                coalesced_count: 1,
+            })
+            .await
+            .unwrap();
+        storage
+            .runs()
+            .finish(
+                &id,
+                RunFinish {
+                    finished_at: (*t).into(),
+                    status: "completed".into(),
+                    exit_code: Some(0),
+                    cost_usd_est: None,
+                    error_kind: None,
+                    error_detail: None,
+                    tail_log: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // 5 quota refusals over the next hour (simulating a per-minute cron
+    // that keeps trying after hitting the cap).
+    let cron = storage.crons().get(cron_id).await.unwrap().unwrap();
+    let quota = quota_from(&cron);
+    for (i, t) in [
+        "2026-06-01 01:00:00",
+        "2026-06-01 01:01:00",
+        "2026-06-01 01:02:00",
+        "2026-06-01 01:03:00",
+        "2026-06-01 01:04:00",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let now = parse_lex(t);
+        let window_start_ts = (now - chrono::Duration::hours(24))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let snap = snapshot_for(&storage, cron_id, &window_start_ts, now).await;
+        // Window count must stay at the 2 admitted runs — every previous
+        // refusal must NOT have inflated it.
+        assert_eq!(
+            snap.window_runs_today, 2,
+            "refusal #{i} at {t}: audit rows must not consume the per-day cap"
+        );
+        let decision = evaluate_admission(&quota, &global, &snap);
+        assert!(
+            matches!(decision, AdmissionDecision::RefuseRunsPerDay { .. }),
+            "refusal #{i}: expected RefuseRunsPerDay while admitted runs still in window, got {decision:?}"
+        );
+        let audit_id = format!("run-refused-{i}");
+        storage
+            .runs()
+            .create_rejected(NewRejectedRun {
+                id: &audit_id,
+                cron_id,
+                scheduled_at: t,
+                status: decision.rejected_status().unwrap(),
+                coalesced_count: 1,
+                error_kind: decision.error_kind().unwrap(),
+                error_detail: &decision.error_detail(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Sanity: 2 admitted + 5 refusals = 7 total runs visible in runs.list.
+    assert_eq!(
+        storage
+            .runs()
+            .list(RunsListFilter {
+                cron_id: Some(cron_id),
+                since: None,
+                limit: 100,
+            })
+            .await
+            .unwrap()
+            .len(),
+        7
+    );
+
+    // Advance "now" to 24h + a hair past the latest admitted run. The
+    // sliding window now excludes both admitted rows; window_runs_today
+    // drops to 0 and the gate must admit again.
+    let now = parse_lex("2026-06-02 00:30:01");
+    let window_start_ts = (now - chrono::Duration::hours(24))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let snap = snapshot_for(&storage, cron_id, &window_start_ts, now).await;
+    assert_eq!(
+        snap.window_runs_today, 0,
+        "after 24h, admitted runs roll out of the window"
+    );
+    assert_eq!(
+        evaluate_admission(&quota, &global, &snap),
+        AdmissionDecision::Admit,
+        "cron should recover once the original admitted runs roll out"
+    );
+}
+
+/// Regression for the reviewer's first blocker: `failure_backoff` must
+/// actually influence admission. We seed a `failed` run, then check that
+/// the backoff window defers, and that the deferral becomes an admit once
+/// `last_terminal_failure_at + delay_for(consecutive_failures)` has
+/// elapsed.
+#[tokio::test]
+async fn failure_backoff_defers_admission_inside_window_and_releases_after() {
+    let (_dir, storage) = open_storage().await;
+    let cron_id = "cron-wek33-backoff";
+    seed_project_and_cron(&storage, cron_id, 100, 99).await;
+    let global = GlobalQuota {
+        global_max_concurrent_runs: 0,
+        cpu_load_throttle: None,
+    };
+
+    // Record one terminal failure at T0 and bump consecutive_failures to 1.
+    let failure_at = parse_lex("2026-06-01 12:00:00");
+    storage
+        .runs()
+        .create(NewRun {
+            id: "run-failed".into(),
+            cron_id: Some(cron_id.into()),
+            session_id: None,
+            scheduled_at: "2026-06-01 12:00:00".into(),
+            started_at: Some("2026-06-01 12:00:00".into()),
+            status: "running".into(),
+            coalesced_count: 1,
+        })
+        .await
+        .unwrap();
+    storage
+        .runs()
+        .finish(
+            "run-failed",
+            RunFinish {
+                finished_at: "2026-06-01 12:00:00".into(),
+                status: "failed".into(),
+                exit_code: Some(1),
+                cost_usd_est: None,
+                error_kind: Some("adapter".into()),
+                error_detail: Some("boom".into()),
+                tail_log: None,
+            },
+        )
+        .await
+        .unwrap();
+    storage
+        .crons()
+        .bump_consecutive_failures(cron_id)
+        .await
+        .unwrap();
+
+    let cron = storage.crons().get(cron_id).await.unwrap().unwrap();
+    let quota = quota_from(&cron);
+    assert_eq!(quota.consecutive_failures, 1);
+    assert_eq!(quota.failure_backoff, Some(FailureBackoff::default()));
+
+    // 30 s after the failure: well inside the 60 s default base window.
+    let snap = snapshot_for(
+        &storage,
+        cron_id,
+        "2026-06-01 00:00:00",
+        failure_at + chrono::Duration::seconds(30),
+    )
+    .await;
+    assert_eq!(snap.last_terminal_failure_at, Some(failure_at));
+    let decision = evaluate_admission(&quota, &global, &snap);
+    match decision {
+        AdmissionDecision::RefuseDeferBackoff {
+            retry_after,
+            consecutive_failures,
+        } => {
+            assert_eq!(retry_after, failure_at + chrono::Duration::seconds(60));
+            assert_eq!(consecutive_failures, 1);
+        }
+        other => panic!("expected RefuseDeferBackoff, got {other:?}"),
+    }
+
+    // Exactly 60 s after: gate releases.
+    let snap_ok = snapshot_for(
+        &storage,
+        cron_id,
+        "2026-06-01 00:00:00",
+        failure_at + chrono::Duration::seconds(60),
+    )
+    .await;
+    assert_eq!(
+        evaluate_admission(&quota, &global, &snap_ok),
+        AdmissionDecision::Admit
     );
 }
