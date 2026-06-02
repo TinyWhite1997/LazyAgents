@@ -55,6 +55,13 @@ pub struct Session {
     pub created_at: String,
     pub updated_at: String,
     pub archived_at: Option<String>,
+    /// Outcome of the optional `.lazyagents/hooks/post-create.sh` script
+    /// run once after `git worktree add` succeeds. NULL on rows created
+    /// before migration 0002 and on sessions that didn't take the
+    /// worktree path. Per WEK-8 brief amendment R4, hook failure does
+    /// NOT roll back the worktree or mutate `SessionStatus` — the TUI
+    /// renders this as a separate badge.
+    pub post_create_hook_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +78,11 @@ pub struct NewSession {
     pub base_branch: Option<String>,
     pub spawn_args: serde_json::Value,
     pub origin: String,
+    /// See [`Session::post_create_hook_status`]. Optional on the create
+    /// path because the worktree hook only runs *after* the row is
+    /// inserted; `WorktreeManager` calls
+    /// [`super::SessionsRepo::set_post_create_hook_status`] to fill it in.
+    pub post_create_hook_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]

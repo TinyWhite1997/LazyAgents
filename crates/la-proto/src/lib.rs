@@ -122,6 +122,34 @@ pub mod error_codes {
     /// version doesn't expose (e.g. JSON output mode).
     pub const ADAPTER_UNSUPPORTED_OPTION: i32 = -33105;
 
+    // ----- Worktree (M2 / WEK-27): -33110..-33119 -----
+    //
+    // The session manager creates a per-session `git worktree` when
+    // `SessionsCreateParams.worktree = true`. These codes classify the
+    // failures that block worktree provisioning before any PTY is spawned,
+    // so the TUI can render an actionable message instead of a generic
+    // "spawn failed". The numeric assignments are stable contract — adding
+    // a new code MUST go at -33115..-33119; existing codes do not move.
+    /// `-33110` — `project_dir` is not (inside) a git repository.
+    pub const WORKTREE_NOT_A_GIT_REPO: i32 = -33110;
+    /// `-33111` — `git worktree add` refused because the worktree slot is
+    /// already in use (index lock, working tree dirty in a way that
+    /// blocks add, sibling worktree already checked out at that branch).
+    pub const WORKTREE_BUSY: i32 = -33111;
+    /// `-33112` — `la/session-<sid>` branch already exists, which should
+    /// be impossible under normal sid generation; treat as state damage.
+    pub const WORKTREE_BRANCH_COLLISION: i32 = -33112;
+    /// `-33113` — filesystem failure during worktree provisioning
+    /// (ENOSPC, EACCES, etc.).
+    pub const WORKTREE_IO: i32 = -33113;
+    /// `-33114` — `git` binary missing or too old to support
+    /// `worktree add -b` (< 2.20).
+    pub const WORKTREE_GIT_UNAVAILABLE: i32 = -33114;
+    /// `-33119` — catch-all for `git worktree add` failures that don't
+    /// match the typed patterns above. `data.stderr` carries the raw
+    /// stderr (trimmed) so the user can self-diagnose.
+    pub const WORKTREE_PROVISION_FAILED: i32 = -33119;
+
     // ----- Storage / SQLite: -33200..-33299 -----
 
     /// `-33201` — SQLite reported `SQLITE_BUSY` after our retry budget.
@@ -189,6 +217,12 @@ pub enum ErrorKind {
     AdapterSpawnFailed,
     AdapterProtocolDrift,
     AdapterUnsupportedOption,
+    WorktreeNotAGitRepo,
+    WorktreeBusy,
+    WorktreeBranchCollision,
+    WorktreeIo,
+    WorktreeGitUnavailable,
+    WorktreeProvisionFailed,
     StorageBusy,
     StorageConflict,
     StorageFailed,
@@ -224,6 +258,12 @@ impl ErrorKind {
             ErrorKind::AdapterSpawnFailed => ADAPTER_SPAWN_FAILED,
             ErrorKind::AdapterProtocolDrift => ADAPTER_PROTOCOL_DRIFT,
             ErrorKind::AdapterUnsupportedOption => ADAPTER_UNSUPPORTED_OPTION,
+            ErrorKind::WorktreeNotAGitRepo => WORKTREE_NOT_A_GIT_REPO,
+            ErrorKind::WorktreeBusy => WORKTREE_BUSY,
+            ErrorKind::WorktreeBranchCollision => WORKTREE_BRANCH_COLLISION,
+            ErrorKind::WorktreeIo => WORKTREE_IO,
+            ErrorKind::WorktreeGitUnavailable => WORKTREE_GIT_UNAVAILABLE,
+            ErrorKind::WorktreeProvisionFailed => WORKTREE_PROVISION_FAILED,
             ErrorKind::StorageBusy => STORAGE_BUSY,
             ErrorKind::StorageConflict => STORAGE_CONFLICT,
             ErrorKind::StorageFailed => STORAGE_FAILED,

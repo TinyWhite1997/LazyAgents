@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use la_adapter::AgentAdapter;
-use la_core::{ManagerConfig, SessionManager};
+use la_core::{ManagerConfig, SessionManager, WorktreeManager};
 use la_ipc::transport::{Endpoint, Listener};
 use la_storage::{Storage, StorageConfig};
 use tokio::sync::Notify;
@@ -116,6 +116,17 @@ impl Daemon {
         let storage_config = StorageConfig::new(database_path, state_dir.clone());
         let storage = Storage::open(storage_config).await?;
 
+        // WEK-27: provision the per-session worktree manager once at
+        // startup. We always construct it (the directory is created
+        // lazily on first use) and stash the Arc on `ManagerConfig` so
+        // `SessionManager::spawn_with_options` can honour
+        // `worktree=true` without a follow-up wiring step. Capability
+        // bit flips on the same path so the client knows the daemon
+        // will actually act on the flag.
+        let worktree_mgr = Arc::new(WorktreeManager::for_state_dir(&state_dir));
+        let mut manager_config = manager_config;
+        manager_config.worktree = Some(worktree_mgr.clone());
+
         // Refresh the backends table from the live adapter set so
         // `sessions.list` joins still resolve even on a fresh install.
         // The registry key is what the wire surface uses (clients pass it
@@ -144,6 +155,19 @@ impl Daemon {
         let reaped = manager.reap_orphans().await.unwrap_or(0);
         if reaped > 0 {
             tracing::info!(count = reaped, "reaped orphan sessions on startup");
+        }
+
+        // WEK-27 §2.4: best-effort `git worktree prune` per known
+        // project root on startup so the daemon picks up after a
+        // crashed predecessor that left orphan worktree entries in
+        // `<repo>/.git/worktrees/`. The call is non-fatal — a wedged
+        // repo logs and the daemon still boots.
+        if let Ok(projects) = storage.projects().list().await {
+            for p in projects {
+                worktree_mgr
+                    .prune_orphans(std::path::Path::new(&p.root_path))
+                    .await;
+            }
         }
 
         let endpoint = endpoint_for(&socket.socket_path);
