@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use la_adapter::{claude::ClaudeAdapter, AgentAdapter};
+#[cfg(debug_assertions)]
+use la_adapter::{AdapterDescriptor, ProbeResult, SpawnRequest, SpawnSpec};
 use la_daemon::paths::{ensure_runtime_dir, SocketDiscovery, SocketLocation};
 use la_daemon::{
     spawn_daemonized, Daemon, DaemonConfig, DaemonError, DaemonizeError, SERVER_VERSION,
@@ -62,6 +64,8 @@ struct Parsed {
     socket_override: Option<std::path::PathBuf>,
     state_dir_override: Option<std::path::PathBuf>,
     log_level: String,
+    #[cfg(debug_assertions)]
+    test_shell_adapter_script: Option<String>,
 }
 
 enum Command {
@@ -87,6 +91,8 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut socket_override = None;
     let mut state_dir_override = None;
     let mut log_level = std::env::var("LAZYAGENTS_LOG").unwrap_or_else(|_| "info".to_string());
+    #[cfg(debug_assertions)]
+    let mut test_shell_adapter_script = None;
 
     while let Some(flag) = iter.next() {
         match flag.as_str() {
@@ -112,12 +118,21 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                     .cloned()
                     .ok_or_else(|| "--log-level expects a value".to_string())?;
             }
+            #[cfg(debug_assertions)]
+            "--test-shell-adapter" => {
+                test_shell_adapter_script =
+                    Some(iter.next().cloned().ok_or_else(|| {
+                        "--test-shell-adapter expects a shell script".to_string()
+                    })?);
+            }
             "-h" | "--help" => {
                 return Ok(Parsed {
                     cmd: Command::Help,
                     socket_override,
                     state_dir_override,
                     log_level,
+                    #[cfg(debug_assertions)]
+                    test_shell_adapter_script,
                 });
             }
             other => return Err(format!("unknown flag: {other}")),
@@ -129,6 +144,8 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         socket_override,
         state_dir_override,
         log_level,
+        #[cfg(debug_assertions)]
+        test_shell_adapter_script,
     })
 }
 
@@ -200,6 +217,11 @@ fn run(p: Parsed) -> ExitCode {
             }
             passthrough.push("--log-level".to_string());
             passthrough.push(p.log_level.clone());
+            #[cfg(debug_assertions)]
+            if let Some(script) = &p.test_shell_adapter_script {
+                passthrough.push("--test-shell-adapter".to_string());
+                passthrough.push(script.clone());
+            }
 
             match spawn_daemonized(
                 &exe,
@@ -260,6 +282,15 @@ fn run_foreground(p: Parsed) -> Result<(), DaemonError> {
             "claude".to_string(),
             Arc::new(ClaudeAdapter::new()) as Arc<dyn AgentAdapter>,
         );
+        #[cfg(debug_assertions)]
+        if let Some(script) = &p.test_shell_adapter_script {
+            adapters.insert(
+                "shtest".to_string(),
+                Arc::new(DebugShellAdapter {
+                    script: script.clone(),
+                }) as Arc<dyn AgentAdapter>,
+            );
+        }
 
         let config = DaemonConfig {
             state_dir,
@@ -295,4 +326,43 @@ fn num_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().min(8))
         .unwrap_or(2)
+}
+
+#[cfg(debug_assertions)]
+struct DebugShellAdapter {
+    script: String,
+}
+
+#[cfg(debug_assertions)]
+#[async_trait::async_trait]
+impl AgentAdapter for DebugShellAdapter {
+    fn descriptor(&self) -> AdapterDescriptor {
+        AdapterDescriptor {
+            id: "shtest",
+            display_name: "Shell Test Backend",
+            default_program: "sh",
+            docs_url: "https://example.test/shtest",
+        }
+    }
+
+    async fn probe(&self) -> ProbeResult {
+        ProbeResult::Available {
+            version: "0.0.0".into(),
+        }
+    }
+
+    fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, la_adapter::AdapterError> {
+        Ok(SpawnSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), self.script.clone().into()],
+            env: req.env.clone(),
+            cwd: req.cwd.clone(),
+            pty: req.pty,
+            stdin_mode: req.stdin_mode,
+        })
+    }
+
+    fn encode_user_input(&self, text: &str) -> bytes::Bytes {
+        bytes::Bytes::copy_from_slice(text.replace('\n', "\r").as_bytes())
+    }
 }

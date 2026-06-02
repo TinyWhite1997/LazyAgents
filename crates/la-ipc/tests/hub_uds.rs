@@ -85,7 +85,8 @@ async fn handle_one_conn(
 
     // Expect exactly one sessions.attach. The wire-level `resume_from_seq`
     // (WEK-49) carries the "since seq" for reconnects; first attaches pass
-    // `None` and we replay everything still in the ring.
+    // `None`, which is live-only (no ring replay) — only `Some(prev_seq)`
+    // asks the hub to replay seq > prev_seq.
     let msg = conn.recv().await.expect("io").expect("eof on attach");
     let Message::Request(req) = msg else { panic!() };
     assert_eq!(req.method, SessionsAttach::NAME);
