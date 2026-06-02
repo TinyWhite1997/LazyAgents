@@ -131,15 +131,32 @@ fn normalise_expr(expr: &str) -> Result<String, Error> {
     }
 }
 
-/// Helper: parse a wall-time literal in `tz` and convert to UTC. Mostly used
-/// from tests, but exposed for IPC callers that need to interpret strings like
-/// `"2026-03-08 02:30:00"` as "in this timezone".
-pub fn wall_time_in_tz(tz: Tz, y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
-    tz.with_ymd_and_hms(y, mo, d, h, mi, s)
-        .single()
-        .or_else(|| tz.with_ymd_and_hms(y, mo, d, h, mi, s).earliest())
-        .unwrap_or_else(|| panic!("invalid wall time in tz {tz:?}"))
-        .with_timezone(&Utc)
+/// Helper: parse a wall-time literal in `tz` and convert to UTC. Exposed for
+/// IPC callers that need to interpret strings like `"2026-03-08 02:30:00"`
+/// as "in this timezone".
+///
+/// Returns `Err(Error::InvalidExpr)` for non-existent local times (the
+/// spring-forward gap, e.g. `2026-03-08 02:30 America/Los_Angeles`) and for
+/// the second occurrence of an ambiguous fall-back hour — the first
+/// occurrence is returned via `earliest()` to match cron crate behaviour.
+pub fn wall_time_in_tz(
+    tz: Tz,
+    y: i32,
+    mo: u32,
+    d: u32,
+    h: u32,
+    mi: u32,
+    s: u32,
+) -> Result<DateTime<Utc>, Error> {
+    let mapped = tz.with_ymd_and_hms(y, mo, d, h, mi, s);
+    let resolved = mapped.single().or_else(|| mapped.earliest());
+    match resolved {
+        Some(dt) => Ok(dt.with_timezone(&Utc)),
+        None => Err(Error::InvalidExpr {
+            raw: format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"),
+            reason: format!("wall time does not exist in timezone {tz:?}"),
+        }),
+    }
 }
 
 #[cfg(test)]

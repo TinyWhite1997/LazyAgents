@@ -12,9 +12,9 @@
 //! deletion" pattern for `BinaryHeap`, which has no `decrease_key`.
 //!
 //! The architecture (verification standard for §5.2) demands "heap 重排在
-//! upsert / delete 后即时生效" — that's why every mutating call asserts a
-//! version bump and the scheduler loop is notified via a tokio Notify the
-//! moment a change lands.
+//! upsert / delete 后即时生效" — that's why every mutating call bumps the
+//! entry's version, and the scheduler loop wakes on the command-channel
+//! `mpsc` (in [`crate::scheduler::Scheduler::run`]) the moment a change lands.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
