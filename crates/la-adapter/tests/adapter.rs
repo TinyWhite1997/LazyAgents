@@ -7,10 +7,10 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use la_adapter::claude::ClaudeAdapter;
 use la_adapter::{AgentAdapter, ProbeResult, SpawnRequest, StdinMode, StopAction, StopSignal};
+use tokio::sync::Mutex;
 
 fn mock_cli() -> PathBuf {
     // Set by Cargo for bins in the same package.
@@ -19,16 +19,15 @@ fn mock_cli() -> PathBuf {
 
 /// All probe-against-mock-cli tests share this mutex: they mutate the
 /// process-wide `MOCK_CLI_MODE` env var and would race under cargo
-/// test's default thread-per-test parallelism.
-static MOCK_ENV: Mutex<()> = Mutex::new(());
-
-fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    MOCK_ENV.lock().unwrap_or_else(|p| p.into_inner())
-}
+/// test's default thread-per-test parallelism. Uses `tokio::sync::Mutex`
+/// so the guard can be held across `.await` without tripping the
+/// `clippy::await_holding_lock` lint that a `std::sync::Mutex` guard
+/// would (the env-var writes themselves are sync, but `probe()` is async).
+static MOCK_ENV: Mutex<()> = Mutex::const_new(());
 
 #[tokio::test]
 async fn probe_against_mock_cli_returns_available() {
-    let _g = lock_env();
+    let _g = MOCK_ENV.lock().await;
     std::env::remove_var("MOCK_CLI_MODE");
     let adapter = ClaudeAdapter::with_program(mock_cli());
     match adapter.probe().await {
@@ -56,7 +55,7 @@ async fn probe_classifies_missing_binary_as_not_installed() {
 
 #[tokio::test]
 async fn probe_classifies_unauthenticated_via_stderr() {
-    let _g = lock_env();
+    let _g = MOCK_ENV.lock().await;
     std::env::set_var("MOCK_CLI_MODE", "unauth");
     let adapter = ClaudeAdapter::with_program(mock_cli());
     let result = adapter.probe().await;
@@ -72,7 +71,7 @@ async fn probe_classifies_unauthenticated_via_stderr() {
 
 #[tokio::test]
 async fn probe_classifies_garbage_output_as_error() {
-    let _g = lock_env();
+    let _g = MOCK_ENV.lock().await;
     std::env::set_var("MOCK_CLI_MODE", "garbage");
     let adapter = ClaudeAdapter::with_program(mock_cli());
     let result = adapter.probe().await;

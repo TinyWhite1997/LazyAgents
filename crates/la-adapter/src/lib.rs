@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 pub mod claude;
+pub mod codex;
 
 /// Static metadata about an adapter — used for UI listings and the
 /// `backends` SQLite snapshot. Field values are stable for the lifetime
