@@ -384,17 +384,24 @@ impl<'a> SessionsRepo<'a> {
         .map_err(Into::into)
     }
 
-    /// Set `worktree_path` / `worktree_branch` to NULL after cleanup.
-    /// Leaves `base_branch` intact for postmortem inspection — callers
-    /// that need to wipe everything can `delete` the row instead.
-    pub async fn clear_worktree(&self, id: &str) -> Result<bool> {
+    /// Set `worktree_path` to NULL after cleanup. When
+    /// `keep_branch = false`, also nulls `worktree_branch`. Per WEK-8
+    /// §2.4 row 2, the branch column survives the archive whenever the
+    /// branch itself was preserved on disk — that's how the TUI can
+    /// later offer "checkout this archived session's work".
+    /// `base_branch` is always left intact for postmortem inspection;
+    /// callers that need to wipe everything can `delete` the row.
+    pub async fn clear_worktree(&self, id: &str, keep_branch: bool) -> Result<bool> {
+        let sql = if keep_branch {
+            "UPDATE sessions SET worktree_path = NULL, updated_at = datetime('now') WHERE id = ?1"
+        } else {
+            "UPDATE sessions SET worktree_path = NULL, worktree_branch = NULL, updated_at = datetime('now') WHERE id = ?1"
+        };
         let result = retry_busy(|| async {
-            sqlx::query(
-                "UPDATE sessions SET worktree_path = NULL, worktree_branch = NULL, updated_at = datetime('now') WHERE id = ?1",
-            )
-            .bind(id)
-            .execute(self.storage.writer_pool())
-            .await
+            sqlx::query(sql)
+                .bind(id)
+                .execute(self.storage.writer_pool())
+                .await
         })
         .await?;
         Ok(result.rows_affected() > 0)

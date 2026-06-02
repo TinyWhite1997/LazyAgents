@@ -649,3 +649,126 @@ async fn branch_exists(repo_root: &Path, branch: &str) -> bool {
         .expect("branch list");
     std::str::from_utf8(&out.stdout).unwrap().contains(branch)
 }
+
+/// WEK-8 §2.4 row 2: when `KeepBranchIfDirty` keeps the branch
+/// (commits beyond base) `archive` MUST preserve `worktree_branch` on
+/// the row so the TUI can later offer `git checkout la/session-<sid>`.
+/// `worktree_path` must still be cleared because the directory is
+/// gone. Regression for the v3 review NEEDS-FIX #2.
+#[tokio::test]
+async fn archive_with_dirty_branch_preserves_branch_column() {
+    let project_tmp = TempDir::new().expect("project dir");
+    let repo_root = project_tmp.path().join("repo");
+    init_repo_with_seed(&repo_root).await;
+
+    let h = harness_with_worktree(&repo_root).await;
+    let adapter = ShellAdapter::new("true");
+    let spawned = h
+        .manager
+        .spawn_with_options(
+            &adapter,
+            h.project_id.clone(),
+            la_adapter::SpawnRequest::new(repo_root.clone()),
+            Some(WorktreeSpawnOptions {
+                repo_root: repo_root.clone(),
+            }),
+        )
+        .await
+        .expect("spawn");
+    let wt_path = spawned.worktree_path.clone().expect("path");
+    let branch = spawned.worktree_branch.clone().expect("branch");
+    wait_for_exit(&h.manager, &spawned.id).await;
+
+    // Commit something inside the worktree so the session branch is
+    // ahead of `main` — KeepBranchIfDirty must then preserve it.
+    tokio::fs::write(wt_path.join("agent.txt"), b"work\n")
+        .await
+        .unwrap();
+    run(&wt_path, &["git", "add", "agent.txt"]).await;
+    run(&wt_path, &["git", "commit", "-q", "-m", "agent work"]).await;
+
+    h.manager.archive(&spawned.id).await.expect("archive");
+
+    assert!(!wt_path.exists(), "worktree dir must be gone after archive");
+    assert!(
+        branch_exists(&repo_root, &branch).await,
+        "branch {branch} must survive (commits beyond base)"
+    );
+
+    let row = h
+        .storage
+        .sessions()
+        .get(spawned.id.as_str())
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(
+        row.worktree_path.is_none(),
+        "worktree_path must be NULL after archive"
+    );
+    assert_eq!(
+        row.worktree_branch.as_deref(),
+        Some(branch.as_str()),
+        "worktree_branch column must survive when the branch was kept"
+    );
+}
+
+/// `WorktreeManager::prune_orphans` MUST drop `.git/worktrees/<name>`
+/// admin entries whose recorded directory no longer exists. We fake
+/// that by `git worktree add`ing a real worktree, then `rm -rf`-ing
+/// the directory behind git's back so the admin entry is orphaned.
+/// Asserts the call is also non-fatal on a path that isn't a git repo.
+#[tokio::test]
+async fn prune_orphans_reaps_orphan_admin_entries() {
+    let project_tmp = TempDir::new().expect("project dir");
+    let repo_root = project_tmp.path().join("repo");
+    init_repo_with_seed(&repo_root).await;
+
+    let state = TempDir::new().expect("state");
+    let wm = WorktreeManager::for_state_dir(state.path());
+
+    // Real `git worktree add` so git lays down the admin entry the
+    // way it would in production.
+    let stranded_dir = project_tmp.path().join("stranded");
+    run(
+        &repo_root,
+        &[
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "la/session-prunetest",
+            stranded_dir.to_str().unwrap(),
+        ],
+    )
+    .await;
+    let admin = repo_root.join(".git").join("worktrees").join("stranded");
+    assert!(
+        admin.exists(),
+        "git should have written admin entry at {}",
+        admin.display()
+    );
+
+    // Yank the directory behind git's back — now `git worktree list`
+    // still mentions it but the path is gone. `prune` is what
+    // resolves that.
+    tokio::fs::remove_dir_all(&stranded_dir).await.unwrap();
+    assert!(
+        admin.exists(),
+        "admin entry should still be around pre-prune"
+    );
+
+    wm.prune_orphans(&repo_root).await;
+
+    assert!(
+        !admin.exists(),
+        "prune_orphans must drop the orphan admin entry at {}",
+        admin.display()
+    );
+
+    // Calling on a non-git path is best-effort and MUST NOT panic /
+    // return Err (the function returns () anyway). Asserts the
+    // contract directly.
+    let not_a_repo = TempDir::new().expect("not-a-repo");
+    wm.prune_orphans(not_a_repo.path()).await;
+}

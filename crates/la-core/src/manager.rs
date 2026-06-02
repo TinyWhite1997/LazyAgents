@@ -310,7 +310,7 @@ impl SessionManager {
                         .inner
                         .storage
                         .sessions()
-                        .clear_worktree(id.as_str())
+                        .clear_worktree(id.as_str(), false)
                         .await;
                 }
                 return Err(err.into());
@@ -602,18 +602,22 @@ impl SessionManager {
                         .cleanup(&handle, crate::worktree::CleanupMode::KeepBranchIfDirty)
                         .await
                     {
-                        Ok(()) => {
+                        Ok(branch_preserved) => {
                             // Clear the path only after the worktree
-                            // is actually gone. On failure we keep the
-                            // triple so a future `sweep_expired` /
-                            // operator retry can reconstruct the
-                            // handle from the row instead of fishing
-                            // the path out of the warning log.
+                            // is actually gone. WEK-8 §2.4 row 2: when
+                            // KeepBranchIfDirty kept the branch (the
+                            // agent committed something), the row's
+                            // `worktree_branch` column must survive so
+                            // the TUI can later offer `git checkout`.
+                            // `branch_preserved` is the bit cleanup
+                            // already computed — no need to re-derive
+                            // it here. On failure we keep the triple so
+                            // a future sweep can retry.
                             let _ = self
                                 .inner
                                 .storage
                                 .sessions()
-                                .clear_worktree(id.as_str())
+                                .clear_worktree(id.as_str(), branch_preserved)
                                 .await;
                         }
                         Err(err) => {

@@ -261,7 +261,7 @@ impl WorktreeManager {
     }
 
     /// Tear down a worktree according to `mode`. Idempotent — a
-    /// worktree-already-gone result is `Ok(())` so the dispatcher can
+    /// worktree-already-gone result is `Ok(_)` so the dispatcher can
     /// retry without coordination. Branch deletion follows
     /// [`CleanupMode`]:
     ///
@@ -271,7 +271,12 @@ impl WorktreeManager {
     /// - [`CleanupMode::KeepBranchIfDirty`]: keep the branch if
     ///   `git rev-list base..branch` is non-empty (the agent committed
     ///   something the user may want to recover).
-    pub async fn cleanup(&self, handle: &WorktreeHandle, mode: CleanupMode) -> CoreResult<()> {
+    ///
+    /// Returns `Ok(true)` when the branch was **preserved** and
+    /// `Ok(false)` when it was deleted — callers persist that bit so
+    /// `sessions.worktree_branch` survives in the row whenever the
+    /// branch is still on disk, per WEK-8 §2.4.
+    pub async fn cleanup(&self, handle: &WorktreeHandle, mode: CleanupMode) -> CoreResult<bool> {
         let force = matches!(mode, CleanupMode::Force);
 
         // `git::worktree_remove` already swallows the "already gone"
@@ -331,7 +336,7 @@ impl WorktreeManager {
             // session branch.
             git::branch_delete(&handle.repo_root, &handle.branch, true).await?;
         }
-        Ok(())
+        Ok(keep_branch)
     }
 
     /// Best-effort `git worktree prune` against `repo_root`. Never panics
@@ -400,7 +405,7 @@ impl WorktreeManager {
                 // a missing branch/base column is a schema drift that
                 // we can't reconstruct a handle from. Clear the path so
                 // the next sweep doesn't pick it up forever.
-                let _ = storage.sessions().clear_worktree(&row.id).await;
+                let _ = storage.sessions().clear_worktree(&row.id, false).await;
                 continue;
             };
             let repo_root = match storage.projects().get(&row.project_id).await {
@@ -411,14 +416,17 @@ impl WorktreeManager {
                     // against. The on-disk directory becomes pure
                     // garbage that `git worktree prune` won't see, but
                     // that's an operator-cleanup edge case.
-                    let _ = storage.sessions().clear_worktree(&row.id).await;
+                    let _ = storage.sessions().clear_worktree(&row.id, false).await;
                     continue;
                 }
             };
             let handle = Self::handle_from_row(repo_root, wt_path, branch, base_branch);
             match self.cleanup(&handle, CleanupMode::Force).await {
-                Ok(()) => {
-                    let _ = storage.sessions().clear_worktree(&row.id).await;
+                Ok(_kept_branch) => {
+                    // `Force` always drops the branch (cleanup returns
+                    // `false`), so `keep_branch=false` is the correct
+                    // bit to persist regardless of the return value.
+                    let _ = storage.sessions().clear_worktree(&row.id, false).await;
                     ok += 1;
                 }
                 Err(e) => {
