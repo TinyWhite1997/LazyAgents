@@ -1426,8 +1426,7 @@ async fn events_subscribe_immediately_pushes_cached_daemon_health_snapshot() {
                 }
                 Ok(Ok(Some(Message::Notification(n)))) if n.method == "daemon.health" => {
                     let p: DaemonHealthParams =
-                        serde_json::from_value(n.params.expect("params"))
-                            .expect("decode health");
+                        serde_json::from_value(n.params.expect("params")).expect("decode health");
                     if !p.backends.is_empty() {
                         got_health = Some(p);
                     }
@@ -1436,14 +1435,11 @@ async fn events_subscribe_immediately_pushes_cached_daemon_health_snapshot() {
             }
         }
         assert!(got_ack, "never received events.subscribe response");
-        let health = got_health
-            .expect("expected an immediate daemon.health snapshot after subscribe");
+        let health =
+            got_health.expect("expected an immediate daemon.health snapshot after subscribe");
         assert_eq!(health.backends.len(), 1, "single registered adapter");
         assert_eq!(health.backends[0].id, "codex");
-        assert_eq!(
-            health.backends[0].status,
-            BackendHealthStatus::NotInstalled
-        );
+        assert_eq!(health.backends[0].status, BackendHealthStatus::NotInstalled);
     };
     let outcome = tokio::time::timeout(Duration::from_secs(5), test).await;
 

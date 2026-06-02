@@ -493,9 +493,7 @@ async fn handle_events_subscribe(
             running: ctx.manager.active_count().await as u32,
             errors_last_5m: backends
                 .iter()
-                .filter(|b| {
-                    b.status != la_proto::notifications::BackendHealthStatus::Available
-                })
+                .filter(|b| b.status != la_proto::notifications::BackendHealthStatus::Available)
                 .count() as u32,
             backends,
         };
