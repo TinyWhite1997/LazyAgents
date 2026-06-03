@@ -22,6 +22,10 @@ static TRACE_SEQ: AtomicU64 = AtomicU64::new(1);
 static EVENT_RING: OnceLock<RecentEvents> = OnceLock::new();
 static METRICS: OnceLock<MetricsStore> = OnceLock::new();
 
+/// Generate a 128-bit event identifier for log correlation.
+///
+/// This is intentionally local to the emitting event today; it is not a W3C
+/// traceparent-compatible, end-to-end trace context propagation mechanism.
 pub fn new_trace_id() -> String {
     let now = Utc::now()
         .timestamp_nanos_opt()
@@ -220,12 +224,12 @@ fn describe_metrics() {
     metrics::describe_counter!(
         "lad_session_output_bytes_total",
         Unit::Bytes,
-        "Session output bytes delivered to attached clients, labelled by backend."
+        "Session output bytes delivered to attached clients."
     );
     metrics::describe_counter!(
         "lad_cron_runs_total",
         Unit::Count,
-        "Cron run notifications emitted by status."
+        "Cron runs by status; status=running marks the fire entry, all other statuses are terminal outcomes."
     );
     metrics::describe_histogram!(
         "lad_pty_spawn_duration_seconds",
@@ -283,7 +287,6 @@ impl MetricKey {
 struct HistogramValue {
     count: u64,
     sum: f64,
-    max: f64,
 }
 
 impl Recorder for MetricsStore {
@@ -356,10 +359,7 @@ impl MetricsStore {
             out.push_str("# TYPE ");
             out.push_str(name);
             out.push(' ');
-            out.push_str(match desc.kind {
-                "histogram" => "summary",
-                other => other,
-            });
+            out.push_str(desc.kind);
             out.push('\n');
         }
         for (key, value) in &inner.counters {
@@ -369,9 +369,15 @@ impl MetricsStore {
             render_sample(&mut out, key, "", *value);
         }
         for (key, value) in &inner.histograms {
-            render_sample(&mut out, key, "_count", value.count as f64);
+            render_sample_with_extra_label(
+                &mut out,
+                key,
+                "_bucket",
+                ("le", "+Inf"),
+                value.count as f64,
+            );
             render_sample(&mut out, key, "_sum", value.sum);
-            render_sample(&mut out, key, "_max", value.max);
+            render_sample(&mut out, key, "_count", value.count as f64);
         }
         out
     }
@@ -427,7 +433,6 @@ impl HistogramFn for HistogramHandle {
         let entry = inner.histograms.entry(self.key.clone()).or_default();
         entry.count += 1;
         entry.sum += value;
-        entry.max = entry.max.max(value);
     }
 }
 
@@ -447,6 +452,38 @@ fn render_sample(out: &mut String, key: &MetricKey, suffix: &str, value: f64) {
         }
         out.push('}');
     }
+    out.push(' ');
+    out.push_str(&format!("{value}"));
+    out.push('\n');
+}
+
+fn render_sample_with_extra_label(
+    out: &mut String,
+    key: &MetricKey,
+    suffix: &str,
+    extra: (&str, &str),
+    value: f64,
+) {
+    out.push_str(&key.name);
+    out.push_str(suffix);
+    out.push('{');
+    for (idx, (k, v)) in key.labels.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(k);
+        out.push_str("=\"");
+        out.push_str(&escape_label(v));
+        out.push('"');
+    }
+    if !key.labels.is_empty() {
+        out.push(',');
+    }
+    out.push_str(extra.0);
+    out.push_str("=\"");
+    out.push_str(&escape_label(extra.1));
+    out.push('"');
+    out.push('}');
     out.push(' ');
     out.push_str(&format!("{value}"));
     out.push('\n');
@@ -479,10 +516,16 @@ mod tests {
         install_metrics_recorder();
         metrics::counter!("lad_rpc_requests_total", "method" => "sessions.list", "result" => "ok")
             .increment(1);
+        metrics::histogram!("lad_pty_spawn_duration_seconds").record(0.25);
         let rendered = render_prometheus();
         assert!(rendered.contains("lad_rpc_requests_total"));
         assert!(rendered.contains("method=\"sessions.list\""));
         assert!(rendered.contains("result=\"ok\""));
+        assert!(rendered.contains("# TYPE lad_pty_spawn_duration_seconds histogram"));
+        assert!(rendered.contains("lad_pty_spawn_duration_seconds_bucket{le=\"+Inf\"} 1"));
+        assert!(rendered.contains("lad_pty_spawn_duration_seconds_sum 0.25"));
+        assert!(rendered.contains("lad_pty_spawn_duration_seconds_count 1"));
+        assert!(!rendered.contains("lad_pty_spawn_duration_seconds_max"));
     }
 
     #[test]

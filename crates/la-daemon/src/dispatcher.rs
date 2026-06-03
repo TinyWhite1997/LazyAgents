@@ -349,11 +349,8 @@ async fn drain_subscription(_id: SessionId, mut sub: Subscription, send: Arc<dyn
         let result = match event {
             HubEvent::Output(p) => {
                 if let Ok(bytes) = p.data_bytes() {
-                    metrics::counter!(
-                        "lad_session_output_bytes_total",
-                        "backend" => "unknown",
-                    )
-                    .increment(bytes.len() as u64);
+                    metrics::counter!("lad_session_output_bytes_total")
+                        .increment(bytes.len() as u64);
                 }
                 Notification::new(SessionOutput::NAME, &*p)
             }
