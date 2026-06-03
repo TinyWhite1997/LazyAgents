@@ -97,7 +97,7 @@ If you don't need any of that, classic `cron` + a shell script is simpler.
 
 ### What protects a freshly-saved cron from going live by accident?
 
-`crons.upsert` always lands a cron disabled — you have to call `crons.set_enabled { cron_id, enabled: true }` to turn it on. Editing any sensitive field afterwards (backend, schedule, prompt, args, budget — see `SENSITIVE_CRON_FIELDS` in `crates/la-daemon/src/cron_security.rs`) **auto-disables** it again, forcing another `set_enabled` before the next fire. The daemon also has a confirmation-token + summary helper (5-minute TTL, single-use) intended to add a two-step gate on `set_enabled`; it lives in `cron_security` but is not yet wired into the RPC surface in v1. Plan accordingly when scripting against `crons.*`.
+In v1, **the only protection is that you have to call `crons.set_enabled` explicitly**. `crons.upsert` for a brand-new id lands it disabled, but updating an *already-enabled* cron — even when you change backend, schedule, prompt, args, or budget — keeps it enabled and the next scheduled fire will use the new values. The daemon's `cron_security` module (`crates/la-daemon/src/cron_security.rs`) defines a `SENSITIVE_CRON_FIELDS` allowlist and a confirmation-token + summary helper (5-minute TTL, single-use, 64 KiB `MAX_PROMPT_BYTES` prompt cap) that *will* auto-disable + token-gate enabling, but those helpers are not yet plumbed into the dispatcher in v1. If you're scripting risky edits, call `set_enabled { enabled: false }` first.
 
 ### Can I put credentials in a cron prompt?
 

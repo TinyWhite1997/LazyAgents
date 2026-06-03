@@ -45,7 +45,7 @@ The full rationale is in [ADR-0002](https://github.com/TinyWhite1997/LazyAgents/
 }}
 ```
 
-Then enable it with `crons.set_enabled { cron_id, enabled: true }`. See [Enabling a cron](#enabling-a-cron) below for the wire shape and the v1 protections that actually run today (auto-disable on sensitive edits + 64 KiB prompt cap).
+Then enable it with `crons.set_enabled { cron_id, enabled: true }`. See [Enabling a cron](#enabling-a-cron) below — and note that v1's enable path has no token gate, no auto-disable on sensitive edits, and no IPC-level prompt size cap.
 
 ### TUI editor (M3.5 wiring, today mock-backed)
 
@@ -58,7 +58,7 @@ In the TUI you switch to the **Crons** tab and press **`n`** to open the editor.
 | Spawn args | Extra args passed to the backend CLI. |
 | Cron expr | 5 or 6 fields. |
 | Tz | IANA name. |
-| Prompt | Up to 64 KiB. Don't put credentials here — see [Security caveats](#security-caveats). |
+| Prompt | Don't put credentials here — see [Security caveats](#security-caveats). A 64 KiB cap (`MAX_PROMPT_BYTES`) exists in `cron_security` but is not enforced at the v1 IPC boundary yet. |
 | Budget | Daily USD cap, runtime per run, max concurrent runs, etc. |
 
 `Ctrl+S` saves the draft. `Esc` discards. **In v1 these writes land in the TUI's mock source only**; M3.5 swaps in a live `IpcCronSource` and the same keystrokes will round-trip to `crons.upsert`.
@@ -90,14 +90,14 @@ Crons don't become enabled on save — `crons.upsert` always lands them disabled
 }}
 ```
 
-The wire params are just `{cron_id, enabled}`; the response carries the updated cron row. There is **no token round-trip exposed on the RPC surface in v1** — the daemon's `cron_security` module has a confirmation-token + summary helper (5-minute TTL, single-use, invalidated by any sensitive-field edit) intended to gate `set_enabled`, but it is not yet wired into the proto or dispatcher. Treat that as planned hardening, not a current user-facing API.
+The wire params are just `{cron_id, enabled}`; the response carries the updated cron row. There is **no enable-time hardening on the v1 RPC surface yet**: no confirmation token, no auto-disable on sensitive edits, no IPC-level prompt size cap. The daemon ships a `cron_security` module (`crates/la-daemon/src/cron_security.rs`) with a 5-minute single-use confirmation token + summary helper, a `SENSITIVE_CRON_FIELDS` allowlist (backend, args, prompt, schedule, timezone, runtime limits, max-per-day, daily budget), and a 64 KiB `MAX_PROMPT_BYTES` cap — but **the dispatcher and scheduler don't call any of it today**. Treat all of those as planned hardening, not current user-facing behaviour.
 
 What v1 *does* enforce today:
 
-- **Auto-disable on sensitive edits.** Changing backend, args, prompt, schedule, timezone, runtime limits, max-per-day, or daily budget bumps the cron back to `enabled = false`, so any next-run after a sensitive change requires you to call `set_enabled` again. The "sensitive" allowlist matches `SENSITIVE_CRON_FIELDS` in `crates/la-daemon/src/cron_security.rs`.
-- **Prompt is hard-capped at 64 KiB** at the IPC boundary (`MAX_PROMPT_BYTES`). Larger prompts are rejected before they hit the scheduler.
+- **New cron defaults to disabled.** `crons.upsert` for a brand-new id sets `enabled = false`; you must explicitly `crons.set_enabled` to turn it on.
+- **Updates preserve the current `enabled` bit.** Updating an already-enabled cron — even when changing backend, prompt, or schedule — leaves it enabled and the next scheduled fire will use the new values. There is no auto-disable safety net in v1; if you're scripting risky edits, call `set_enabled { enabled: false }` first.
 
-Once the token gate ships, a `set_enabled` call will hand back a confirmation token + summary and a follow-up call with the token will flip the bit. Until then, the v1 protection is the auto-disable behaviour plus the sensitive-field allowlist — keep that in mind when scripting against `crons.*`.
+Once `cron_security` is wired to the RPC surface, both the auto-disable on sensitive edits and the token round-trip will kick in. Until then the only protection on `crons.set_enabled` is "you have to call it explicitly".
 
 ## What fires when the cron triggers
 
@@ -147,7 +147,7 @@ Old `runs` rows are pruned after a retention window (default 90 days, swept once
 
 - **Prompts are stored as plaintext.** They're not encrypted or treated as secrets. Don't put credentials in a prompt.
 - **Cron-spawned commands are spawned directly** — the executor does not wrap them in `/bin/sh -c`. Shell-injection through `spawn_args` is not a thing.
-- **Prompts are capped at 64 KiB** at the IPC boundary, before they ever touch the scheduler.
+- **A 64 KiB prompt cap exists in `cron_security` (`MAX_PROMPT_BYTES`) but is not enforced at the v1 RPC boundary**; the daemon will accept and store arbitrarily large prompts today. Treat 64 KiB as the design target you should respect anyway — once `cron_security` is wired through, oversize prompts will be rejected before the scheduler sees them.
 
 ## Dry-run before you enable
 
