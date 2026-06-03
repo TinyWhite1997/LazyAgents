@@ -121,6 +121,7 @@ pub fn decide_upsert_security(
     next: &CronSecuritySnapshot,
 ) -> Result<UpsertSecurityDecision, CronSecurityError> {
     next.validate()?;
+    let existing_enabled = existing.is_some() && existing_enabled;
     let changed_fields = existing
         .map(|prev| prev.changed_sensitive_fields(next))
         .unwrap_or_default();
@@ -220,8 +221,8 @@ impl ConfirmationTokens {
         summary: ConfirmationSummary,
         now: Instant,
     ) -> Result<SetEnabledGate, CronSecurityError> {
-        self.prune_expired(now);
         let Some(token) = token else {
+            self.prune_expired(now);
             let issued = self.issue(cron_id, summary.clone(), now)?;
             return Ok(SetEnabledGate::RequiresConfirmation {
                 token: issued,
@@ -230,6 +231,7 @@ impl ConfirmationTokens {
         };
 
         let Some(pending) = self.pending.remove(token) else {
+            self.prune_expired(now);
             return Err(CronSecurityError::InvalidConfirmationToken);
         };
         if pending.expires_at <= now {
@@ -342,6 +344,15 @@ mod tests {
     }
 
     #[test]
+    fn new_cron_upsert_never_enables_in_one_step_even_if_caller_passes_enabled() {
+        let decision = decide_upsert_security(true, None, &snapshot("new")).unwrap();
+
+        assert!(!decision.enabled_after_upsert);
+        assert!(!decision.requires_reconfirmation);
+        assert!(decision.changed_fields.is_empty());
+    }
+
+    #[test]
     fn failure_backoff_is_not_a_sensitive_field() {
         assert!(!format!("{:?}", SENSITIVE_CRON_FIELDS).contains("FailureBackoff"));
     }
@@ -403,6 +414,32 @@ mod tests {
                 .require_or_confirm("cron-b", Some(token.expose_secret()), summary(), now)
                 .unwrap_err(),
             CronSecurityError::TokenCronMismatch
+        );
+        assert_eq!(tokens.pending_len(), 0);
+    }
+
+    #[test]
+    fn expired_confirmation_token_reports_expired() {
+        let mut tokens = ConfirmationTokens::new();
+        let now = Instant::now();
+        let token = match tokens
+            .require_or_confirm("cron-a", None, summary(), now)
+            .unwrap()
+        {
+            SetEnabledGate::RequiresConfirmation { token, .. } => token,
+            SetEnabledGate::Confirmed { .. } => panic!("expected token"),
+        };
+
+        assert_eq!(
+            tokens
+                .require_or_confirm(
+                    "cron-a",
+                    Some(token.expose_secret()),
+                    summary(),
+                    now + CONFIRMATION_TOKEN_TTL + Duration::from_secs(1),
+                )
+                .unwrap_err(),
+            CronSecurityError::ExpiredConfirmationToken
         );
         assert_eq!(tokens.pending_len(), 0);
     }

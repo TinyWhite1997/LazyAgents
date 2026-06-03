@@ -7,9 +7,11 @@
 //! [`StreamPair`] alias so callers can be transport-agnostic above this layer.
 //!
 //! Security note: Unix listeners bind under a temporary `umask(0o077)`, then
-//! chmod the socket file to 0600 and verify accepted peers with `SO_PEERCRED`.
-//! Windows listeners reject remote clients; the current v1 validation target
-//! is Linux, so Windows SID ACL hardening remains behind the platform gate.
+//! chmod the socket file to 0600 and verify accepted peers with platform peer
+//! credentials (`SO_PEERCRED` on Linux/Android, `getpeereid` on BSD-family
+//! targets). Windows listeners reject remote clients; the current v1
+//! validation target is Linux, so Windows SID ACL hardening remains behind the
+//! platform gate.
 //!
 //! The `Endpoint` enum exists so the same code path can describe both a UDS
 //! path and a Named Pipe name without conditional compilation in callers.
@@ -162,6 +164,19 @@ mod imp {
     }
 
     fn verify_peer_uid(stream: &UnixStream) -> io::Result<()> {
+        let peer_uid = peer_uid(stream)?;
+        let expected = unsafe { libc::geteuid() };
+        if peer_uid != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("peer uid {peer_uid} does not match daemon uid {expected}"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
         let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         let rc = unsafe {
@@ -178,14 +193,42 @@ mod imp {
         }
 
         let cred = unsafe { cred.assume_init() };
-        let expected = unsafe { libc::geteuid() };
-        if cred.uid != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("peer uid {} does not match daemon uid {expected}", cred.uid),
-            ));
+        Ok(cred.uid)
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
         }
-        Ok(())
+        Ok(uid)
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    fn peer_uid(_stream: &UnixStream) -> io::Result<libc::uid_t> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix peer credential validation is not implemented on this target",
+        ))
     }
 
     /// Convenience: socket-file mode-checking for tests. Returns the file

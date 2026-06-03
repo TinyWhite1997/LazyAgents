@@ -41,8 +41,11 @@ metadata.
   `Display`.
 - LazyAgents does not store backend credentials. Authentication remains owned
   by the installed agent CLIs.
-- Cron metadata may include prompt text; users should treat prompts as stored
-  local data and avoid placing credentials in them.
+- Cron prompts are sensitive stored local data, but they are not treated as
+  secrets and do not use `SecretString`: the daemon must be able to diff and
+  persist prompt text for cron definitions. Prompt safety is enforced through
+  the 64 KiB backend limit and sensitive-field reconfirmation; users should not
+  place credentials in prompts.
 
 ## Spawn Controls
 
