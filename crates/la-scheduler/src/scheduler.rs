@@ -148,6 +148,15 @@ impl SchedulerHandle {
     /// heap can defer the next wake-up without re-querying SQLite. The
     /// contract is:
     ///
+    /// - **At install / daemon restart (REQUIRED).** The scheduler's mirror
+    ///   is in-memory only and a fresh [`Self::upsert`] starts with a zero
+    ///   [`crate::BackoffState`]. Immediately after each `upsert` whose
+    ///   `crons.consecutive_failures > 0`, the daemon MUST follow with one
+    ///   `update_backoff_state(id, parsed_backoff, last_failure_at, n)`
+    ///   call seeded from SQLite. Skipping this leaves the heap floor
+    ///   inactive across restarts: the admission gate will still refuse the
+    ///   fires (it re-reads SQLite) but the scheduler reverts to the
+    ///   wake-up-on-every-tick noise this layer exists to suppress.
     /// - **After every terminal run** (status `failed` / `timed_out` /
     ///   `completed` / `cancelled` / `budget_exceeded`), once the executor
     ///   has settled the new counter, call this with the
@@ -481,6 +490,13 @@ impl Scheduler {
         let now = self.clock.wall_now();
         let next = next_eligible_fire(&spec, now, new_state);
         guard.refresh_next_fire(id, next, None);
+        debug!(
+            cron_id = %id,
+            consecutive_failures = new_state.consecutive_failures,
+            retry_after = ?new_state.retry_after(),
+            next_fire_at = ?next,
+            "scheduler backoff mirror updated",
+        );
         true
     }
 

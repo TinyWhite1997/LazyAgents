@@ -86,6 +86,16 @@ impl BackoffState {
     /// failure, or `consecutive_failures == 0`). Mirrors
     /// [`crate::quota::backoff_retry_after`] without taking the full quota
     /// struct — the scheduler only needs the three fields tracked here.
+    ///
+    /// **All-or-nothing semantics (fail-open).** The three inputs
+    /// (`backoff`, `last_failure_at`, `consecutive_failures`) are treated
+    /// as one bundle: missing any single piece (e.g. `Some(backoff) +
+    /// consecutive_failures > 0 + last_failure_at = None`) returns `None`
+    /// rather than synthesising a window from defaults. The choice is
+    /// deliberate — if the executor failed to thread the timestamp through,
+    /// we would rather temporarily lose the deferral (the admission gate
+    /// is the safety net) than wedge the heap into a permanent
+    /// retry-after-Y2K window.
     pub fn retry_after(self) -> Option<DateTime<Utc>> {
         let backoff = self.backoff?;
         let last = self.last_failure_at?;

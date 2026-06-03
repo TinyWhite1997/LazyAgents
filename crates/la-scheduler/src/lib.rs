@@ -46,6 +46,26 @@
 //!    callers that bypass the scheduler (e.g. `crons.run_now`), but in steady
 //!    state the scheduler should never push a fire that the gate would
 //!    refuse for backoff reasons.
+//!
+//! ### Install / daemon-restart seeding (REQUIRED)
+//!
+//! The scheduler's backoff mirror is **in-memory only** — it does not survive
+//! a daemon restart, and a fresh [`SchedulerHandle::upsert`] starts with a
+//! zero [`BackoffState`]. The authoritative copy lives in SQLite on the
+//! `crons` row (`consecutive_failures`, parsed `failure_backoff`) plus the
+//! `runs` row that holds the most recent terminal failure's `finished_at`.
+//!
+//! Therefore the daemon **MUST**, immediately after every
+//! `SchedulerHandle::upsert` whose row has `consecutive_failures > 0`, follow
+//! with a [`SchedulerHandle::update_backoff_state`] call seeded from SQLite.
+//! Without that follow-up, every daemon restart silently disables the heap
+//! floor until the next terminal failure observation re-arms it: the
+//! admission gate still refuses the fires (it re-reads SQLite) but the
+//! scheduler reverts to waking on every cron tick — exactly the wake-up
+//! noise this layer exists to suppress.
+//!
+//! This contract is enforced by the daemon's run-executor brief (M3.5);
+//! la-scheduler exposes the API but cannot police the caller.
 
 pub mod catchup;
 pub mod clock;

@@ -997,6 +997,29 @@ async fn upsert_preserves_existing_backoff_state() {
         "preserved backoff state must still floor the heap after a re-upsert",
     );
 
+    // Re-upsert with a different catchup_mode (Skip → Coalesce). The
+    // backoff mirror is owned by the executor, not the cron's catchup
+    // policy — flipping the policy must NOT clear it.
+    let spec_v4 = CronSpec::parse("* * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "edited",
+            spec_v4,
+            CatchupMode::Coalesce,
+            Duration::zero(),
+            None,
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let post3 = ch.handle.snapshot().await.unwrap();
+    assert_eq!(
+        post3[0].fire_at,
+        wall + Duration::seconds(240),
+        "catchup_mode change must not clear executor-owned backoff mirror",
+    );
+
     ch.handle.shutdown().await.unwrap();
 }
 
