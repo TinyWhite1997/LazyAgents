@@ -733,8 +733,8 @@ impl<'a> RunsRepo<'a> {
 
     /// Archive runs whose `finished_at` falls strictly before
     /// `now - retention_days` (M3 Rev2 §3.3). Only rows in a terminal
-    /// status are considered (`succeeded`/`completed`, `failed`,
-    /// `timed_out`, `cancelled`, `budget_exceeded`); `pending`,
+    /// status are considered (`completed`, `failed`, `timed_out`,
+    /// `cancelled`, `budget_exceeded`); `pending`,
     /// `spawning`, and `running` rows are left in place even if their
     /// `scheduled_at` is ancient — those represent live or stranded work
     /// that the operator should resolve manually, not data to discard.
