@@ -11,7 +11,8 @@
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::app::{AppMsg, Modal, Tab};
+use crate::app::{AppMsg, Focus, Modal, Tab};
+use crate::crons::FieldEdit;
 
 /// Hit boxes for the renderer's interactive regions, so mouse clicks can
 /// be routed to the right [`AppMsg`].
@@ -28,6 +29,14 @@ pub struct HitBoxes {
     pub sidebar: Rect,
     pub sidebar_scroll_offset: usize,
     pub tab_bar_row: u16,
+    /// Active tab — drives which AppMsg variants the translator emits
+    /// for shared keys (`j`/`k`/`n`/`d`/`r`/space). Without this the
+    /// Crons tab would receive `SidebarDown` instead of `CronListDown`.
+    pub tab: Tab,
+    /// Focus inside the active tab. On Crons, `Focus::Main` means the
+    /// editor pane has the cursor and printable keys feed
+    /// [`FieldEdit::Insert`] instead of triggering navigation.
+    pub focus: Focus,
 }
 
 /// Translate one crossterm event to an `AppMsg`, given the modal currently
@@ -42,17 +51,34 @@ pub fn translate(event: Event, modal: Option<&Modal>, hit: &HitBoxes) -> Option<
             if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
                 return None;
             }
-            translate_key(k.code, k.modifiers, modal)
+            translate_key(k.code, k.modifiers, modal, hit.tab, hit.focus)
         }
         Event::Mouse(m) => translate_mouse(m, hit),
         _ => None,
     }
 }
 
-fn translate_key(code: KeyCode, mods: KeyModifiers, modal: Option<&Modal>) -> Option<AppMsg> {
+fn translate_key(
+    code: KeyCode,
+    mods: KeyModifiers,
+    modal: Option<&Modal>,
+    tab: Tab,
+    focus: Focus,
+) -> Option<AppMsg> {
     // Modal-context keys first; otherwise normal navigation.
     if let Some(m) = modal {
         return translate_modal_key(code, mods, m);
+    }
+    // Crons-tab keys take priority when the user is on that tab —
+    // otherwise `j` on the Crons list would still send SidebarDown and
+    // the cron list wouldn't move.
+    if tab == Tab::Crons {
+        if let Some(msg) = translate_crons_key(code, mods, focus) {
+            return Some(msg);
+        }
+        // Fall through to globals only (Tab / digit / q / ?). The
+        // Sessions navigation keys are NOT advertised here.
+        return translate_globals(code, mods);
     }
     Some(match code {
         // Always-on: quit / help / tab cycle.
@@ -87,6 +113,79 @@ fn translate_key(code: KeyCode, mods: KeyModifiers, modal: Option<&Modal>) -> Op
     })
 }
 
+/// Keys valid on the Crons tab. Two sub-contexts:
+/// - `focus == Sidebar` → cron list navigation (`j`/`k`/`n`/`d`/`r`/space).
+/// - `focus == Main` → form editor: printable chars feed the field, the
+///   navigation keys are only the ones safe in a buffer (Tab/Shift-Tab/Esc).
+fn translate_crons_key(code: KeyCode, mods: KeyModifiers, focus: Focus) -> Option<AppMsg> {
+    // Globals first so Ctrl-C / Tab / digit / ? / q always win.
+    if let KeyCode::Char('c') = code {
+        if mods.contains(KeyModifiers::CONTROL) {
+            return Some(AppMsg::Quit);
+        }
+    }
+    // Ctrl-S commits the editor draft from either focus — saves the user
+    // from hunting for a binding when the form is "obviously done".
+    if let KeyCode::Char('s') = code {
+        if mods.contains(KeyModifiers::CONTROL) {
+            return Some(AppMsg::CronSaveDraft);
+        }
+    }
+    if focus == Focus::Sidebar {
+        return Some(match code {
+            KeyCode::Char('q') => AppMsg::Quit,
+            KeyCode::Char('?') => AppMsg::ToggleFullHints,
+            KeyCode::Tab => AppMsg::CronFocusEditor,
+            KeyCode::BackTab => AppMsg::PrevTab,
+            KeyCode::Char('1') => AppMsg::SetTab(Tab::Sessions),
+            KeyCode::Char('2') => AppMsg::SetTab(Tab::Crons),
+
+            KeyCode::Char('j') | KeyCode::Down => AppMsg::CronListDown,
+            KeyCode::Char('k') | KeyCode::Up => AppMsg::CronListUp,
+            KeyCode::Char('g') => AppMsg::CronListTop,
+            KeyCode::Char('G') => AppMsg::CronListBottom,
+
+            KeyCode::Char('n') => AppMsg::CronNew,
+            KeyCode::Char('d') => AppMsg::CronDelete,
+            KeyCode::Char(' ') => AppMsg::CronToggleEnabled,
+            KeyCode::Char('r') => AppMsg::CronTriggerNow,
+            KeyCode::Char('R') => AppMsg::CronDryRun,
+            KeyCode::Char('i') | KeyCode::Char('e') | KeyCode::Enter => AppMsg::CronFocusEditor,
+            KeyCode::Esc => AppMsg::Cancel,
+            _ => return None,
+        });
+    }
+    // Editor pane: printable chars → field edit; only structural keys
+    // are reserved. `Enter` does NOT save unconditionally — the App
+    // decides (CronEditorEnter inserts a newline on multi-line fields,
+    // saves on single-line). Explicit "save now" stays on Ctrl+S so the
+    // multi-line fields are still typable.
+    Some(match code {
+        KeyCode::Esc => AppMsg::CronCancelDraft,
+        KeyCode::Tab => AppMsg::CronFieldNext,
+        KeyCode::BackTab => AppMsg::CronFieldPrev,
+        KeyCode::Enter => AppMsg::CronEditorEnter,
+        KeyCode::Backspace => AppMsg::CronFieldEdit(FieldEdit::Backspace),
+        KeyCode::Char(c) => AppMsg::CronFieldEdit(FieldEdit::Insert(c)),
+        _ => return None,
+    })
+}
+
+/// The minimum global set every context honours: quit / help / tab
+/// switch. Used as a fallback when the active-tab translator declined.
+fn translate_globals(code: KeyCode, mods: KeyModifiers) -> Option<AppMsg> {
+    Some(match code {
+        KeyCode::Char('q') => AppMsg::Quit,
+        KeyCode::Char('?') => AppMsg::ToggleFullHints,
+        KeyCode::Tab => AppMsg::NextTab,
+        KeyCode::BackTab => AppMsg::PrevTab,
+        KeyCode::Char('1') => AppMsg::SetTab(Tab::Sessions),
+        KeyCode::Char('2') => AppMsg::SetTab(Tab::Crons),
+        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => AppMsg::Quit,
+        _ => return None,
+    })
+}
+
 fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Option<AppMsg> {
     // Ctrl-C always quits, even inside a modal.
     if let KeyCode::Char('c') = code {
@@ -108,6 +207,15 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
         Modal::NewSession { .. } => match code {
             KeyCode::Enter => AppMsg::Confirm,
             KeyCode::Esc => AppMsg::Cancel,
+            _ => return None,
+        },
+        Modal::ConfirmEnableCron { .. } | Modal::ConfirmDeleteCron { .. } => match code {
+            KeyCode::Char('y') | KeyCode::Enter => AppMsg::Confirm,
+            KeyCode::Char('n') | KeyCode::Esc => AppMsg::Cancel,
+            _ => return None,
+        },
+        Modal::DryRunCron { .. } => match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => AppMsg::Cancel,
             _ => return None,
         },
     })
@@ -155,6 +263,8 @@ mod tests {
             sidebar: Rect::new(1, 2, 28, 8),
             sidebar_scroll_offset: 0,
             tab_bar_row: 0,
+            tab: Tab::Sessions,
+            focus: Focus::Sidebar,
         }
     }
 
@@ -236,6 +346,8 @@ mod tests {
             sidebar: Rect::new(1, 2, 28, 8),
             sidebar_scroll_offset: 12,
             tab_bar_row: 0,
+            tab: Tab::Sessions,
+            focus: Focus::Sidebar,
         };
         let ev = Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),

@@ -26,6 +26,16 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# WEK-35 / M3.4 acceptance: "dry_run 与 scheduler 计算一致（共享 cron crate
+# 调用）". la-tui uses the same workspace-pinned `cron` + `chrono`/`chrono-tz`
+# versions as la-scheduler::cron_spec so the human preview / dry-run modal
+# returns byte-identical fire times to what the daemon will schedule. We
+# intentionally do NOT pull la-scheduler as a dep — the §2.1 architectural
+# rule limits la-tui to la-proto + la-ipc + utility third-party crates, and
+# CronSpec parsing is small enough to mirror locally.
+cron = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

@@ -82,15 +82,7 @@ impl HintRegistry {
         }
         match tab {
             Tab::Sessions => Self::for_sessions(focus, selection),
-            // Crons tab placeholder until M3. We still want `Tab` / `?` /
-            // `q` to be teachable so the user is not stranded on an empty
-            // tab — but we deliberately do NOT advertise cron-management
-            // keys we cannot honour yet.
-            Tab::Crons => {
-                let mut out = Self::globals();
-                out.sort_by_key(|h| std::cmp::Reverse(h.importance));
-                out
-            }
+            Tab::Crons => Self::for_crons(focus),
         }
     }
 
@@ -173,6 +165,67 @@ impl HintRegistry {
                 // 选择在 M1.7 落 daemon 之前没有 handler，所以这里**不**
                 // advertise — 等 backend chooser 上线再加回来。
             ],
+            Modal::ConfirmEnableCron { .. } => vec![
+                Hint::new("y", "enable cron", Importance::Primary),
+                Hint::new("n / Esc", "cancel", Importance::High),
+            ],
+            Modal::ConfirmDeleteCron { .. } => vec![
+                Hint::new("y", "delete cron", Importance::Primary),
+                Hint::new("n / Esc", "cancel", Importance::High),
+            ],
+            Modal::DryRunCron { .. } => vec![
+                Hint::new("Esc", "close", Importance::Primary),
+                Hint::new("⏎", "close", Importance::High),
+            ],
+        }
+    }
+
+    /// Crons-tab hints. The Crons tab has two focus contexts (list +
+    /// editor); we surface the most-used keys for each so the bottom
+    /// bar mirrors the WEK-35 acceptance keys (`n`, `d`, `space`, `r`).
+    fn for_crons(focus: Focus) -> Vec<Hint> {
+        match focus {
+            Focus::Sidebar => {
+                let mut out = vec![
+                    Hint::new("⏎", "edit", Importance::Primary),
+                    Hint::new("n", "new", Importance::High),
+                    Hint::new("d", "delete", Importance::High),
+                    Hint::new("Space", "enable/disable", Importance::High),
+                    Hint::new("r", "trigger now", Importance::Medium),
+                    Hint::new("R", "dry-run (next 5)", Importance::Medium),
+                    Hint::new("j/k", "down/up", Importance::Medium),
+                    Hint::new("g/G", "top/bottom", Importance::Low),
+                    Hint::new("Tab", "edit pane", Importance::Low),
+                ];
+                out.extend(Self::globals());
+                out.sort_by_key(|h| std::cmp::Reverse(h.importance));
+                out
+            }
+            // Editor focus is a free-typing context: every `Char(c)` —
+            // including `q`, `?`, digits — feeds the field buffer. We
+            // deliberately do NOT extend `globals()` here so the bar
+            // never advertises `q quit` / `? all keys` / `Tab next tab`
+            // when those keys actually just write into the buffer
+            // (review feedback from Code Reviewer: hint == 真实绑定).
+            // Ctrl-C is still an unconditional escape — we omit it from
+            // the bar because it's standard and listing every modifier
+            // shortcut would crowd out the field-relevant keys.
+            //
+            // `Enter` is intentionally NOT advertised as "save" because
+            // its behaviour is field-dependent (newline on multi-line
+            // fields, save on single-line). `Ctrl+S` is the
+            // field-independent save so users always have one
+            // unambiguous gesture.
+            Focus::Main => {
+                let mut out = vec![
+                    Hint::new("Ctrl+S", "save", Importance::Primary),
+                    Hint::new("Esc", "discard draft", Importance::High),
+                    Hint::new("Tab", "next field", Importance::High),
+                    Hint::new("⏎", "newline / save", Importance::Medium),
+                ];
+                out.sort_by_key(|h| std::cmp::Reverse(h.importance));
+                out
+            }
         }
     }
 
@@ -324,6 +377,8 @@ mod tests {
             sidebar: Rect::default(),
             sidebar_scroll_offset: 0,
             tab_bar_row: 0,
+            tab: Tab::Sessions,
+            focus: Focus::Sidebar,
         };
 
         let contexts = [
@@ -373,6 +428,8 @@ mod tests {
             sidebar: Rect::default(),
             sidebar_scroll_offset: 0,
             tab_bar_row: 0,
+            tab: Tab::Sessions,
+            focus: Focus::Sidebar,
         };
         let modals = [
             Modal::ConfirmDelete {
@@ -381,6 +438,20 @@ mod tests {
             Modal::FullHints,
             Modal::NewSession {
                 project_id: "p1".into(),
+            },
+            Modal::ConfirmEnableCron {
+                cron_id: "c1".into(),
+                cron_name: "n".into(),
+                budget_label: "b".into(),
+                next_label: "x".into(),
+            },
+            Modal::ConfirmDeleteCron {
+                cron_id: "c1".into(),
+                cron_name: "n".into(),
+            },
+            Modal::DryRunCron {
+                cron_id: "c1".into(),
+                fires: vec!["t".into()],
             },
         ];
         for m in &modals {
@@ -404,6 +475,63 @@ mod tests {
         }
     }
 
+    /// WEK-35 review feedback: hints on the Crons editor pane must not
+    /// advertise keys that the input layer silently captures as field
+    /// edits. Concretely, `q`/`?`/`Tab next tab` were leaking through
+    /// `globals()` while in `Focus::Main`, even though every printable
+    /// char goes to [`FieldEdit::Insert`] there. Pin both directions:
+    /// (a) no hint on the editor pane maps to a `Char(_)` field-edit,
+    /// (b) every hint that names a single key actually triggers a
+    /// non-`CronFieldEdit` AppMsg.
+    #[test]
+    fn crons_editor_hints_do_not_advertise_keys_that_are_field_edits() {
+        use crate::app::AppMsg;
+        use crate::input::{translate, HitBoxes};
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        use ratatui::layout::Rect;
+
+        let hit = HitBoxes {
+            tabs: Vec::new(),
+            sidebar: Rect::default(),
+            sidebar_scroll_offset: 0,
+            tab_bar_row: 0,
+            tab: Tab::Crons,
+            focus: Focus::Main,
+        };
+        let hints = HintRegistry::for_context(Tab::Crons, Focus::Main, &Selection::Empty, None);
+        // Negative: no hint should resolve to a field-edit. This is the
+        // exact failure mode the reviewer caught — `q quit` advertised
+        // in the bar but the keystroke ended up in the prompt buffer.
+        for h in &hints {
+            let Some(code) = single_char_key(h.key) else {
+                continue;
+            };
+            let ev = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+            let msg = translate(ev, None, &hit).expect("editor key translatable");
+            assert!(
+                !matches!(msg, AppMsg::CronFieldEdit(_)),
+                "editor hint '{}' ({}) maps to a field-edit instead of the advertised action",
+                h.label,
+                h.key,
+            );
+        }
+        // Positive: editor pane should NOT teach `q`/`?`/`Tab next tab`
+        // because they aren't bound to their global meaning here.
+        let advertises = |label: &str| hints.iter().any(|h| h.label == label);
+        assert!(
+            !advertises("quit"),
+            "editor pane must not advertise `q quit` (q is a literal keystroke)"
+        );
+        assert!(
+            !advertises("all keys"),
+            "editor pane must not advertise `? all keys` (? is a literal keystroke)"
+        );
+        assert!(
+            !advertises("next tab"),
+            "editor pane must not advertise `Tab next tab` (Tab is field-next)"
+        );
+    }
+
     /// Map the registry's presentational key labels back to the [`KeyCode`]
     /// the input layer matches against. Returns `None` for composite labels
     /// (`j/k`, `g/G`, `n / Esc`, `Esc / ?`) — the test treats those as
@@ -423,6 +551,9 @@ mod tests {
             "q" => Some(KeyCode::Char('q')),
             "y" => Some(KeyCode::Char('y')),
             "?" => Some(KeyCode::Char('?')),
+            "r" => Some(KeyCode::Char('r')),
+            "R" => Some(KeyCode::Char('R')),
+            "Space" => Some(KeyCode::Char(' ')),
             _ => None,
         }
     }

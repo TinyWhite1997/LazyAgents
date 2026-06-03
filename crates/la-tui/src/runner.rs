@@ -27,6 +27,7 @@ use ratatui::Frame;
 use ratatui::Terminal;
 
 use crate::app::{App, AppMsg, AppOutcome, Focus, Modal, Tab};
+use crate::crons::{human_label, CronSource, CronsState, EditField};
 use crate::health_sub::HealthEvent;
 use crate::input::{translate, HitBoxes};
 use crate::key_hints::{format_hint_bar, HintRegistry};
@@ -38,7 +39,7 @@ use crate::tabs::render_tabs;
 /// Run the TUI event loop until the user quits. Returns Ok(()) on normal
 /// exit; any I/O or terminal-setup error is propagated so the binary can
 /// log it and exit nonzero.
-pub fn run<S: SessionSource>(app: App<S>) -> io::Result<()> {
+pub fn run<S: SessionSource, C: CronSource>(app: App<S, C>) -> io::Result<()> {
     run_with_health(app, None)
 }
 
@@ -46,8 +47,8 @@ pub fn run<S: SessionSource>(app: App<S>) -> io::Result<()> {
 /// used by the `la` binary to forward `daemon.health` notifications
 /// from [`crate::health_sub::spawn`] into the App as `BackendsUpdate`
 /// messages.
-pub fn run_with_health<S: SessionSource>(
-    mut app: App<S>,
+pub fn run_with_health<S: SessionSource, C: CronSource>(
+    mut app: App<S, C>,
     health_rx: Option<Receiver<HealthEvent>>,
 ) -> io::Result<()> {
     let mut terminal = setup_terminal()?;
@@ -80,9 +81,9 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
     Ok(())
 }
 
-fn event_loop<S: SessionSource>(
+fn event_loop<S: SessionSource, C: CronSource>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App<S>,
+    app: &mut App<S, C>,
     health_rx: Option<Receiver<HealthEvent>>,
 ) -> io::Result<()> {
     let mut hit = HitBoxes {
@@ -90,8 +91,13 @@ fn event_loop<S: SessionSource>(
         sidebar: Rect::default(),
         sidebar_scroll_offset: 0,
         tab_bar_row: 0,
+        tab: Tab::Sessions,
+        focus: Focus::Sidebar,
     };
     loop {
+        // Push a fresh `now` into the Crons state so the inline
+        // "今日/明日" labels refresh each frame without the user typing.
+        app.crons.set_now(chrono::Utc::now());
         terminal.draw(|frame| {
             hit = draw(frame, app);
         })?;
@@ -127,7 +133,7 @@ fn event_loop<S: SessionSource>(
 
 /// Lay out the screen and render every pane. Returns the hit boxes the
 /// event loop needs to translate mouse clicks.
-pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
+pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S, C>) -> HitBoxes {
     let size = frame.area();
 
     // Vertical stack: tab bar (3 rows incl. border) · main row (rest) · status (2) · hints (1).
@@ -188,7 +194,7 @@ pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
             render_content_placeholder(frame, content_area, &app.sidebar.selection());
         }
         Tab::Crons => {
-            render_crons_placeholder(frame, sidebar_area, content_area);
+            render_crons(frame, sidebar_area, content_area, &app.crons, app.focus);
         }
     }
 
@@ -232,6 +238,8 @@ pub fn draw<S: SessionSource>(frame: &mut Frame<'_>, app: &App<S>) -> HitBoxes {
         // sync with what ratatui's List widget actually drew.
         sidebar_scroll_offset: app.sidebar.scroll_offset(),
         tab_bar_row: tabs_area.y,
+        tab: app.tab,
+        focus: app.focus,
     }
 }
 
@@ -259,15 +267,193 @@ Once a project exists, press `n` here to start a session inside it."
     frame.render_widget(para, area);
 }
 
-fn render_crons_placeholder(frame: &mut Frame<'_>, sidebar: Rect, content: Rect) {
-    let s = Paragraph::new("Crons land in M3.")
-        .block(Block::default().borders(Borders::ALL).title("Crons"));
-    frame.render_widget(s, sidebar);
-    let c =
-        Paragraph::new("Cron scheduler is part of milestone M3 (PRD §5.4). Press Tab to return.")
-            .block(Block::default().borders(Borders::ALL).title("Detail"))
-            .wrap(Wrap { trim: false });
-    frame.render_widget(c, content);
+fn render_crons(
+    frame: &mut Frame<'_>,
+    list_area: Rect,
+    editor_area: Rect,
+    state: &CronsState,
+    focus: Focus,
+) {
+    render_crons_list(frame, list_area, state, focus == Focus::Sidebar);
+    render_crons_editor(frame, editor_area, state, focus == Focus::Main);
+}
+
+fn render_crons_list(frame: &mut Frame<'_>, area: Rect, state: &CronsState, focused: bool) {
+    let crons = state.crons();
+    let cursor = state.cursor().unwrap_or(0);
+
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(crons.len());
+    if crons.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no crons — press `n` to add one)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        for (i, c) in crons.iter().enumerate() {
+            let selected = i == cursor;
+            let glyph = if c.enabled { "✓" } else { "○" };
+            let glyph_style = if c.enabled {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            // ● badge for "dirty" rows so the user knows a save is
+            // pending. The list reflects committed state; the editor
+            // pane owns the dirty draft.
+            let dirty_badge = if c.dirty { " ●" } else { "" };
+            let row_style = if selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {glyph} "), glyph_style),
+                Span::styled(format!("{:<18}", truncate(&c.name, 18)), row_style),
+                Span::styled(
+                    format!(" {}", c.cron_expr),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(dirty_badge, Style::default().fg(Color::Yellow)),
+            ]));
+        }
+    }
+
+    let title = if focused { "Crons*" } else { "Crons" };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        });
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_crons_editor(frame: &mut Frame<'_>, area: Rect, state: &CronsState, focused: bool) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Editor")
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        });
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    frame.render_widget(block, area);
+
+    let Some(cron) = state.editor_view() else {
+        let para = Paragraph::new(
+            "No cron selected.\n\nPress `n` to start a new one, or `j`/`k` to pick a row.",
+        )
+        .wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+        return;
+    };
+
+    let preview = state.preview();
+    // Inline "下次：…" hint, red-flagged if the expression is invalid.
+    let (preview_line, preview_style) = match preview.error.as_deref() {
+        Some(err) => (format!("✗ {err}"), Style::default().fg(Color::Red)),
+        None => match preview.next {
+            Some(next) => (
+                human_label(next, state.now(), &cron.tz),
+                Style::default().fg(Color::Green),
+            ),
+            None => ("下次：—".to_string(), Style::default().fg(Color::Yellow)),
+        },
+    };
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    // Header row: name + dirty badge + enable state.
+    let header_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let dirty_badge = if cron.dirty { "  ● unsaved" } else { "" };
+    let enabled_badge = if cron.enabled {
+        Span::styled("  [enabled]", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("  [disabled]", Style::default().fg(Color::DarkGray))
+    };
+    lines.push(Line::from(vec![
+        Span::styled(cron.name.clone(), header_style),
+        enabled_badge,
+        Span::styled(dirty_badge, Style::default().fg(Color::Yellow)),
+    ]));
+    lines.push(Line::from(Span::styled(preview_line, preview_style)));
+    lines.push(Line::from(""));
+
+    let cur_field = state.field();
+    for f in EditField::ALL {
+        let active = f == cur_field && focused;
+        let marker = if active { "▶ " } else { "  " };
+        let label_style = if active {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!("{marker}{}", f.label()),
+            label_style,
+        )]));
+        let body = field_body(f, cron);
+        let body_style = if f == EditField::CronExpr && preview.error.is_some() {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        // Multiline fields (spawn args, prompt) render as separate lines
+        // all indented four columns past the marker so they don't shift
+        // the form when the field is short — uniform indent across lines
+        // matches what a single-line field renders.
+        for ln in body.lines() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("    {ln}"),
+                body_style,
+            )]));
+        }
+        if body.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "    (empty)",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
+}
+
+fn field_body(field: EditField, cron: &crate::crons::Cron) -> String {
+    match field {
+        EditField::Name => cron.name.clone(),
+        EditField::Backend => cron.backend_id.clone(),
+        EditField::SpawnArgs => cron.spawn_args.join("\n"),
+        EditField::CronExpr => cron.cron_expr.clone(),
+        EditField::Tz => cron.tz.clone(),
+        EditField::Prompt => cron.prompt.clone(),
+        EditField::Budget => cron
+            .cost_budget_usd_per_day
+            .map(|v| format!("{v}"))
+            .unwrap_or_default(),
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn render_modal(
@@ -342,6 +528,67 @@ fn render_modal(
                         .border_style(Style::default().fg(Color::Cyan)),
                 )
                 .wrap(Wrap { trim: false });
+            frame.render_widget(para, area);
+        }
+        Modal::ConfirmEnableCron {
+            cron_name,
+            budget_label,
+            next_label,
+            ..
+        } => {
+            let area = centered(full, 70, 10);
+            frame.render_widget(Clear, area);
+            let body = format!(
+                "Enable cron \"{cron_name}\"?\n\nDaily cost budget: {budget_label}\n{next_label}\n\nEnabled crons run unattended and spend on real backends.\n\n[y] enable   [n / Esc] cancel"
+            );
+            let para = Paragraph::new(body)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Confirm enable cron")
+                        .border_style(Style::default().fg(Color::Yellow)),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(para, area);
+        }
+        Modal::ConfirmDeleteCron { cron_name, .. } => {
+            let area = centered(full, 60, 7);
+            frame.render_widget(Clear, area);
+            let body = format!(
+                "Delete cron \"{cron_name}\"?\n\nThis cannot be undone — the daemon will stop scheduling it.\n\n[y] confirm   [n / Esc] cancel"
+            );
+            let para = Paragraph::new(body)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Confirm delete cron")
+                        .border_style(Style::default().fg(Color::Red)),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(para, area);
+        }
+        Modal::DryRunCron { cron_id, fires } => {
+            let area = centered(full, 70, (fires.len() as u16 + 6).min(18));
+            frame.render_widget(Clear, area);
+            let header = Line::from(vec![Span::styled(
+                format!("Next {} fires for {cron_id}", fires.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            )]);
+            let mut lines: Vec<Line<'_>> = vec![header, Line::from("")];
+            for (i, f) in fires.iter().enumerate() {
+                lines.push(Line::from(format!("  {:>2}. {f}", i + 1)));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Esc / ⏎ to close.",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+            let para = Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Dry-run")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
             frame.render_widget(para, area);
         }
     }
