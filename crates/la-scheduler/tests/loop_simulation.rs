@@ -222,6 +222,83 @@ async fn over_max_catchup_degrades_to_single_fire() {
     ch.handle.shutdown().await.unwrap();
 }
 
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn seven_day_timeline_all_catchup_modes_are_bounded_and_distinct() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 8, 0, 0, 0).unwrap();
+    let modes = [
+        (CatchupMode::Skip, 0usize, 0u32, false),
+        (CatchupMode::Coalesce, 1usize, 84u32, false),
+        (CatchupMode::Replay, 84usize, 1u32, false),
+    ];
+
+    for (mode, expected_len, expected_count, expected_degraded) in modes {
+        let (_clock, mut ch) = start_at(wall);
+        let last = wall - Duration::days(7);
+        let spec = CronSpec::parse("0 */2 * * *", "UTC").unwrap();
+        ch.handle
+            .upsert(
+                format!("seven-day-{mode:?}"),
+                spec,
+                mode,
+                Duration::zero(),
+                Some(last),
+            )
+            .await
+            .unwrap();
+        advance(StdDuration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        let fires = drain_fires(&mut ch.fires).await;
+        assert_eq!(
+            fires.len(),
+            expected_len,
+            "{mode:?} emitted an unexpected number of seven-day catch-up fires: {fires:#?}",
+        );
+        for fire in &fires {
+            assert_eq!(fire.coalesced_count, expected_count);
+            assert_eq!(fire.catchup_degraded, expected_degraded);
+        }
+        if mode == CatchupMode::Replay {
+            assert_eq!(
+                fires.first().unwrap().scheduled_at,
+                last + Duration::hours(2)
+            );
+            assert_eq!(fires.last().unwrap().scheduled_at, wall);
+        }
+        ch.handle.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn seven_day_minutely_replay_degrades_before_unbounded_backlog() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 8, 0, 0, 0).unwrap();
+    let (_clock, mut ch) = start_at(wall);
+
+    ch.handle
+        .upsert(
+            "seven-day-minutely-replay",
+            CronSpec::parse("* * * * *", "UTC").unwrap(),
+            CatchupMode::Replay,
+            Duration::zero(),
+            Some(wall - Duration::days(7)),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    let fires = drain_fires(&mut ch.fires).await;
+    assert_eq!(fires.len(), 1, "over-cap replay must collapse to one fire");
+    assert!(fires[0].catchup_degraded);
+    assert_eq!(
+        fires[0].scheduled_at,
+        wall - Duration::days(7) + Duration::minutes((la_scheduler::MAX_CATCHUP + 1) as i64),
+        "degraded catch-up keeps the last collected fire before the iterator cap"
+    );
+
+    ch.handle.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // §5.1 DST — IANA timezone fires use wall-clock semantics
 // ---------------------------------------------------------------------------

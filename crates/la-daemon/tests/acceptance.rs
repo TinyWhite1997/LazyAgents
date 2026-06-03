@@ -30,10 +30,11 @@ use la_ipc::transport::{connect, Endpoint};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
 use la_proto::methods::{
-    SessionState, SessionsArchiveParams, SessionsArchiveResult, SessionsAttachParams,
-    SessionsAttachResult, SessionsCreateParams, SessionsCreateResult, SessionsDeleteParams,
-    SessionsDeleteResult, SessionsDetachParams, SessionsDetachResult, SessionsListParams,
-    SessionsListResult, SessionsWriteParams, SessionsWriteResult,
+    EventTopic, EventsSubscribeParams, EventsSubscribeResult, SessionSignal, SessionState,
+    SessionsArchiveParams, SessionsArchiveResult, SessionsAttachParams, SessionsAttachResult,
+    SessionsCreateParams, SessionsCreateResult, SessionsDeleteParams, SessionsDeleteResult,
+    SessionsDetachParams, SessionsDetachResult, SessionsListParams, SessionsListResult,
+    SessionsSignalParams, SessionsSignalResult, SessionsWriteParams, SessionsWriteResult,
 };
 use la_proto::notifications::SessionOutputParams;
 use tempfile::TempDir;
@@ -129,6 +130,7 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
         ..DaemonConfig::default()
     };
     let daemon = Daemon::bind(config).await.expect("bind daemon");
+    let bus = daemon.manager.bus();
     let (handle, join) = daemon.spawn();
 
     // Wait for the socket to be ready for connections (Listener::bind has
@@ -145,7 +147,7 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
         socket,
         handle,
         join,
-        bus: None,
+        bus: Some(bus),
         _tempdir: tempdir,
     }
 }
@@ -738,6 +740,180 @@ async fn shutdown_kills_term_ignoring_child_within_hard_cap() {
         elapsed <= Duration::from_secs(11),
         "SIGKILL escalation must happen inside the 10s ceiling, took {elapsed:?}"
     );
+}
+
+/// WEK-38 chaos: an agent child can disappear outside the daemon's control
+/// (OOM killer, user kill -9, terminal crash). The output pump must observe
+/// the waiter exit, persist an `exited` state, drop the runtime, and keep the
+/// daemon responsive for later RPCs.
+#[tokio::test]
+async fn chaos_external_child_kill_exits_session_without_crashing_daemon() {
+    let project = tempfile::tempdir().expect("project tmp");
+    let pid_file = project.path().join("child.pid");
+    let daemon = bootstrap_daemon("printf '%s\\n' $$ > child.pid; trap '' TERM; sleep 120").await;
+    let mut conn = client(&daemon.socket).await;
+
+    let create: SessionsCreateResult = call(
+        &mut conn,
+        1,
+        "sessions.create",
+        &SessionsCreateParams {
+            project_dir: project.path().to_string_lossy().to_string(),
+            backend: "shtest".to_string(),
+            args: vec![],
+            prompt: None,
+            worktree: false,
+        },
+    )
+    .await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut pid_text = String::new();
+    while std::time::Instant::now() < deadline {
+        pid_text = std::fs::read_to_string(&pid_file).unwrap_or_default();
+        if !pid_text.trim().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let child_pid: i32 = pid_text.trim().parse().expect("child wrote a pid");
+    kill_pid(child_pid, 9);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut exited = false;
+    while tokio::time::Instant::now() < deadline {
+        let list: SessionsListResult = call(
+            &mut conn,
+            2,
+            "sessions.list",
+            &SessionsListParams {
+                project: None,
+                backend: None,
+                include_archived: true,
+            },
+        )
+        .await;
+        if list
+            .sessions
+            .iter()
+            .any(|s| s.session_id == create.session_id && s.state == SessionState::Exited)
+        {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        exited,
+        "externally killed child did not settle to exited state"
+    );
+
+    let _: SessionsListResult = call(
+        &mut conn,
+        3,
+        "sessions.list",
+        &SessionsListParams {
+            project: None,
+            backend: None,
+            include_archived: true,
+        },
+    )
+    .await;
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+/// WEK-38 / Story 3: closing a TUI is just an IPC disconnect. It must not
+/// stop the daemon-owned session runtime or the daemon-level cron event path.
+#[tokio::test]
+async fn chaos_ipc_disconnect_keeps_session_and_cron_events_alive() {
+    use la_core::BusEvent;
+    use la_proto::notifications::CronFiredParams;
+
+    let project = tempfile::tempdir().expect("project tmp");
+    let daemon = bootstrap_daemon("trap 'exit 0' TERM; sleep 120").await;
+    let bus = daemon.bus.clone().expect("test daemon exposes its bus");
+    let mut conn = client(&daemon.socket).await;
+
+    let create: SessionsCreateResult = call(
+        &mut conn,
+        1,
+        "sessions.create",
+        &SessionsCreateParams {
+            project_dir: project.path().to_string_lossy().to_string(),
+            backend: "shtest".to_string(),
+            args: vec![],
+            prompt: None,
+            worktree: false,
+        },
+    )
+    .await;
+    drop(conn);
+
+    let mut conn = client(&daemon.socket).await;
+    let list: SessionsListResult = call(
+        &mut conn,
+        2,
+        "sessions.list",
+        &SessionsListParams {
+            project: None,
+            backend: None,
+            include_archived: true,
+        },
+    )
+    .await;
+    assert!(
+        list.sessions
+            .iter()
+            .any(|s| s.session_id == create.session_id && s.state != SessionState::Exited),
+        "disconnecting the first client must not reap the daemon-owned session"
+    );
+
+    let sub = EventsSubscribeParams {
+        topics: vec![EventTopic::CronFired],
+    };
+    send_request(&mut conn, 3, "events.subscribe", &sub).await;
+    let ack: EventsSubscribeResult =
+        serde_json::from_value(recv_response_for(&mut conn, 3).await).expect("decode sub");
+    assert!(ack.topics.contains(&EventTopic::CronFired));
+
+    let payload = CronFiredParams {
+        cron_id: "story-3-cron".into(),
+        run_id: "run-after-disconnect".into(),
+        fired_at: "2026-06-03T04:00:00Z".into(),
+        status: "spawning".into(),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got = None;
+    while tokio::time::Instant::now() < deadline && got.is_none() {
+        bus.publish(BusEvent::CronFired(payload.clone()));
+        match tokio::time::timeout(Duration::from_millis(250), conn.recv()).await {
+            Ok(Ok(Some(Message::Notification(n)))) if n.method == "cron.fired" => {
+                got = Some(
+                    serde_json::from_value::<CronFiredParams>(n.params.expect("cron params"))
+                        .expect("decode cron.fired"),
+                );
+            }
+            _ => {}
+        }
+    }
+    let got = got.expect("cron.fired was not delivered after prior client disconnect");
+    assert_eq!(got.cron_id, "story-3-cron");
+
+    let _: SessionsSignalResult = call(
+        &mut conn,
+        4,
+        "sessions.signal",
+        &SessionsSignalParams {
+            session_id: create.session_id,
+            signal: SessionSignal::Term,
+        },
+    )
+    .await;
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
 
 /// WEK-27 regression: a daemon with an active worktree-sweep loop
