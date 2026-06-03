@@ -37,6 +37,14 @@ env:
   CARGO_DIST_VERSION: "v0.32.0"
   # Speed up CI by skipping unused cargo features.
   CARGO_TERM_COLOR: always
+  # Resolve once: workflow_dispatch lets the operator pass an explicit
+  # `tag` input (e.g. "v0.2.0-rc.1") for a dry-run plan; tag pushes set
+  # `github.ref_name` to the tag automatically. Falling back to `ref_name`
+  # when the input is blank means a manual run from a branch (the default
+  # workflow_dispatch shape) plans for HEAD's branch name — which `dist
+  # plan` rejects with a clear error, exactly what we want instead of
+  # silently planning the wrong release.
+  RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
 
 jobs:
   plan:
@@ -57,7 +65,7 @@ jobs:
       - name: plan
         id: plan
         run: |
-          dist plan --tag="${GITHUB_REF_NAME}" --output-format=json > dist-manifest.json
+          dist plan --tag="${RELEASE_TAG}" --output-format=json > dist-manifest.json
           cat dist-manifest.json
           echo "manifest=$(cat dist-manifest.json | base64 -w0)" >> "$GITHUB_OUTPUT"
 
@@ -101,7 +109,7 @@ jobs:
       # target. The `dist` profile (Cargo.toml) drives lto/strip; the
       # workspace metadata picks installers + target list.
       - name: build local artifacts
-        run: dist build --tag="${{ github.ref_name }}" --artifacts=local --target=${{ matrix.target }}
+        run: dist build --tag="${RELEASE_TAG}" --artifacts=local --target=${{ matrix.target }}
         shell: bash
       - name: upload artifacts
         uses: actions/upload-artifact@v4
@@ -112,7 +120,7 @@ jobs:
             !target/distrib/*.txt
 
   global:
-    name: global installers (shell / homebrew / scoop)
+    name: global installers (shell / powershell / homebrew)
     needs: [plan, build]
     runs-on: ubuntu-latest
     steps:
@@ -131,10 +139,12 @@ jobs:
           path: target/distrib
           merge-multiple: true
       # `dist build --artifacts=global` produces install.sh, install.ps1,
-      # the Homebrew formula, and the Scoop manifest. They are anchored at
-      # the planned download URLs and reference each per-target checksum.
+      # and the Homebrew formula. They are anchored at the planned
+      # download URLs and reference each per-target checksum. (Scoop
+      # manifest is intentionally NOT generated — see Cargo.toml dist
+      # metadata comment for why it's a follow-up.)
       - name: build global installers
-        run: dist build --tag="${{ github.ref_name }}" --artifacts=global
+        run: dist build --tag="${RELEASE_TAG}" --artifacts=global
       - name: upload global artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -193,5 +203,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          dist host --tag="${{ github.ref_name }}" --steps=upload
-          dist host --tag="${{ github.ref_name }}" --steps=announce
+          dist host --tag="${RELEASE_TAG}" --steps=upload
+          dist host --tag="${RELEASE_TAG}" --steps=announce

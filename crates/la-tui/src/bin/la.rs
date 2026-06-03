@@ -72,9 +72,11 @@ fn parse_cli() -> CliAction {
 }
 
 fn print_help() {
-    let bin = env!("CARGO_PKG_NAME");
+    // The binary is named `la`, the crate is named `la-tui`. Show the
+    // user-facing name in the help title to match `--version`'s output
+    // ("la X.Y.Z") — no point surfacing the cargo crate name in CLI text.
     let version = env!("CARGO_PKG_VERSION");
-    println!("{bin} {version} — LazyAgents TUI client");
+    println!("la {version} — LazyAgents TUI client");
     println!();
     println!("USAGE:");
     println!("  la                 launch the TUI (spawns `lad` if not running)");

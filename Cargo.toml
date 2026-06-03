@@ -46,11 +46,19 @@ panic = "abort"
 #     (sigstore-backed) replace standalone cosign for keyless signing in CI.
 #     This is what `dist` ships natively as of 0.32; rolling our own `cosign
 #     sign-blob` would re-duplicate the same Fulcio/Rekor pipeline.
-#   • Homebrew tap + Scoop bucket — `tap` + `scoop-tap` point at sibling
-#     org repos (`TinyWhite1997/homebrew-tap` / `TinyWhite1997/scoop-bucket`).
-#     Those repos need to exist before the publish step succeeds; until M4
-#     RC the `publish-jobs` entries can stay commented out so a tag push
-#     plans+builds+hosts the release without erroring on missing taps.
+#   • Homebrew tap — `tap` points at `TinyWhite1997/homebrew-tap`. The
+#     repo must exist before the first publish; until then `publish-jobs`
+#     stays commented out so a tag push plans+builds+hosts without
+#     erroring on the missing tap.
+#   • Scoop bucket — DEFERRED to a follow-up (see issue comment thread on
+#     WEK-41). cargo-dist 0.32 ships native installer support only for
+#     `shell` / `powershell` / `npm` / `homebrew` / `msi`; there is no
+#     first-party Scoop installer and no `scoop-tap` field. Shipping a
+#     Scoop manifest cleanly requires either (a) a custom `publish-jobs`
+#     script that consumes `dist-manifest.json` and writes the bucket
+#     repo, or (b) a third-party generator like `scoop-bucket-helper`.
+#     Either path is wider than the WEK-5 Linux-only acceptance bar, so
+#     it is tracked as a follow-up rather than forced into this issue.
 #
 # WEK-5 scope: Linux-only validation. macOS/Windows targets remain in this
 # list so the GHA matrix is wired and ready; cross-platform smoke is a
@@ -80,11 +88,10 @@ windows-archive = ".zip"
 github-attestations = true
 # Homebrew tap (must exist as TinyWhite1997/homebrew-tap before tagging).
 tap = "TinyWhite1997/homebrew-tap"
-# Scoop bucket (must exist as TinyWhite1997/scoop-bucket before tagging).
-scoop-tap = "TinyWhite1997/scoop-bucket"
-# Publishers stay disabled until the tap/bucket repos are created — flip
-# these on in the M4 RC follow-up. Building + hosting still happens.
-# publish-jobs = ["homebrew", "scoop"]
+# Publisher stays disabled until `TinyWhite1997/homebrew-tap` exists — flip
+# this on in the M4 RC follow-up. Building + hosting still happens without
+# it. (Scoop is intentionally NOT listed — see comment above.)
+# publish-jobs = ["homebrew"]
 pr-run-mode = "plan"
 install-updater = false
 
