@@ -14,8 +14,8 @@ use chrono_tz::Tz;
 use tokio::time::{advance, timeout, Duration as StdDuration};
 
 use la_scheduler::{
-    CatchupMode, Clock, CronSpec, FakeClock, FireEvent, Scheduler, SchedulerChannels,
-    SchedulerEvent,
+    next_eligible_fire, BackoffState, CatchupMode, Clock, CronSpec, FailureBackoff, FakeClock,
+    FireEvent, Scheduler, SchedulerChannels, SchedulerEvent,
 };
 
 /// Common fixture: anchor the fake clock at `wall`, spin up the scheduler,
@@ -707,6 +707,346 @@ async fn install_then_skew_does_not_double_fire_catchup() {
     assert!(
         matches!(diag, Ok(Some(SchedulerEvent::ClockSkewDetected { .. }))),
         "expected ClockSkewDetected diagnostic to confirm skew path ran, got {diag:?}",
+    );
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// §5.4 failure_backoff — heap defers next_fire_at past the backoff window
+// (WEK-52 / WEK-33 N4 follow-up). The scheduler keeps a mirror of the
+// executor-reported failure state; while the rail is active the heap stops
+// waking on natural cron ticks that the admission gate would only refuse as
+// `RefuseDeferBackoff`.
+// ---------------------------------------------------------------------------
+
+/// Pure-helper unit test: with backoff active, `next_eligible_fire` floors at
+/// `last_failure_at + delay_for(n)` even when `spec.next_after(now)` is much
+/// sooner. Pinned here because every loop-level test depends on this contract.
+#[test]
+fn next_eligible_fire_floors_to_backoff_retry() {
+    let spec = CronSpec::parse("* * * * *", "UTC").unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 30).unwrap();
+    let last_failure = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    // 3 failures with default expo(1m,2,1h): 60 * 2^(3-1) = 240s.
+    let backoff = BackoffState {
+        backoff: Some(FailureBackoff::default()),
+        last_failure_at: Some(last_failure),
+        consecutive_failures: 3,
+    };
+    let next = next_eligible_fire(&spec, now, backoff).unwrap();
+    assert_eq!(
+        next,
+        last_failure + Duration::seconds(240),
+        "next_eligible_fire must defer to last_failure_at + 240s, not the next 12:01:00 cron tick",
+    );
+
+    // No backoff configured → natural cadence.
+    let no_backoff = BackoffState::default();
+    let natural = next_eligible_fire(&spec, now, no_backoff).unwrap();
+    assert_eq!(natural, Utc.with_ymd_and_hms(2026, 1, 1, 12, 1, 0).unwrap());
+
+    // Backoff window already in the past → natural cadence.
+    let stale = BackoffState {
+        backoff: Some(FailureBackoff::default()),
+        last_failure_at: Some(last_failure - Duration::hours(5)),
+        consecutive_failures: 1, // 60s window — far past now
+    };
+    let post = next_eligible_fire(&spec, now, stale).unwrap();
+    assert_eq!(post, Utc.with_ymd_and_hms(2026, 1, 1, 12, 1, 0).unwrap());
+}
+
+/// End-to-end through the live loop: a minutely cron pushed into backoff
+/// stops producing fires inside the backoff window. Before the fix the loop
+/// would push one `FireEvent` per minute for the admission gate to refuse;
+/// after the fix the heap defers to `last_failure_at + delay_for(n)`.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn backoff_defers_next_fire_past_backoff_window() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, mut ch) = start_at(wall);
+
+    let spec = CronSpec::parse("* * * * *", "UTC").unwrap(); // every minute
+    ch.handle
+        .upsert(
+            "minutely",
+            spec,
+            CatchupMode::Skip,
+            Duration::zero(),
+            Some(wall), // last fired now → no install catch-up
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    // Seed the backoff mirror as if the executor settled a 3rd consecutive
+    // terminal failure at 12:00:00. default expo(1m,2,1h) → 240s window, so
+    // the next heap fire must land at 12:04:00 not 12:01:00.
+    let existed = ch
+        .handle
+        .update_backoff_state(
+            "minutely",
+            Some(FailureBackoff::default()),
+            Some(wall),
+            3,
+        )
+        .await
+        .unwrap();
+    assert!(existed, "update_backoff_state must find the entry");
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    // Snapshot: heap entry must be deferred to 12:04:00, not 12:01:00.
+    let snap = ch.handle.snapshot().await.unwrap();
+    assert_eq!(snap.len(), 1);
+    assert_eq!(
+        snap[0].fire_at,
+        wall + Duration::seconds(240),
+        "heap must defer to last_failure_at + 240s after WEK-52 backoff update",
+    );
+
+    // Advance 3 minutes — the loop must NOT push any fires inside the
+    // backoff window. Before the fix the natural 12:01 / 12:02 / 12:03
+    // ticks would each produce a FireEvent for the gate to refuse.
+    advance_in_steps(StdDuration::from_secs(3 * 60), StdDuration::from_secs(30)).await;
+    let mid = drain_fires(&mut ch.fires).await;
+    assert!(
+        mid.is_empty(),
+        "no fires expected inside backoff window: {mid:#?}",
+    );
+
+    // Advance past the 240s mark — exactly one fire (12:04:00) should pop,
+    // then the next natural minutely cadence resumes.
+    advance_in_steps(StdDuration::from_secs(2 * 60), StdDuration::from_secs(30)).await;
+    let post = drain_fires(&mut ch.fires).await;
+    assert!(
+        !post.is_empty(),
+        "expected at least one post-backoff fire after 4m mark",
+    );
+    let first = &post[0];
+    assert_eq!(first.cron_id, "minutely");
+    assert_eq!(
+        first.scheduled_at,
+        wall + Duration::seconds(240),
+        "first post-backoff fire must be the deferred 12:04:00 tick",
+    );
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// After the executor reports a successful terminal run it calls
+/// `clear_backoff_state`. The scheduler must re-anchor `next_fire_at` to the
+/// natural cadence immediately so the user's "manual retry succeeded" run
+/// resumes without waiting out the old backoff window.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn clear_backoff_state_resumes_natural_cadence_immediately() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, ch) = start_at(wall);
+
+    let spec = CronSpec::parse("* * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "minutely",
+            spec,
+            CatchupMode::Skip,
+            Duration::zero(),
+            Some(wall),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    // Seed: 6 failures → 1920s window (capped well below 1h).
+    ch.handle
+        .update_backoff_state(
+            "minutely",
+            Some(FailureBackoff::default()),
+            Some(wall),
+            6,
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let deferred = ch.handle.snapshot().await.unwrap();
+    assert_eq!(deferred[0].fire_at, wall + Duration::seconds(1920));
+
+    // Clear (executor saw a success terminal status). The next heap entry
+    // must collapse back to the natural 12:01:00 cadence.
+    let existed = ch.handle.clear_backoff_state("minutely").await.unwrap();
+    assert!(existed);
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let resumed = ch.handle.snapshot().await.unwrap();
+    assert_eq!(
+        resumed[0].fire_at,
+        wall + Duration::seconds(60),
+        "clear_backoff_state must drop the heap floor to the natural cron tick",
+    );
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// Race with `delete`: a backoff update arriving after the entry has been
+/// removed (e.g. user disabled the cron between the executor settling and
+/// the message being delivered) must reply `false` and not resurrect it.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn update_backoff_state_after_delete_is_noop_returns_false() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, ch) = start_at(wall);
+
+    let spec = CronSpec::parse("* * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert("ghost", spec, CatchupMode::Skip, Duration::zero(), None)
+        .await
+        .unwrap();
+    ch.handle.delete("ghost").await.unwrap();
+
+    let existed = ch
+        .handle
+        .update_backoff_state("ghost", Some(FailureBackoff::default()), Some(wall), 2)
+        .await
+        .unwrap();
+    assert!(
+        !existed,
+        "update_backoff_state on a deleted cron must be a no-op returning false",
+    );
+    let snap = ch.handle.snapshot().await.unwrap();
+    assert!(snap.is_empty(), "deleted cron must not be resurrected");
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// Re-upserting an entry (e.g. user edits the cron expression while the
+/// executor's failure-state mirror is non-empty) must NOT silently clear
+/// the backoff rail — the executor owns that field, not the config edit.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn upsert_preserves_existing_backoff_state() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, ch) = start_at(wall);
+
+    let spec_v1 = CronSpec::parse("* * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "edited",
+            spec_v1,
+            CatchupMode::Skip,
+            Duration::zero(),
+            Some(wall),
+        )
+        .await
+        .unwrap();
+    // 3 consecutive failures → 240s window.
+    ch.handle
+        .update_backoff_state(
+            "edited",
+            Some(FailureBackoff::default()),
+            Some(wall),
+            3,
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let pre = ch.handle.snapshot().await.unwrap();
+    assert_eq!(pre[0].fire_at, wall + Duration::seconds(240));
+
+    // Config-edit upsert: change cadence to every 5 minutes. The rail must
+    // stay active across the upsert, so the floor still applies.
+    let spec_v2 = CronSpec::parse("*/5 * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "edited",
+            spec_v2,
+            CatchupMode::Skip,
+            Duration::zero(),
+            None,
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let post = ch.handle.snapshot().await.unwrap();
+    // The natural next */5 fire from 12:00:00 is 12:05:00; the backoff
+    // floor (240s = 12:04:00) is earlier so the natural one wins.
+    assert_eq!(
+        post[0].fire_at,
+        Utc.with_ymd_and_hms(2026, 1, 1, 12, 5, 0).unwrap(),
+        "upsert with a longer cadence picks the later of natural-cron vs backoff floor",
+    );
+
+    // Re-upsert a high-frequency cron — now the backoff floor wins.
+    let spec_v3 = CronSpec::parse("* * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "edited",
+            spec_v3,
+            CatchupMode::Skip,
+            Duration::zero(),
+            None,
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let post2 = ch.handle.snapshot().await.unwrap();
+    assert_eq!(
+        post2[0].fire_at,
+        wall + Duration::seconds(240),
+        "preserved backoff state must still floor the heap after a re-upsert",
+    );
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// Chaos guard for the M3.7 brief (issue exit criterion):
+/// "高频 cron + 长期 backoff 不应产生千级 RefuseDeferBackoff 噪声". A minutely
+/// cron pushed into a 1h backoff must produce at most one heap fire across
+/// the entire 60-minute window — not the 59 the pre-fix loop would push.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn high_frequency_cron_in_long_backoff_does_not_spam_fires() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, mut ch) = start_at(wall);
+
+    let spec = CronSpec::parse("* * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "noisy",
+            spec,
+            CatchupMode::Skip,
+            Duration::zero(),
+            Some(wall),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    // 7 failures at default expo(1m,2,1h) caps at 1h = 3600s.
+    ch.handle
+        .update_backoff_state(
+            "noisy",
+            Some(FailureBackoff::default()),
+            Some(wall),
+            7,
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let pre = ch.handle.snapshot().await.unwrap();
+    assert_eq!(pre[0].fire_at, wall + Duration::seconds(3600));
+
+    // Walk 59 minutes of simulated time. The pre-fix loop would have
+    // emitted ~59 FireEvents for the gate to refuse; the post-fix loop must
+    // emit zero.
+    advance_in_steps(StdDuration::from_secs(59 * 60), StdDuration::from_secs(60)).await;
+    let fires = drain_fires(&mut ch.fires).await;
+    assert!(
+        fires.is_empty(),
+        "no fires expected inside 1h backoff cap: got {} fires",
+        fires.len(),
     );
 
     ch.handle.shutdown().await.unwrap();
