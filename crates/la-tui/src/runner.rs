@@ -28,33 +28,47 @@ use ratatui::Terminal;
 
 use crate::app::{App, AppMsg, AppOutcome, Focus, Modal, Tab};
 use crate::crons::{human_label, CronSource, CronsState, EditField};
-use crate::health_sub::HealthEvent;
 use crate::input::{translate, HitBoxes};
 use crate::key_hints::{format_hint_bar, HintRegistry};
+use crate::notif_sub::NotifEvent;
 use crate::sidebar::{render_backends, render_sidebar, Selection};
 use crate::source::SessionSource;
 use crate::status::render_status;
 use crate::tabs::render_tabs;
 
+/// Back-compat re-export — pre-WEK-36 callers spelled this as
+/// `crate::health_sub::HealthEvent`. New code should use [`NotifEvent`].
+pub use crate::notif_sub::HealthEvent;
+
 /// Run the TUI event loop until the user quits. Returns Ok(()) on normal
 /// exit; any I/O or terminal-setup error is propagated so the binary can
 /// log it and exit nonzero.
 pub fn run<S: SessionSource, C: CronSource>(app: App<S, C>) -> io::Result<()> {
-    run_with_health(app, None)
+    run_with_notifs(app, None)
 }
 
-/// Same as [`run`] but threads in an external [`HealthEvent`] channel —
-/// used by the `la` binary to forward `daemon.health` notifications
-/// from [`crate::health_sub::spawn`] into the App as `BackendsUpdate`
-/// messages.
-pub fn run_with_health<S: SessionSource, C: CronSource>(
+/// Same as [`run`] but threads in an external [`NotifEvent`] channel —
+/// used by the `la` binary to forward `daemon.health` / `cron.fired`
+/// notifications from [`crate::notif_sub::spawn`] into the App as
+/// `BackendsUpdate` / `HealthUpdate` / `CronFiredEvent` / `DaemonOffline`
+/// messages, plus to refresh the cron preview each frame.
+pub fn run_with_notifs<S: SessionSource, C: CronSource>(
     mut app: App<S, C>,
-    health_rx: Option<Receiver<HealthEvent>>,
+    notif_rx: Option<Receiver<NotifEvent>>,
 ) -> io::Result<()> {
     let mut terminal = setup_terminal()?;
-    let res = event_loop(&mut terminal, &mut app, health_rx);
+    let res = event_loop(&mut terminal, &mut app, notif_rx);
     restore_terminal(&mut terminal)?;
     res
+}
+
+/// Back-compat alias for the pre-WEK-36 entry point that only consumed
+/// `daemon.health`. New code should call [`run_with_notifs`].
+pub fn run_with_health<S: SessionSource, C: CronSource>(
+    app: App<S, C>,
+    health_rx: Option<Receiver<HealthEvent>>,
+) -> io::Result<()> {
+    run_with_notifs(app, health_rx)
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -84,7 +98,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
 fn event_loop<S: SessionSource, C: CronSource>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<S, C>,
-    health_rx: Option<Receiver<HealthEvent>>,
+    notif_rx: Option<Receiver<NotifEvent>>,
 ) -> io::Result<()> {
     let mut hit = HitBoxes {
         tabs: Vec::new(),
@@ -97,20 +111,40 @@ fn event_loop<S: SessionSource, C: CronSource>(
     loop {
         // Push a fresh `now` into the Crons state so the inline
         // "今日/明日" labels refresh each frame without the user typing.
-        app.crons.set_now(chrono::Utc::now());
+        let now = chrono::Utc::now();
+        app.crons.set_now(now);
+        // Refresh the status bar's "next cron" label from the local
+        // CronsState — we don't have a `crons.list_next` push from the
+        // daemon yet, so the TUI derives it from the same `CronPreview`
+        // the editor pane is showing. Picks the soonest enabled cron's
+        // next fire across the full snapshot.
+        app.status.next_cron_label = derive_next_cron_label(&app.crons, now);
         terminal.draw(|frame| {
             hit = draw(frame, app);
         })?;
-        // Drain any pending health events between renders so a fresh
-        // `daemon.health` snapshot is reflected on the very next frame.
-        if let Some(rx) = health_rx.as_ref() {
-            while let Ok(HealthEvent::Backends(badges)) = rx.try_recv() {
-                let _ = app.handle(AppMsg::BackendsUpdate(badges));
+        // Drain any pending notifications between renders so a fresh
+        // health / cron pulse is reflected on the very next frame.
+        if let Some(rx) = notif_rx.as_ref() {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    NotifEvent::Backends(badges) => {
+                        let _ = app.handle(AppMsg::BackendsUpdate(badges));
+                    }
+                    NotifEvent::Health(h) => {
+                        let _ = app.handle(AppMsg::HealthUpdate(h));
+                    }
+                    NotifEvent::CronFired(p) => {
+                        let _ = app.handle(AppMsg::CronFiredEvent(p));
+                    }
+                    NotifEvent::DaemonOffline => {
+                        let _ = app.handle(AppMsg::DaemonOffline);
+                    }
+                }
             }
         }
         // Poll so the screen refreshes periodically; the 250ms cap also
-        // bounds how long a backends snapshot can sit in the channel
-        // before the next frame consumes it.
+        // bounds how long a notification can sit in the channel before
+        // the next frame consumes it.
         if !crossterm::event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -129,6 +163,42 @@ fn event_loop<S: SessionSource, C: CronSource>(
             AppOutcome::Quit => return Ok(()),
         }
     }
+}
+
+/// Walk the cron snapshot for the soonest enabled cron whose
+/// expression resolves to a future fire and return a human label
+/// (`"next 02:00"` style). Returns `None` for an empty list, all
+/// disabled, or all invalid expressions.
+///
+/// Computed inside the runner (not the App) so the App stays
+/// independent of `now` — and so the live daemon-pushed equivalent
+/// (post-M3.5 `crons.list_next`) can drop in here without touching
+/// `App`.
+fn derive_next_cron_label(
+    crons: &CronsState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    use chrono::TimeZone;
+    use chrono_tz::Tz;
+
+    let mut best: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+    for c in crons.crons() {
+        if !c.enabled {
+            continue;
+        }
+        let preview = crate::crons::CronPreview::compute(&c.cron_expr, &c.tz, now);
+        let Some(next) = preview.next else { continue };
+        match &best {
+            Some((cur, _)) if *cur <= next => {}
+            _ => {
+                let tz: Tz = c.tz.parse().unwrap_or(chrono_tz::UTC);
+                let local = tz.from_utc_datetime(&next.naive_utc());
+                let label = format!("next {} ({})", local.format("%H:%M"), tz.name());
+                best = Some((next, label));
+            }
+        }
+    }
+    best.map(|(_, label)| label)
 }
 
 /// Lay out the screen and render every pane. Returns the hit boxes the
@@ -589,6 +659,57 @@ fn render_modal(
                     .title("Dry-run")
                     .border_style(Style::default().fg(Color::Cyan)),
             );
+            frame.render_widget(para, area);
+        }
+        Modal::Errors { rows } => {
+            // Tall enough to show the rows + a header + a footer hint;
+            // each row needs at most 3 lines (status, reason, docs).
+            let height = ((rows.len() as u16) * 3 + 6).clamp(7, 22);
+            let area = centered(full, 80, height);
+            frame.render_widget(Clear, area);
+            let mut lines: Vec<Line<'_>> = Vec::new();
+            if rows.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No active errors. Backends are all healthy.",
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            } else {
+                for r in rows {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:<14}", r.id),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(r.status_label.clone(), Style::default().fg(Color::Yellow)),
+                    ]));
+                    if let Some(reason) = &r.reason {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {reason}"),
+                            Style::default().add_modifier(Modifier::DIM),
+                        )));
+                    }
+                    if let Some(docs) = &r.docs_url {
+                        lines.push(Line::from(Span::styled(
+                            format!("    → {docs}"),
+                            Style::default().fg(Color::Cyan),
+                        )));
+                    }
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Esc / ⏎ / f to close.",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+            let para = Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Errors")
+                        .border_style(Style::default().fg(Color::Red)),
+                )
+                .wrap(Wrap { trim: false });
             frame.render_widget(para, area);
         }
     }

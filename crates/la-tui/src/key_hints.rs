@@ -177,6 +177,10 @@ impl HintRegistry {
                 Hint::new("Esc", "close", Importance::Primary),
                 Hint::new("⏎", "close", Importance::High),
             ],
+            Modal::Errors { .. } => vec![
+                Hint::new("Esc / ⏎", "close", Importance::Primary),
+                Hint::new("f", "close", Importance::Low),
+            ],
         }
     }
 
@@ -232,6 +236,11 @@ impl HintRegistry {
     fn globals() -> Vec<Hint> {
         vec![
             Hint::new("Tab", "next tab", Importance::Low),
+            // `f` opens the Errors modal from the status-bar badge; the
+            // hint is always-on so users discover it without needing the
+            // bar to be in error state. Low importance so it sits near
+            // the meta keys, not crowding out the primary actions.
+            Hint::new("f", "errors", Importance::Low),
             Hint::new("?", "all keys", Importance::Meta),
             Hint::new("q", "quit", Importance::Meta),
         ]

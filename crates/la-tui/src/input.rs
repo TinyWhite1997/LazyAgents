@@ -103,6 +103,7 @@ fn translate_key(
         KeyCode::Char('a') => AppMsg::ArchiveOrRestore,
         KeyCode::Char('n') => AppMsg::NewSession,
         KeyCode::Char('i') => AppMsg::ImportDiscovered,
+        KeyCode::Char('f') => AppMsg::OpenErrors,
         KeyCode::Esc => AppMsg::Cancel,
 
         // Ctrl-C is treated as Quit so muscle memory works even when the
@@ -147,6 +148,7 @@ fn translate_crons_key(code: KeyCode, mods: KeyModifiers, focus: Focus) -> Optio
 
             KeyCode::Char('n') => AppMsg::CronNew,
             KeyCode::Char('d') => AppMsg::CronDelete,
+            KeyCode::Char('f') => AppMsg::OpenErrors,
             KeyCode::Char(' ') => AppMsg::CronToggleEnabled,
             KeyCode::Char('r') => AppMsg::CronTriggerNow,
             KeyCode::Char('R') => AppMsg::CronDryRun,
@@ -216,6 +218,12 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
         },
         Modal::DryRunCron { .. } => match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => AppMsg::Cancel,
+            _ => return None,
+        },
+        Modal::Errors { .. } => match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('f') => {
+                AppMsg::Cancel
+            }
             _ => return None,
         },
     })

@@ -42,24 +42,26 @@ fn real_main() -> io::Result<()> {
 
     let source = MockSessionSource::fixture();
     let mut app = App::new(source);
-    app.handle(AppMsg::StatusUpdate(Status {
-        daemon_online: bootstrap.connected,
-        running: 2,
-        next_cron_label: Some("cron pane in M3".to_string()),
-        right_context: bootstrap.status_context(&location.socket_path),
-    }));
+    // Seed the status bar with what we already know after bootstrap:
+    // daemon presence + a right-context note about the socket. Every
+    // other field stays at `Status::default()` and is filled in by the
+    // first `daemon.health` push the notif-sub thread delivers — WEK-36
+    // 验收 "状态栏数据延迟 < 1s" relies on that push, not on a startup
+    // guess.
+    let mut bootstrap_status = Status::offline();
+    bootstrap_status.daemon_online = bootstrap.connected;
+    bootstrap_status.right_context = bootstrap.status_context(&location.socket_path);
+    app.handle(AppMsg::StatusUpdate(bootstrap_status));
 
-    // WEK-29: subscribe to `daemon.health` over IPC so the sidebar's
-    // Backends panel reflects the real probe state instead of staying
-    // on `no probe yet` until the daemon's next push (which the runner
-    // would never see without this subscription). The subscriber thread
-    // exits when the channel receiver is dropped at runner shutdown.
-    let health_rx = if bootstrap.connected {
-        Some(la_tui::health_sub::spawn(&location.socket_path))
-    } else {
-        None
-    };
-    la_tui::runner::run_with_health(app, health_rx)
+    // WEK-36: subscribe to `daemon.health` AND `cron.fired` over IPC so
+    // the status bar + Backends panel reflect real state. The subscriber
+    // reconnects with backoff when the connection drops, so a daemon
+    // restart auto-recovers without restarting `la`. We start the
+    // subscriber even when bootstrap reported no connection: the
+    // reconnect loop will keep trying, so once the user runs
+    // `lad daemonize` in a sibling shell, the bar lights up on its own.
+    let notif_rx = Some(la_tui::notif_sub::spawn(&location.socket_path));
+    la_tui::runner::run_with_notifs(app, notif_rx)
 }
 
 /// Outcome of the startup bootstrap. Carries enough info for the status
