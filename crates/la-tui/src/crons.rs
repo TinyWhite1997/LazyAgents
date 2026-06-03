@@ -11,8 +11,9 @@
 //!    cron crate 调用）", [`CronPreview`] uses the **same** `cron` +
 //!    `chrono-tz` versions that `la-scheduler::cron_spec` is pinned to via
 //!    the workspace `[workspace.dependencies]` block. The parse + first-fire
-//!    behaviour is byte-identical to the daemon's; the daemon owns the
-//!    authoritative call, the TUI is just rendering an early preview.
+//!    behaviour is byte-identical to the daemon's, including LazyAgents'
+//!    take-first bias for ambiguous DST fall-back wall times; the daemon owns
+//!    the authoritative call, the TUI is just rendering an early preview.
 //!
 //! ## Why mirror `CronSpec` instead of depending on la-scheduler?
 //!
@@ -25,7 +26,7 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, LocalResult, TimeZone, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
 
@@ -203,6 +204,10 @@ impl CronPreview {
     /// `CronPreview`: callers render `error` when present and the fire
     /// list otherwise. This is the function both the inline preview and
     /// the dry-run modal share.
+    ///
+    /// During a DST fall-back overlap, an ambiguous wall-clock fire time is
+    /// shown only for the first occurrence so the TUI dry-run matches daemon
+    /// scheduling and catch-up.
     pub fn compute(expr: &str, tz: &str, now: DateTime<Utc>) -> Self {
         let normalised = match normalise_expr(expr) {
             Ok(s) => s,
@@ -235,7 +240,9 @@ impl CronPreview {
             }
         };
         let now_tz = now.with_timezone(&tz);
-        let mut iter = schedule.after(&now_tz);
+        let mut iter = schedule
+            .after(&now_tz)
+            .filter(|dt| is_first_local_occurrence(*dt, tz));
         let next = iter.next().map(|dt| dt.with_timezone(&Utc));
         // Take the next N-1 after `next`; if `next` was None there's nothing
         // to enumerate.
@@ -248,6 +255,13 @@ impl CronPreview {
             next,
             upcoming,
         }
+    }
+}
+
+fn is_first_local_occurrence(dt: DateTime<Tz>, tz: Tz) -> bool {
+    match tz.from_local_datetime(&dt.naive_local()) {
+        LocalResult::Ambiguous(first, _) => dt == first,
+        _ => true,
     }
 }
 
@@ -802,6 +816,17 @@ mod tests {
         assert_eq!(all[4], t(2026, 1, 1, 17, 0));
     }
 
+    #[test]
+    fn dry_run_takes_first_dst_fallback_occurrence_only() {
+        let p = CronPreview::compute("30 1 * * *", "America/Los_Angeles", t(2026, 11, 1, 8, 0));
+
+        assert!(p.error.is_none());
+        assert_eq!(
+            p.all_fires()[..2],
+            [t(2026, 11, 1, 8, 30), t(2026, 11, 2, 9, 30),]
+        );
+    }
+
     /// Spot-check: the (expr, tz) → next-fire mapping matches the
     /// `cron::Schedule` API our acceptance criterion pins to. If
     /// la-scheduler upgrades the workspace `cron` dep, both ends move
@@ -825,6 +850,7 @@ mod tests {
             let schedule = Schedule::from_str(&normalised).unwrap();
             let scheduler_next = schedule
                 .after(&now.with_timezone(&tz))
+                .filter(|d| is_first_local_occurrence(*d, tz))
                 .next()
                 .map(|d| d.with_timezone(&Utc));
             assert_eq!(p.next, scheduler_next, "diverged for {:?}", expr);
