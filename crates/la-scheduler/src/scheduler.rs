@@ -22,7 +22,8 @@
 //!
 //! All three funnel through [`Scheduler::process_missed_fires`] so the same
 //! `apply_catchup` resolver decides skip/coalesce/replay and the same
-//! `catchup_degraded` flag fires when `MAX_CATCHUP` is breached.
+//! `catchup_truncated` flag (plus matching `SchedulerEvent::CatchupTruncated`
+//! diagnostic) fires when `MAX_CATCHUP` is breached.
 
 use std::sync::Arc;
 
@@ -546,7 +547,7 @@ impl Scheduler {
                 scheduled_at: top.fire_at,
                 fired_at: now,
                 coalesced_count: 1,
-                catchup_degraded: false,
+                catchup_truncated: false,
             };
             if self.fire_tx.send(event).await.is_err() {
                 warn!("fire channel closed; dropping further events");
@@ -681,6 +682,11 @@ impl Scheduler {
     /// `(inputs.last_fired_at, inputs.end]`, runs the resolver, and pushes
     /// one `FireEvent` per resolved emission onto the fire channel.
     ///
+    /// When the resolver crosses [`crate::catchup::MAX_CATCHUP`] it also
+    /// fans a [`SchedulerEvent::CatchupTruncated`] onto the diagnostic
+    /// channel so the daemon / UI can warn that older fires were dropped
+    /// (§S1 / WEK-58).
+    ///
     /// Returns `Err(Error::Invariant)` if the fire channel has been closed
     /// by the consumer — the loop treats that as a fatal exit signal.
     async fn process_missed_fires(&self, inputs: MissedFireInputs<'_>) -> Result<(), Error> {
@@ -692,13 +698,32 @@ impl Scheduler {
             return Ok(());
         }
         let outcome = apply_catchup(&missed, inputs.mode, inputs.min_replay_interval)?;
+        let truncated_flag = outcome.truncated.is_some();
+        if let Some(t) = &outcome.truncated {
+            tracing::warn!(
+                cron_id = %inputs.id,
+                missed = t.missed,
+                executed = t.executed,
+                dropped = t.dropped,
+                "scheduler.catchup_truncated"
+            );
+            // Best-effort diagnostic; never block the fire path on the
+            // metric channel. `try_send` keeps over-cap bursts from
+            // back-pressuring against a slow subscriber.
+            let _ = self.diag_tx.try_send(SchedulerEvent::CatchupTruncated {
+                cron_id: inputs.id.to_string(),
+                missed: t.missed,
+                executed: t.executed,
+                dropped: t.dropped,
+            });
+        }
         for fire in outcome.fires {
             let event = FireEvent {
                 cron_id: inputs.id.to_string(),
                 scheduled_at: fire.scheduled_at,
                 fired_at: inputs.fired_at,
                 coalesced_count: fire.coalesced_count,
-                catchup_degraded: outcome.degraded_to_skip,
+                catchup_truncated: truncated_flag,
             };
             if self.fire_tx.send(event).await.is_err() {
                 return Err(Error::Invariant("fire channel closed"));

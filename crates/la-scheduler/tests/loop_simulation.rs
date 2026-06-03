@@ -135,7 +135,7 @@ async fn seven_day_timeline_coalesce_emits_single_catchup_event_on_install() {
     assert_eq!(ev.cron_id, "coalesce-cron");
     // 7 missed top-of-hours: 06,07,08,09,10,11,12.
     assert_eq!(ev.coalesced_count, 7);
-    assert!(!ev.catchup_degraded);
+    assert!(!ev.catchup_truncated);
     assert_eq!(
         ev.scheduled_at,
         Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap()
@@ -180,7 +180,7 @@ async fn seven_day_timeline_replay_emits_every_missed_fire() {
     assert_eq!(fires.len(), 7, "replay must emit every missed fire");
     for f in &fires {
         assert_eq!(f.coalesced_count, 1);
-        assert!(!f.catchup_degraded);
+        assert!(!f.catchup_truncated);
     }
     assert_eq!(
         fires.first().unwrap().scheduled_at,
@@ -208,13 +208,13 @@ fn seven_day_timeline_all_catchup_modes_stay_under_cap() {
 
     let skip = apply_catchup(&missed, CatchupMode::Skip, Duration::zero()).unwrap();
     assert!(skip.fires.is_empty());
-    assert!(!skip.degraded_to_skip);
+    assert!(skip.truncated.is_none());
 
     let coalesce = apply_catchup(&missed, CatchupMode::Coalesce, Duration::zero()).unwrap();
     assert_eq!(coalesce.fires.len(), 1);
     assert_eq!(coalesce.fires[0].coalesced_count, 42);
     assert_eq!(coalesce.fires[0].scheduled_at, *missed.last().unwrap());
-    assert!(!coalesce.degraded_to_skip);
+    assert!(coalesce.truncated.is_none());
 
     let replay = apply_catchup(&missed, CatchupMode::Replay, Duration::zero()).unwrap();
     assert_eq!(replay.fires.len(), missed.len());
@@ -227,7 +227,7 @@ fn seven_day_timeline_all_catchup_modes_stay_under_cap() {
         missed
     );
     assert!(replay.fires.iter().all(|f| f.coalesced_count == 1));
-    assert!(!replay.degraded_to_skip);
+    assert!(replay.truncated.is_none());
 }
 
 #[test]
@@ -296,17 +296,129 @@ fn seven_day_dst_windows_skip_spring_gap_and_collapse_fall_overlap() {
     );
 }
 
+/// §S1 / WEK-58: over-cap catch-up no longer "degrades to skip + emits the
+/// last fire". The resolver truncates the missed list to the **earliest** 100
+/// entries, then the per-entry policy runs over those 100. We check three
+/// things at once on the live loop:
+///
+/// 1. The earliest 100 missed fires (not the latest) drive the emissions.
+/// 2. `min_replay_interval` is still honoured on the truncated window —
+///    proving the throttle didn't get accidentally short-circuited by the
+///    over-cap branch.
+/// 3. A `SchedulerEvent::CatchupTruncated { cron_id, missed, executed,
+///    dropped }` is delivered on the diagnostic channel so the UI can warn.
 #[tokio::test(start_paused = true, flavor = "current_thread")]
-async fn over_max_catchup_degrades_to_single_fire() {
-    let wall = Utc.with_ymd_and_hms(2026, 1, 8, 0, 0, 0).unwrap();
+async fn over_max_catchup_executes_earliest_window_with_throttle() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
     let (_clock, mut ch) = start_at(wall);
 
-    // 7 days @ 1 fire/min = 10080 fires; way over the 100 cap.
-    let last = wall - Duration::days(7);
-    let spec = CronSpec::parse("* * * * *", "UTC").unwrap();
+    // Every-second cron, last_fired_at = 10 min ago. The raw backlog is 600
+    // fires; the scheduler's per-probe cap is MAX_CATCHUP+1 = 101, so the
+    // resolver sees 101 missed fires and truncates to the earliest 100.
+    // With a 10s replay throttle, those 100 1-second-apart fires emit at
+    // t=0,10,20,...,90 (relative to the earliest missed fire) = 10 events.
+    let last = wall - Duration::minutes(10);
+    let spec = CronSpec::parse("* * * * * *", "UTC").unwrap();
     ch.handle
         .upsert(
             "flood",
+            spec,
+            CatchupMode::Replay,
+            Duration::seconds(10),
+            Some(last),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    let fires = drain_fires(&mut ch.fires).await;
+    assert_eq!(
+        fires.len(),
+        10,
+        "earliest 100 missed fires throttled at 10s must yield exactly 10 emissions, got {fires:#?}",
+    );
+
+    // Each emission carries the truncated flag — the daemon will surface it
+    // on every run row so the audit trail shows the burst boundary.
+    for f in &fires {
+        assert!(
+            f.catchup_truncated,
+            "every over-cap fire must carry catchup_truncated=true"
+        );
+        assert_eq!(f.coalesced_count, 1);
+        assert_eq!(f.cron_id, "flood");
+    }
+
+    // Spacing: each kept fire is exactly the throttle interval after its
+    // predecessor (1s missed fires + 10s throttle => take every 10th).
+    for w in fires.windows(2) {
+        assert_eq!(
+            w[1].scheduled_at - w[0].scheduled_at,
+            Duration::seconds(10),
+            "post-truncate throttle must keep 10s spacing"
+        );
+    }
+
+    // Earliest kept fire MUST be at-or-after `last` (the boundary the spec
+    // skips, since `fires_between` is exclusive on the lower bound), and
+    // strictly within the earliest 100-second window — i.e. far below `wall`.
+    let earliest = fires.first().unwrap().scheduled_at;
+    assert!(
+        earliest > last && earliest < last + Duration::seconds(101),
+        "earliest emission must come from the earliest 100s of the backlog, got {earliest}",
+    );
+    // The last emission must also fall within the earliest 100s window (not
+    // anywhere near `wall`), confirming we kept the *earliest* fires and not
+    // the latest as the pre-WEK-58 degrade-to-skip path did.
+    let latest = fires.last().unwrap().scheduled_at;
+    assert!(
+        latest < last + Duration::seconds(101),
+        "latest emission must still fall within earliest-100 window, got {latest}",
+    );
+
+    // Diagnostic: exactly one CatchupTruncated event with executed=100 and
+    // dropped=1 (probe cap saw 101, resolver kept 100).
+    let diag = timeout(StdDuration::from_millis(100), ch.diagnostics.recv())
+        .await
+        .expect("diag deadline")
+        .expect("diag channel must deliver CatchupTruncated");
+    match diag {
+        SchedulerEvent::CatchupTruncated {
+            cron_id,
+            missed,
+            executed,
+            dropped,
+        } => {
+            assert_eq!(cron_id, "flood");
+            assert_eq!(missed, 101, "scheduler probe cap surfaces 101 missed");
+            assert_eq!(executed, 100);
+            assert_eq!(dropped, 1);
+        }
+        other => panic!("expected SchedulerEvent::CatchupTruncated, got {other:?}"),
+    }
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// Companion boundary test on the live loop: when the missed count lands
+/// exactly at `MAX_CATCHUP` the diagnostic still fires (with `dropped=0`),
+/// and every emission carries `catchup_truncated=true`. Pins the symmetry
+/// with the resolver unit tests so a future refactor that flips the
+/// `n >= MAX_CATCHUP` boundary back to strictly-greater can't sneak through.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn over_max_catchup_boundary_at_exact_cap_still_truncates() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, mut ch) = start_at(wall);
+
+    // 100 missed fires exactly: 1s cadence, last = 100s ago. The scheduler's
+    // probe cap (101) is not reached; the resolver sees 100, and the
+    // `n >= MAX_CATCHUP` guard fires with dropped=0.
+    let last = wall - Duration::seconds(100);
+    let spec = CronSpec::parse("* * * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "boundary",
             spec,
             CatchupMode::Replay,
             Duration::zero(),
@@ -318,8 +430,67 @@ async fn over_max_catchup_degrades_to_single_fire() {
     tokio::task::yield_now().await;
 
     let fires = drain_fires(&mut ch.fires).await;
-    assert_eq!(fires.len(), 1, "over-cap must collapse to one fire");
-    assert!(fires[0].catchup_degraded);
+    assert_eq!(fires.len(), 100, "n==MAX_CATCHUP yields all 100 emissions");
+    assert!(
+        fires.iter().all(|f| f.catchup_truncated),
+        "boundary case still marks emissions as catchup_truncated"
+    );
+
+    let diag = timeout(StdDuration::from_millis(100), ch.diagnostics.recv())
+        .await
+        .expect("diag deadline")
+        .expect("boundary CatchupTruncated must fire");
+    match diag {
+        SchedulerEvent::CatchupTruncated {
+            missed,
+            executed,
+            dropped,
+            ..
+        } => {
+            assert_eq!(missed, 100);
+            assert_eq!(executed, 100);
+            assert_eq!(dropped, 0);
+        }
+        other => panic!("expected CatchupTruncated, got {other:?}"),
+    }
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// Inverse boundary: missed=99 fires must NOT trigger the truncate path —
+/// no diagnostic, no `catchup_truncated` flag.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn under_max_catchup_does_not_truncate() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, mut ch) = start_at(wall);
+
+    let last = wall - Duration::seconds(99);
+    let spec = CronSpec::parse("* * * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "under-cap",
+            spec,
+            CatchupMode::Replay,
+            Duration::zero(),
+            Some(last),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    let fires = drain_fires(&mut ch.fires).await;
+    assert_eq!(fires.len(), 99, "under-cap emits every missed fire");
+    assert!(
+        fires.iter().all(|f| !f.catchup_truncated),
+        "no fire should carry catchup_truncated under the cap"
+    );
+
+    let diag = timeout(StdDuration::from_millis(50), ch.diagnostics.recv()).await;
+    assert!(
+        diag.is_err(),
+        "no CatchupTruncated diagnostic must fire when n < MAX_CATCHUP, got {diag:?}"
+    );
 
     ch.handle.shutdown().await.unwrap();
 }
@@ -651,6 +822,7 @@ async fn clock_skew_above_threshold_emits_diagnostic() {
             );
             assert_eq!(recomputed_entries, 1);
         }
+        other => panic!("expected ClockSkewDetected, got {other:?}"),
     }
 
     ch.handle.shutdown().await.unwrap();
@@ -724,7 +896,7 @@ async fn skew_with_coalesce_emits_one_merged_fire() {
     assert_eq!(ev.cron_id, "coalesce-suspend");
     // 5 missed hours: 13:00, 14:00, 15:00, 16:00, 17:00.
     assert_eq!(ev.coalesced_count, 5);
-    assert!(!ev.catchup_degraded);
+    assert!(!ev.catchup_truncated);
 
     // Drain (and discard) the diagnostic so the channel doesn't fill.
     let _ = timeout(StdDuration::from_millis(50), ch.diagnostics.recv()).await;
@@ -732,7 +904,7 @@ async fn skew_with_coalesce_emits_one_merged_fire() {
 }
 
 /// Same scenario, `replay` policy: every missed hour fires once after the
-/// skew, in order, without `catchup_degraded`. Covers the same blocker as
+/// skew, in order, without `catchup_truncated`. Covers the same blocker as
 /// the coalesce variant — proves the skew path honours per-entry policy
 /// rather than collapsing to skip.
 #[tokio::test(start_paused = true, flavor = "current_thread")]
@@ -766,7 +938,7 @@ async fn skew_with_replay_emits_every_missed_fire() {
     );
     for f in &fires {
         assert_eq!(f.coalesced_count, 1);
-        assert!(!f.catchup_degraded);
+        assert!(!f.catchup_truncated);
         assert_eq!(f.cron_id, "replay-suspend");
     }
     let scheduled_at: Vec<_> = fires.iter().map(|f| f.scheduled_at).collect();
@@ -837,7 +1009,7 @@ async fn starved_loop_runs_catchup_policy() {
         Utc.with_ymd_and_hms(2026, 1, 1, 12, 1, 0).unwrap()
     );
     assert_eq!(normal.coalesced_count, 1);
-    assert!(!normal.catchup_degraded);
+    assert!(!normal.catchup_truncated);
 
     let merged = &fires[1];
     assert_eq!(merged.cron_id, "minutely-coalesce");
@@ -846,7 +1018,7 @@ async fn starved_loop_runs_catchup_policy() {
         Utc.with_ymd_and_hms(2026, 1, 1, 12, 5, 0).unwrap()
     );
     assert_eq!(merged.coalesced_count, 4, "12:02..12:05 = 4 missed fires");
-    assert!(!merged.catchup_degraded);
+    assert!(!merged.catchup_truncated);
 
     ch.handle.shutdown().await.unwrap();
 }

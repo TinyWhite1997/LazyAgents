@@ -77,7 +77,9 @@ pub mod heap;
 pub mod quota;
 mod scheduler;
 
-pub use catchup::{apply_catchup, CatchupMode, CatchupOutcome, ResolvedFire, MAX_CATCHUP};
+pub use catchup::{
+    apply_catchup, CatchupMode, CatchupOutcome, CatchupTruncated, ResolvedFire, MAX_CATCHUP,
+};
 #[cfg(any(test, feature = "test-util"))]
 pub use clock::FakeClock;
 pub use clock::{system_clock, Clock, SharedClock, SystemClock};
