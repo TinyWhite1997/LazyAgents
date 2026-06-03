@@ -417,7 +417,11 @@ done
         &SessionsAttachParams {
             session_id: session_id.clone(),
             replay_bytes: None,
-            resume_from_seq: None,
+            // WEK-70: `None` is live-only — if the shell's
+            // `ready-from-shtest` was emitted before attach landed,
+            // it's already in the ring but won't be replayed. Use
+            // `Some(0)` to catch up the banner deterministically.
+            resume_from_seq: Some(0),
             acquire_input: true,
         },
     )
@@ -525,24 +529,36 @@ done
         "did not drain every fence-probe Response before continuing"
     );
 
-    // Send hello-m1 and drive Response + Notification through one recv
-    // loop, so we cannot lose `echo:hello-m1` to the response-only
-    // waiter inside the `call()` helper.
-    let hello_id: i64 = 999;
-    send_request(
-        &mut conn,
-        hello_id,
-        "sessions.write",
-        &SessionsWriteParams::try_from_bytes(session_id.clone(), b"hello-m1\r").unwrap(),
-    )
-    .await;
+    // Send hello-m1 with the same deadline-bounded retry pattern as the
+    // fence. Even after the fence proves the read loop has iterated at
+    // least once, there is a residual window between every `printf` exit
+    // and the next `read` install — a single hello-m1 can still land in
+    // that gap. Re-sending until we observe `echo:hello-m1` closes it.
+    // Multiple `hello-m1\r` writes produce multiple `echo:hello-m1`
+    // lines — the `contains()` assertion only needs one.
+    let hello_id_start: i64 = 200;
+    let mut hello_id: i64 = hello_id_start;
+    let mut hello_sent: i64 = 0;
+    let mut hello_acked: i64 = 0;
     let mut echoed = Vec::<u8>::new();
-    let mut got_write_ack = false;
+    let mut next_hello_at = tokio::time::Instant::now();
     let echo_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < echo_deadline
-        && !(got_write_ack && contains(&echoed, b"echo:hello-m1"))
+        && !contains(&echoed, b"echo:hello-m1")
     {
-        let msg = match tokio::time::timeout(Duration::from_millis(200), conn.recv()).await {
+        if tokio::time::Instant::now() >= next_hello_at {
+            send_request(
+                &mut conn,
+                hello_id,
+                "sessions.write",
+                &SessionsWriteParams::try_from_bytes(session_id.clone(), b"hello-m1\r").unwrap(),
+            )
+            .await;
+            hello_id += 1;
+            hello_sent += 1;
+            next_hello_at = tokio::time::Instant::now() + Duration::from_millis(200);
+        }
+        let msg = match tokio::time::timeout(Duration::from_millis(150), conn.recv()).await {
             Ok(Ok(Some(m))) => m,
             _ => continue,
         };
@@ -554,11 +570,15 @@ done
                     echoed.extend_from_slice(&p.data_bytes().expect("base64"));
                 }
             }
-            Message::Response(r) if r.id == RequestId::Num(hello_id) => {
-                if let la_proto::jsonrpc::ResponseOutcome::Error(e) = r.outcome {
-                    panic!("sessions.write hello-m1 errored: {e:?}");
+            Message::Response(r) => {
+                if let RequestId::Num(n) = r.id {
+                    if n >= hello_id_start {
+                        if let la_proto::jsonrpc::ResponseOutcome::Error(e) = r.outcome {
+                            panic!("sessions.write hello-m1 errored: {e:?}");
+                        }
+                        hello_acked += 1;
+                    }
                 }
-                got_write_ack = true;
             }
             _ => {}
         }
@@ -568,11 +588,27 @@ done
         "missing echoed write; got {:?}",
         String::from_utf8_lossy(&echoed)
     );
-    assert!(
-        got_write_ack,
-        "hello-m1 echoed but the write Response never arrived — subsequent \
-         call()s would mis-match ids; echoed bytes = {:?}",
-        String::from_utf8_lossy(&echoed)
+
+    // Drain any leftover hello-m1 Responses so subsequent call()s
+    // (sessions.detach, sessions.list, ...) don't trip the id-strict
+    // recv_response_for.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while hello_acked < hello_sent && tokio::time::Instant::now() < drain_deadline {
+        match tokio::time::timeout(Duration::from_millis(150), conn.recv()).await {
+            Ok(Ok(Some(Message::Response(r)))) => {
+                if let RequestId::Num(n) = r.id {
+                    if n >= hello_id_start {
+                        hello_acked += 1;
+                    }
+                }
+            }
+            Ok(Ok(Some(_))) => {}
+            _ => continue,
+        }
+    }
+    assert_eq!(
+        hello_acked, hello_sent,
+        "did not drain every hello-m1 Response before continuing"
     );
 
     let _: SessionsDetachResult = call(
@@ -606,7 +642,13 @@ done
     )
     .await;
 
+    // Same pre-`read` race as hello-m1: if `quit\r` lands while the
+    // shell is between `printf` and the next `read`, it gets dropped
+    // and the session never exits. The existing poll loop polls list
+    // every 100 ms — re-send `quit\r` on each tick so a lost write is
+    // recovered without inflating wall-clock for the happy path.
     let mut final_list = None;
+    let mut quit_id: i64 = 1000;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         let list: SessionsListResult = call(
@@ -628,6 +670,32 @@ done
             final_list = Some(list);
             break;
         }
+        // Re-issue quit; the first one may have landed in the
+        // pre-`read` window, in which case the shell is still alive
+        // and waiting for another newline. Tolerate errors — once the
+        // shell exits, the next write will fail with NotAttached or
+        // similar, and that's fine: we're polling for Exited anyway.
+        send_request(
+            &mut conn,
+            quit_id,
+            "sessions.write",
+            &SessionsWriteParams::try_from_bytes(session_id.clone(), b"quit\r").unwrap(),
+        )
+        .await;
+        // Drain whatever Response comes back for quit_id without
+        // panicking on RPC error.
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            if tokio::time::Instant::now() >= drain_deadline {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(50), conn.recv()).await {
+                Ok(Ok(Some(Message::Response(r)))) if r.id == RequestId::Num(quit_id) => break,
+                Ok(Ok(Some(_))) => continue,
+                _ => continue,
+            }
+        }
+        quit_id += 1;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(final_list.is_some(), "session did not reach exited state");
