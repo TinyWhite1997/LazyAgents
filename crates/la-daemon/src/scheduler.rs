@@ -46,9 +46,7 @@ use la_scheduler::{
     quota::backoff::FailureBackoff, AdmissionDecision, CronQuota, CronSpec, FireEvent, GlobalQuota,
     QuotaSnapshot, Scheduler, SchedulerHandle,
 };
-use la_storage::{
-    Cron, CronUpsert, NewRejectedRun, NewRun, RunFinish, RunRecord, Storage,
-};
+use la_storage::{Cron, CronUpsert, NewRejectedRun, NewRun, RunFinish, RunRecord, Storage};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
@@ -310,7 +308,9 @@ async fn seed_crons_into_scheduler(
                 .runs()
                 .last_terminal_failure_at_for_cron(&cron.id)
                 .await?;
-            let last_failure = last_failure_str.as_deref().and_then(parse_sqlite_lexical_utc);
+            let last_failure = last_failure_str
+                .as_deref()
+                .and_then(parse_sqlite_lexical_utc);
             let _ = handle
                 .update_backoff_state(
                     cron.id.clone(),
@@ -477,7 +477,9 @@ async fn build_snapshot(
         .runs()
         .last_terminal_failure_at_for_cron(&cron.id)
         .await?;
-    let last_failure = last_failure_str.as_deref().and_then(parse_sqlite_lexical_utc);
+    let last_failure = last_failure_str
+        .as_deref()
+        .and_then(parse_sqlite_lexical_utc);
     let running_global = *cfg.running_global.lock().await;
     Ok(QuotaSnapshot {
         running_for_cron,
@@ -622,12 +624,14 @@ async fn admit_and_spawn_with_id(
 
     // 7. Publish a cron.fired pulse so subscribed TUIs (M3.6 status bar)
     //    can render the pulse animation.
-    cfg.manager.bus().publish(BusEvent::CronFired(CronFiredParams {
-        cron_id: cron.id.clone(),
-        run_id: run_id.clone(),
-        fired_at: fire.fired_at.to_rfc3339(),
-        status: "running".to_string(),
-    }));
+    cfg.manager
+        .bus()
+        .publish(BusEvent::CronFired(CronFiredParams {
+            cron_id: cron.id.clone(),
+            run_id: run_id.clone(),
+            fired_at: fire.fired_at.to_rfc3339(),
+            status: "running".to_string(),
+        }));
 
     // 8. Spawn the run-completion watcher.
     spawn_run_watcher(cfg, run_id.clone(), spawned.id, cron.clone());
@@ -726,12 +730,7 @@ async fn write_rejected_audit(
     }
 }
 
-fn spawn_run_watcher(
-    cfg: &ExecutorConfig,
-    run_id: String,
-    session_id: SessionId,
-    cron: Cron,
-) {
+fn spawn_run_watcher(cfg: &ExecutorConfig, run_id: String, session_id: SessionId, cron: Cron) {
     let storage = cfg.storage.clone();
     let manager = cfg.manager.clone();
     let handle = cfg.handle.clone();
@@ -798,10 +797,7 @@ fn spawn_run_watcher(
                         status: "timed_out".to_string(),
                         exit_code: None,
                         error_kind: Some("max_runtime_exceeded".to_string()),
-                        error_detail: Some(format!(
-                            "max_runtime_s={} exceeded",
-                            rt.as_secs()
-                        )),
+                        error_detail: Some(format!("max_runtime_s={} exceeded", rt.as_secs())),
                     };
                 }
             }
@@ -850,7 +846,9 @@ fn spawn_run_watcher(
                     }
                 }
                 Ok(None) => {}
-                Err(err) => tracing::warn!(cron_id = %cron.id, %err, "bump consecutive_failures failed"),
+                Err(err) => {
+                    tracing::warn!(cron_id = %cron.id, %err, "bump consecutive_failures failed")
+                }
             }
         } else if outcome.status == "completed" {
             let _ = storage.crons().reset_consecutive_failures(&cron.id).await;
@@ -873,10 +871,7 @@ struct TerminalOutcome {
     error_detail: Option<String>,
 }
 
-fn spawn_diag_drain(
-    mut diag: mpsc::Receiver<la_scheduler::SchedulerEvent>,
-    shutdown: Arc<Notify>,
-) {
+fn spawn_diag_drain(mut diag: mpsc::Receiver<la_scheduler::SchedulerEvent>, shutdown: Arc<Notify>) {
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -929,7 +924,9 @@ pub async fn upsert_cron(
                 spec,
                 mode,
                 REPLAY_INTERVAL_FLOOR,
-                cron.last_fired_at.as_deref().and_then(parse_sqlite_lexical_utc),
+                cron.last_fired_at
+                    .as_deref()
+                    .and_then(parse_sqlite_lexical_utc),
             )
             .await
             .map_err(|e| CronOpError::Other(e.to_string()))?;
@@ -970,7 +967,9 @@ pub async fn set_enabled(
                 spec,
                 mode,
                 throttle,
-                cron.last_fired_at.as_deref().and_then(parse_sqlite_lexical_utc),
+                cron.last_fired_at
+                    .as_deref()
+                    .and_then(parse_sqlite_lexical_utc),
             )
             .await
             .map_err(|e| CronOpError::Other(e.to_string()))?;
@@ -1122,11 +1121,7 @@ fn sqlite_lex_to_rfc3339_or_pass(s: String) -> String {
 
 /// Pure preview path for `crons.dry_run`: parse a cron expression + tz and
 /// project the next `count` fire times (capped at 20).
-pub fn dry_run_fires(
-    expr: &str,
-    tz: &str,
-    count: u32,
-) -> Result<Vec<DateTime<Utc>>, CronOpError> {
+pub fn dry_run_fires(expr: &str, tz: &str, count: u32) -> Result<Vec<DateTime<Utc>>, CronOpError> {
     let spec = CronSpec::parse(expr, tz).map_err(|err| match err {
         la_scheduler::Error::InvalidExpr { reason, .. } => CronOpError::InvalidExpr(reason),
         la_scheduler::Error::InvalidTimezone(tz) => CronOpError::InvalidTz(tz),
@@ -1214,7 +1209,13 @@ mod tests {
 
     /// Build a [`Storage`] with one project + one enabled cron so we can
     /// drive the admission gate without booting the whole daemon.
-    async fn fixture() -> (TempDir, Storage, AdapterRegistry, la_core::SessionManager, Cron) {
+    async fn fixture() -> (
+        TempDir,
+        Storage,
+        AdapterRegistry,
+        la_core::SessionManager,
+        Cron,
+    ) {
         let dir = TempDir::new().expect("tempdir");
         let storage = Storage::open(StorageConfig::for_test(dir.path()))
             .await
@@ -1269,8 +1270,7 @@ mod tests {
         let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
         adapters.insert("noop".into(), Arc::new(NoopAdapter));
         let registry = AdapterRegistry::from_map(adapters);
-        let manager =
-            la_core::SessionManager::new(storage.clone(), ManagerConfig::default());
+        let manager = la_core::SessionManager::new(storage.clone(), ManagerConfig::default());
         (dir, storage, registry, manager, cron)
     }
 

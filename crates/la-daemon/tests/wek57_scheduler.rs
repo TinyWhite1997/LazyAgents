@@ -119,11 +119,8 @@ impl AgentAdapter for SleepAdapter {
         let script_dir = std::env::temp_dir().join("lazyagents-wek57-sleep-scripts");
         std::fs::create_dir_all(&script_dir).map_err(la_adapter::AdapterError::SpawnFailed)?;
         let script_path = script_dir.join(format!("{}.sh", la_storage::new_id()));
-        std::fs::write(
-            &script_path,
-            format!("#!/bin/sh\nsleep {secs}\nexit 0\n"),
-        )
-        .map_err(la_adapter::AdapterError::SpawnFailed)?;
+        std::fs::write(&script_path, format!("#!/bin/sh\nsleep {secs}\nexit 0\n"))
+            .map_err(la_adapter::AdapterError::SpawnFailed)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -212,7 +209,9 @@ where
         method: method.to_string(),
         params: Some(serde_json::to_value(params).unwrap()),
     };
-    conn.send(&Message::Request(req.clone())).await.expect("send");
+    conn.send(&Message::Request(req.clone()))
+        .await
+        .expect("send");
     loop {
         let msg = timeout(Duration::from_secs(5), conn.recv())
             .await
@@ -244,7 +243,9 @@ async fn call_raw(
         method: method.to_string(),
         params: Some(params),
     };
-    conn.send(&Message::Request(req.clone())).await.expect("send");
+    conn.send(&Message::Request(req.clone()))
+        .await
+        .expect("send");
     loop {
         let msg = timeout(Duration::from_secs(5), conn.recv())
             .await
@@ -432,12 +433,8 @@ async fn crons_run_now_admits_through_admission_lock_with_global_cap_one() {
         let sock = td.socket.clone();
         handles.push(tokio::spawn(async move {
             let mut c = client(&sock).await;
-            let r: CronsRunNowResult = call(
-                &mut c,
-                "crons.run_now",
-                &CronsRunNowParams { cron_id },
-            )
-            .await;
+            let r: CronsRunNowResult =
+                call(&mut c, "crons.run_now", &CronsRunNowParams { cron_id }).await;
             r
         }));
     }
@@ -487,7 +484,10 @@ async fn crons_run_now_admits_through_admission_lock_with_global_cap_one() {
                 .is_some_and(|k| k.starts_with("quota_"))
         })
         .count();
-    assert!(admitted_rows >= 1, "at least one admitted row, got {admitted_rows}");
+    assert!(
+        admitted_rows >= 1,
+        "at least one admitted row, got {admitted_rows}"
+    );
     assert_eq!(refused_rows, 4, "four audit rows for the refused fires");
 
     // Strongest invariant from the issue body: at no point are there more
@@ -509,8 +509,7 @@ async fn crons_run_now_admits_through_admission_lock_with_global_cap_one() {
 #[tokio::test]
 async fn unknown_backend_upsert_returns_adapter_not_installed() {
     let td = bootstrap(Arc::new(EchoAdapter), SchedulerConfig::default()).await;
-    let project_id =
-        seed_project_row(td._tempdir.path().join("state").as_path(), "/tmp").await;
+    let project_id = seed_project_row(td._tempdir.path().join("state").as_path(), "/tmp").await;
     let mut conn = client(&td.socket).await;
     let err = call_raw(
         &mut conn,
@@ -533,8 +532,7 @@ async fn unknown_backend_upsert_returns_adapter_not_installed() {
 #[tokio::test]
 async fn invalid_cron_expr_returns_cron_invalid_expr() {
     let td = bootstrap(Arc::new(EchoAdapter), SchedulerConfig::default()).await;
-    let project_id =
-        seed_project_row(td._tempdir.path().join("state").as_path(), "/tmp").await;
+    let project_id = seed_project_row(td._tempdir.path().join("state").as_path(), "/tmp").await;
     let mut conn = client(&td.socket).await;
     let err = call_raw(
         &mut conn,

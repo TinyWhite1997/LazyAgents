@@ -1483,9 +1483,14 @@ use la_proto::methods::{
 fn cron_op_to_rpc(err: crate::scheduler::CronOpError) -> RpcError {
     use crate::scheduler::CronOpError as E;
     match err {
-        E::NotFound(id) => RpcError::new(error_codes::CRON_NOT_FOUND, format!("cron {id} not found")),
+        E::NotFound(id) => {
+            RpcError::new(error_codes::CRON_NOT_FOUND, format!("cron {id} not found"))
+        }
         E::InvalidExpr(reason) => RpcError::new(error_codes::CRON_INVALID_EXPR, reason),
-        E::InvalidTz(tz) => RpcError::new(error_codes::CRON_INVALID_TZ, format!("invalid timezone: {tz}")),
+        E::InvalidTz(tz) => RpcError::new(
+            error_codes::CRON_INVALID_TZ,
+            format!("invalid timezone: {tz}"),
+        ),
         E::Storage(e) => storage_to_rpc(e),
         E::Other(s) => RpcError::new(error_codes::INTERNAL_ERROR, s),
     }
@@ -1555,7 +1560,10 @@ async fn handle_crons_upsert(
         .get(&id)
         .await
         .map_err(storage_to_rpc)?;
-    let consecutive_failures = existing.as_ref().map(|c| c.consecutive_failures).unwrap_or(0);
+    let consecutive_failures = existing
+        .as_ref()
+        .map(|c| c.consecutive_failures)
+        .unwrap_or(0);
     let last_fired_at = existing.as_ref().and_then(|c| c.last_fired_at.clone());
 
     let upsert = la_storage::CronUpsert {
@@ -1592,9 +1600,10 @@ async fn handle_crons_delete(
     ctx: &ConnectionContext,
     params: CronsDeleteParams,
 ) -> Result<serde_json::Value, RpcError> {
-    let deleted = crate::scheduler::delete_cron(&ctx.scheduler, state.manager.storage(), &params.cron_id)
-        .await
-        .map_err(cron_op_to_rpc)?;
+    let deleted =
+        crate::scheduler::delete_cron(&ctx.scheduler, state.manager.storage(), &params.cron_id)
+            .await
+            .map_err(cron_op_to_rpc)?;
     ok(CronsDeleteResult { deleted })
 }
 
@@ -1667,7 +1676,10 @@ async fn handle_runs_list(
         limit,
     };
     let rows = storage.runs().list(filter).await.map_err(storage_to_rpc)?;
-    let runs: Vec<RunEntry> = rows.into_iter().map(crate::scheduler::run_to_wire).collect();
+    let runs: Vec<RunEntry> = rows
+        .into_iter()
+        .map(crate::scheduler::run_to_wire)
+        .collect();
     ok(RunsListResult { runs })
 }
 
