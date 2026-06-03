@@ -506,11 +506,19 @@ impl Daemon {
         // 10 s countdown started) so they don't eat into the SIGKILL
         // budget. Nothing more to do here besides closing storage.
 
-        // WEK-57 / M3.9: drain the scheduler stack. The executor has
-        // already observed `shutdown.notify_waiters()` above and is
-        // pulling buffered fires out of the channel; `SchedulerServices::
-        // shutdown` joins both the heap loop and the executor so the
-        // last admission write lands before we close storage.
+        // WEK-57 / M3.9: drain the scheduler stack. The scheduler owns
+        // its own executor shutdown signal (distinct from the daemon-wide
+        // `Notify` fired above) so the executor is still running here,
+        // ready to consume any fires the heap loop produces. `shutdown`
+        // closes the heap loop first, awaits it, then signals the
+        // executor — guaranteeing no scheduled fire is dropped between
+        // the connection-drain phase and now.
+        //
+        // The timeout is sized to fit comfortably inside the §6.4 10 s
+        // ceiling even after the SIGKILL phase above; in practice the
+        // scheduler shuts down in well under 100 ms because the heap
+        // loop's main `select!` is awaiting either `cmd_rx.recv()` or a
+        // `sleep_until` deadline and both yield instantly.
         if let Some(s) = scheduler {
             let _ = tokio::time::timeout(Duration::from_secs(2), s.shutdown()).await;
         }

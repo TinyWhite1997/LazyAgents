@@ -108,18 +108,42 @@ pub struct SchedulerServices {
     /// [`Self::join_loops`] can take ownership without `&mut self` —
     /// useful because the daemon stores this struct behind `Arc`.
     loops: Mutex<Option<(JoinHandle<()>, JoinHandle<()>)>>,
-    shutdown: Arc<Notify>,
+    /// Executor-only shutdown signal. **Distinct from** the daemon-wide
+    /// `Notify` the rest of the runtime shares so the executor doesn't
+    /// race the heap loop on shutdown.
+    ///
+    /// The runtime's connection-drain phase fires the shared notify
+    /// early (so dispatcher handlers and accept loop wind down); if the
+    /// executor listened on the same signal, it would drain its buffer
+    /// and exit while the scheduler heap is still alive — any cron that
+    /// reaches its `fire_at` during the §6.4 drain window would push a
+    /// `FireEvent` into the channel with no reader, and the fire would
+    /// silently disappear. This notifier is fired ONLY from inside
+    /// [`Self::shutdown`], strictly *after* the heap loop has been told
+    /// to stop pushing new fires and its channel has closed.
+    executor_shutdown: Arc<Notify>,
 }
 
 impl SchedulerServices {
     /// Boot the scheduler heap, load enabled crons from SQLite, and start
     /// the run executor. Returns once everything is alive.
+    ///
+    /// `daemon_shutdown` is the workspace-wide notifier (also driving
+    /// dispatcher / accept-loop wind-down) — used here ONLY to stop the
+    /// diagnostics drain task, which is happy to die early because
+    /// dropping `SchedulerChannels::diagnostics` simply closes the
+    /// channel. The scheduler heap loop and the run executor use a
+    /// separate, internally-owned [`Self::executor_shutdown`] notifier
+    /// so they can outlive the daemon's connection-drain phase and
+    /// guarantee no scheduled fire is dropped between
+    /// `daemon_shutdown.notify_waiters()` and
+    /// [`Self::shutdown`].
     pub async fn start(
         storage: Storage,
         manager: SessionManager,
         adapters: AdapterRegistry,
         config: SchedulerConfig,
-        shutdown: Arc<Notify>,
+        daemon_shutdown: Arc<Notify>,
     ) -> Result<Self, SchedulerStartError> {
         let (channels, scheduler_loop) = Scheduler::start(system_clock());
         let handle = channels.handle.clone();
@@ -127,11 +151,14 @@ impl SchedulerServices {
         // diagnostics is consumed by a side task so the bounded channel
         // never blocks the scheduler loop. Today the daemon only logs
         // them; a future status-bar surface can replace this with a
-        // bus publisher.
-        spawn_diag_drain(channels.diagnostics, shutdown.clone());
+        // bus publisher. The diag drain CAN safely listen on the
+        // daemon-wide notify because dropping the channel is a clean
+        // exit, unlike a fire we'd be ignoring.
+        spawn_diag_drain(channels.diagnostics, daemon_shutdown.clone());
 
         let running_global = Arc::new(Mutex::new(0_u32));
         let admission_lock = Arc::new(Mutex::new(()));
+        let executor_shutdown = Arc::new(Notify::new());
 
         // Initial cron load. We do this before returning so the daemon's
         // health endpoint and the TUI's first `crons.list` already see the
@@ -148,7 +175,7 @@ impl SchedulerServices {
             running_global: running_global.clone(),
             shutdown_poll: config.shutdown_poll,
         };
-        let executor_loop = spawn_executor(executor_cfg, fires, shutdown.clone());
+        let executor_loop = spawn_executor(executor_cfg, fires, executor_shutdown.clone());
 
         Ok(Self {
             handle,
@@ -156,37 +183,64 @@ impl SchedulerServices {
             running_global,
             admission_lock,
             loops: Mutex::new(Some((scheduler_loop, executor_loop))),
-            shutdown,
+            executor_shutdown,
         })
     }
 
     /// Drain the executor + heap, awaiting both. Idempotent; calling twice
-    /// is a no-op because the inner notifier has already fired.
+    /// is a no-op because the heap loop has already shut down.
+    ///
+    /// Ordering matters and is the whole point of the
+    /// [`Self::executor_shutdown`] split — see field docs. Concretely:
+    ///
+    /// 1. Send `Command::Shutdown` to the scheduler heap loop. The
+    ///    loop returns immediately, dropping its `FireEvent` sender;
+    ///    no further scheduled fires can be produced.
+    /// 2. Wait for the heap loop's `JoinHandle` to resolve. Now the
+    ///    `mpsc::Receiver<FireEvent>` inside the executor is guaranteed
+    ///    to observe `None` once it has drained the buffer.
+    /// 3. Notify the executor's private shutdown signal. The executor
+    ///    sees this only AFTER it has either drained the channel to
+    ///    `None` or popped every remaining buffered fire; either way no
+    ///    in-flight admission write is dropped.
+    /// 4. Wait for the executor to join.
+    ///
+    /// The previous design fired a single daemon-wide notify in step 1
+    /// and joined in step 4. That left a window — between "accept loop
+    /// fires `ctx.shutdown.notify_waiters()`" and "runtime calls
+    /// `s.shutdown()`" — during which the heap loop was still alive but
+    /// the executor had already exited, silently dropping any fire that
+    /// landed in that window.
     pub async fn shutdown(&self) {
-        self.shutdown.notify_waiters();
-        // Stop the heap first so it stops pushing new fires onto the
-        // channel. The executor's `fire_rx.recv()` will see `None`
-        // shortly after and exit.
         if let Err(err) = self.handle.shutdown().await {
             tracing::debug!(%err, "scheduler control channel shutdown failed");
         }
         let pair = self.loops.lock().await.take();
         if let Some((scheduler_loop, executor_loop)) = pair {
+            // First wait for the heap loop to finish; only then can we
+            // be sure no more fires will be produced. The executor is
+            // still running and will drain whatever the heap pushed
+            // before it exited.
             if let Err(err) = scheduler_loop.await {
                 tracing::debug!(%err, "scheduler loop join failed");
             }
+            // Heap is now gone; tell the executor it can stop after
+            // draining any remaining buffered fires.
+            self.executor_shutdown.notify_waiters();
             if let Err(err) = executor_loop.await {
                 tracing::debug!(%err, "scheduler executor join failed");
             }
         }
     }
 
-    /// Fire the shutdown notifier without waiting for the loops to join.
-    /// Used in the daemon `accept_loop` cleanup when an outstanding RPC
+    /// Fire the executor shutdown notifier without waiting for the loops
+    /// to join. Used in fallback cleanup paths where an outstanding RPC
     /// handler is still holding an `Arc<SchedulerServices>` and we cannot
-    /// take ownership for the awaited [`Self::shutdown`] path.
+    /// take ownership for the awaited [`Self::shutdown`] path. The heap
+    /// loop is left alone because we don't hold the channel sender; the
+    /// owning [`Self::shutdown`] will get to it.
     pub fn request_stop(&self) {
-        self.shutdown.notify_waiters();
+        self.executor_shutdown.notify_waiters();
     }
 }
 
@@ -388,6 +442,16 @@ async fn process_fire(cfg: &ExecutorConfig, fire: FireEvent) {
     } else {
         write_rejected_audit(cfg, &cron, &fire, decision).await;
     }
+
+    // Advance the cron watermark for every *scheduled* outcome — admit,
+    // refuse, defer alike — so a daemon restart resumes from the most
+    // recent tick rather than catching up past it. Without this, a fire
+    // that wrote an audit row (refuse) or only logged (defer) would be
+    // re-processed after restart and could spawn a real run once the
+    // quota is back under the cap. `run_now` calls go through
+    // `admit_and_spawn_with_id` directly and intentionally skip this so
+    // a manual trigger never consumes a scheduled tick.
+    persist_fire_watermark(cfg, &cron, &fire).await;
 }
 
 async fn build_snapshot(
@@ -472,27 +536,18 @@ async fn admit_and_spawn_with_id(
         status: "spawning".to_string(),
         coalesced_count: fire.coalesced_count.max(1) as i64,
     };
-    let _ = cfg.storage.runs().create(new_run).await.map_err(|e| {
+    if let Err(e) = cfg.storage.runs().create(new_run).await {
         // Roll back the in-memory counter on storage error so a wedged
         // SQLite doesn't permanently inflate the global rail.
-        AdmitError::Storage(e)
-    })?;
+        decrement_global(cfg).await;
+        return Err(AdmitError::Storage(e));
+    }
 
-    // Update `crons.last_fired_at` / `next_fire_at` so a daemon restart
-    // resumes from this fire rather than re-walking the watermark.
-    let next_fire_at = match parse_cron_spec(cron) {
-        Ok((spec, _, _)) => spec.next_after(fire.fired_at).map(format_sqlite_lexical),
-        Err(_) => None,
-    };
-    let _ = cfg
-        .storage
-        .crons()
-        .mark_fired(
-            &cron.id,
-            &format_sqlite_lexical(fire.fired_at),
-            next_fire_at.as_deref(),
-        )
-        .await;
+    // NB: `crons.last_fired_at` / `next_fire_at` are advanced by the
+    // *scheduled* caller (`process_fire`), not here. `crons.run_now` also
+    // funnels through this helper and must NOT bump the cron watermark —
+    // a manual trigger is out-of-band and should not consume a scheduled
+    // tick.
 
     // 3. Look up the adapter; bail with an audit row if it disappeared.
     let adapter = match cfg.adapters.get(&cron.backend_id) {
@@ -598,6 +653,26 @@ enum AdmitError {
 async fn decrement_global(cfg: &ExecutorConfig) {
     let mut count = cfg.running_global.lock().await;
     *count = count.saturating_sub(1);
+}
+
+/// Bump `crons.last_fired_at` / `next_fire_at` so daemon restart does not
+/// catch-up-replay the same scheduled tick. Called for admit / refuse /
+/// defer of any *scheduled* fire; `run_now` fires skip this so an out-of-band
+/// manual trigger never advances the cron-watermark.
+async fn persist_fire_watermark(cfg: &ExecutorConfig, cron: &Cron, fire: &FireEvent) {
+    let next_fire_at = match parse_cron_spec(cron) {
+        Ok((spec, _, _)) => spec.next_after(fire.fired_at).map(format_sqlite_lexical),
+        Err(_) => None,
+    };
+    let _ = cfg
+        .storage
+        .crons()
+        .mark_fired(
+            &cron.id,
+            &format_sqlite_lexical(fire.fired_at),
+            next_fire_at.as_deref(),
+        )
+        .await;
 }
 
 async fn finish_run_with_error(
@@ -1077,4 +1152,306 @@ pub fn dry_run_fires(
 #[allow(dead_code)]
 fn _force_link_catchup() {
     let _ = apply_catchup;
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the daemon scheduler's admission gate invariants
+    //! that are hard to exercise through the full daemon IPC harness.
+    //!
+    //! For end-to-end coverage of `crons.*` / `runs.*` RPC, see
+    //! `tests/wek57_scheduler.rs`.
+
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use la_adapter::{AdapterDescriptor, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec};
+    use la_core::ManagerConfig;
+    use la_scheduler::clock::system_clock;
+    use la_storage::{BackendUpsert, CronUpsert, NewProject, Storage, StorageConfig};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Adapter that just hands back `/bin/true` so an unintended spawn
+    /// completes immediately. Never reached by the leak-on-storage-error
+    /// test because the storage failure aborts before the adapter is
+    /// invoked, but kept honest in case the assertion ordering changes.
+    struct NoopAdapter;
+
+    #[async_trait]
+    impl AgentAdapter for NoopAdapter {
+        fn descriptor(&self) -> AdapterDescriptor {
+            AdapterDescriptor {
+                id: "noop",
+                display_name: "Noop Adapter",
+                default_program: "/bin/true",
+                docs_url: "https://example.test/noop",
+            }
+        }
+
+        async fn probe(&self) -> ProbeResult {
+            ProbeResult::Available {
+                version: "0".into(),
+            }
+        }
+
+        fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, la_adapter::AdapterError> {
+            Ok(SpawnSpec {
+                program: PathBuf::from("/bin/true"),
+                args: vec![],
+                env: req.env.clone(),
+                cwd: req.cwd.clone(),
+                pty: req.pty,
+                stdin_mode: req.stdin_mode,
+            })
+        }
+
+        fn encode_user_input(&self, text: &str) -> Bytes {
+            Bytes::copy_from_slice(text.as_bytes())
+        }
+    }
+
+    /// Build a [`Storage`] with one project + one enabled cron so we can
+    /// drive the admission gate without booting the whole daemon.
+    async fn fixture() -> (TempDir, Storage, AdapterRegistry, la_core::SessionManager, Cron) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::open(StorageConfig::for_test(dir.path()))
+            .await
+            .expect("open storage");
+        storage
+            .backends()
+            .upsert(BackendUpsert {
+                id: "noop",
+                display_name: "Noop Adapter",
+                version: None,
+                available: true,
+            })
+            .await
+            .expect("backend");
+        let project_id = la_storage::new_id();
+        storage
+            .projects()
+            .create(NewProject {
+                id: project_id.clone(),
+                root_path: dir.path().display().to_string(),
+                display_name: "leak-test".into(),
+                vcs: None,
+            })
+            .await
+            .expect("project");
+        let cron_id = la_storage::new_id();
+        let cron = storage
+            .crons()
+            .upsert(CronUpsert {
+                id: cron_id.clone(),
+                name: "leak".into(),
+                enabled: true,
+                project_id,
+                backend_id: "noop".into(),
+                spawn_args: serde_json::json!({}),
+                prompt: "noop".into(),
+                cron_expr: "0 0 1 1 *".into(),
+                tz: "UTC".into(),
+                catchup_mode: "coalesce".into(),
+                max_concurrent_runs: 1,
+                max_runs_per_day: 24,
+                max_runtime_s: 60,
+                cost_budget_usd_per_day: None,
+                failure_backoff: "expo(1m,2,1h)".into(),
+                pause_on_consecutive_failures: 5,
+                consecutive_failures: 0,
+                last_fired_at: None,
+                next_fire_at: None,
+            })
+            .await
+            .expect("cron");
+        let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+        adapters.insert("noop".into(), Arc::new(NoopAdapter));
+        let registry = AdapterRegistry::from_map(adapters);
+        let manager =
+            la_core::SessionManager::new(storage.clone(), ManagerConfig::default());
+        (dir, storage, registry, manager, cron)
+    }
+
+    /// Build the executor config that `process_fire` / `admit_and_spawn`
+    /// consume.
+    fn exec_cfg(
+        storage: &Storage,
+        adapters: &AdapterRegistry,
+        manager: &la_core::SessionManager,
+        running_global: Arc<Mutex<u32>>,
+        admission_lock: Arc<Mutex<()>>,
+    ) -> ExecutorConfig {
+        ExecutorConfig {
+            storage: storage.clone(),
+            manager: manager.clone(),
+            adapters: adapters.clone(),
+            handle: Scheduler::start(system_clock()).0.handle,
+            admission_lock,
+            global: GlobalQuota::default(),
+            running_global,
+            shutdown_poll: StdDuration::from_millis(100),
+        }
+    }
+
+    /// Regression: `admit_and_spawn_with_id` must DECREMENT
+    /// `running_global` when `runs().create()` fails, otherwise a
+    /// transient SQLite failure permanently inflates the global rail
+    /// and the gate refuses every subsequent fire as
+    /// `quota_global_max_concurrent_runs` until the daemon restarts.
+    #[tokio::test]
+    async fn admit_decrements_global_when_runs_create_fails() {
+        let (_dir, storage, adapters, manager, cron) = fixture().await;
+        let running_global = Arc::new(Mutex::new(0_u32));
+        let admission_lock = Arc::new(Mutex::new(()));
+        let cfg = exec_cfg(
+            &storage,
+            &adapters,
+            &manager,
+            running_global.clone(),
+            admission_lock.clone(),
+        );
+        let now = Utc::now();
+        let fire = FireEvent {
+            cron_id: cron.id.clone(),
+            scheduled_at: now,
+            fired_at: now,
+            coalesced_count: 1,
+            catchup_degraded: false,
+        };
+
+        // Force a `runs().create()` failure by closing the storage
+        // pools out from under the admission path. After close, the
+        // INSERT will fail with `sqlx::Error::PoolClosed`; the contract
+        // we are asserting is that the in-memory counter is rolled back
+        // so the gate doesn't permanently refuse subsequent fires.
+        storage.close().await;
+
+        let err = admit_and_spawn_with_id(&cfg, &cron, &fire, None)
+            .await
+            .expect_err("storage failure must surface");
+        assert!(matches!(err, AdmitError::Storage(_)), "got {err:?}");
+        let after = *running_global.lock().await;
+        assert_eq!(
+            after, 0,
+            "running_global must decrement on runs.create failure (leak rail otherwise stays at 1 forever)"
+        );
+    }
+
+    /// Regression: the executor must NOT exit on the daemon-wide
+    /// `daemon_shutdown` notifier that the accept loop fires during the
+    /// connection-drain phase. The executor's exit signal lives inside
+    /// `SchedulerServices` and is only fired by [`SchedulerServices::
+    /// shutdown`] — strictly *after* the heap loop has been told to
+    /// stop pushing fires.
+    ///
+    /// The pre-fix code shared one `Arc<Notify>` between the executor
+    /// and the rest of the daemon, so any caller that triggered the
+    /// shared notify would silently kill the executor mid-window and
+    /// drop any fire the still-alive heap loop emitted afterwards.
+    #[tokio::test]
+    async fn executor_survives_daemon_shutdown_notify_until_services_shutdown() {
+        let (_dir, storage, adapters, manager, _cron) = fixture().await;
+        let daemon_shutdown = Arc::new(Notify::new());
+        let services = SchedulerServices::start(
+            storage.clone(),
+            manager,
+            adapters,
+            SchedulerConfig::default(),
+            daemon_shutdown.clone(),
+        )
+        .await
+        .expect("scheduler boots");
+
+        // Give the executor task ample time to enter its `select!` and
+        // park on `shutdown.notified()` before we fire the notify — a
+        // `notify_waiters()` call only wakes existing waiters, so
+        // notifying too early loses the wake.
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        // Simulate the accept loop's `ctx.shutdown.notify_waiters()`.
+        // After the fix this must NOT cause the executor to exit; with
+        // the bug the executor would race to drain its empty channel
+        // and `loops` would be effectively dead even though we never
+        // called `services.shutdown()`.
+        daemon_shutdown.notify_waiters();
+        // Give the runtime ample time for the executor (if it were
+        // listening on the daemon notify) to drain + exit.
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+
+        // Executor + heap must still be joinable (alive). We peek by
+        // taking the lock — but DO NOT consume; just inspect.
+        {
+            let guard = services.loops.lock().await;
+            let pair = guard.as_ref().expect("loops present pre-shutdown");
+            assert!(
+                !pair.0.is_finished(),
+                "scheduler heap loop must outlive the daemon-wide notify"
+            );
+            assert!(
+                !pair.1.is_finished(),
+                "scheduler executor must outlive the daemon-wide notify — \
+                 otherwise any fire emitted between the accept-loop notify and \
+                 SchedulerServices::shutdown is silently dropped"
+            );
+        }
+
+        // Now do the proper shutdown — both loops must wind down.
+        services.shutdown().await;
+    }
+
+    /// Regression: a scheduled fire that the gate refuses or defers
+    /// must STILL advance `crons.last_fired_at` / `next_fire_at`.
+    /// Without this, a daemon restart re-walks the catch-up window from
+    /// the stale watermark and may re-process the same tick — once the
+    /// quota cap has space, the second pass spawns a real run (or, for
+    /// audit-only refusals, writes a duplicate row). `crons.run_now`
+    /// fires intentionally skip the watermark bump (out-of-band manual
+    /// trigger should never consume a scheduled tick).
+    #[tokio::test]
+    async fn refused_scheduled_fire_advances_cron_watermark() {
+        let (_dir, storage, adapters, manager, cron) = fixture().await;
+        let running_global = Arc::new(Mutex::new(0_u32));
+        let admission_lock = Arc::new(Mutex::new(()));
+        let cfg = exec_cfg(
+            &storage,
+            &adapters,
+            &manager,
+            running_global.clone(),
+            admission_lock.clone(),
+        );
+
+        // Provoke a global-cap refusal by pre-inflating the counter to
+        // the cap. `GlobalQuota::default().global_max_concurrent_runs`
+        // is 8 — set the counter to that so any new fire trips the
+        // global rail.
+        *running_global.lock().await = GlobalQuota::default().global_max_concurrent_runs;
+
+        let now = Utc::now();
+        let fire = FireEvent {
+            cron_id: cron.id.clone(),
+            scheduled_at: now,
+            fired_at: now,
+            coalesced_count: 1,
+            catchup_degraded: false,
+        };
+        process_fire(&cfg, fire).await;
+
+        let after = storage
+            .crons()
+            .get(&cron.id)
+            .await
+            .expect("query")
+            .expect("cron present");
+        assert!(
+            after.last_fired_at.is_some(),
+            "refused scheduled fire must still advance last_fired_at \
+             (otherwise daemon restart re-catches-up the same tick)"
+        );
+        assert!(
+            after.next_fire_at.is_some(),
+            "refused scheduled fire must still advance next_fire_at"
+        );
+    }
 }
