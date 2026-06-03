@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 
 use crate::catchup::CatchupMode;
 use crate::cron_spec::CronSpec;
+use crate::quota::backoff::FailureBackoff;
 use crate::Error;
 
 /// Stable, caller-supplied id for a scheduled cron. The scheduler doesn't
@@ -45,10 +46,90 @@ pub struct Entry {
     /// Cached next fire (in UTC). Always derivable from `spec` + `last`, but
     /// we materialise it for fast peeking and event emission.
     pub next_fire_at: Option<DateTime<Utc>>,
+    /// Failure-backoff state mirrored from the daemon's run executor.
+    /// When `consecutive_failures > 0` and `failure_backoff` is `Some(_)`,
+    /// the scheduler floors `next_fire_at` at
+    /// `last_terminal_failure_at + backoff.delay_for(consecutive_failures)`,
+    /// so a high-frequency cron in backoff does not waste scheduler wake-ups
+    /// firing into an admission gate that will only return
+    /// `RefuseDeferBackoff` (WEK-52 / WEK-33 N4).
+    pub backoff: BackoffState,
     /// Monotonically-incremented marker that lets us spot stale heap entries
     /// after upsert/delete. Bumped on every state change that affects
     /// `next_fire_at` or removes the entry.
     pub version: u64,
+}
+
+/// Per-cron failure-backoff state mirrored from the daemon's run executor.
+///
+/// The daemon owns the authoritative copy in SQLite (`crons.consecutive_failures`,
+/// `runs.finished_at` of the most recent terminal failure, parsed
+/// `crons.failure_backoff`); this struct is the scheduler's local mirror,
+/// updated via [`crate::SchedulerHandle::update_backoff_state`] every time
+/// the executor settles a terminal run.
+///
+/// All-zero / all-`None` is the "no active backoff" sentinel, matching the
+/// case after a successful run (executor calls
+/// [`crate::SchedulerHandle::clear_backoff_state`] to reset). When the rail
+/// is inactive the helper [`next_eligible_fire`] returns `None` and the
+/// scheduler falls back to the natural `spec.next_after(now)` cadence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackoffState {
+    pub backoff: Option<FailureBackoff>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
+}
+
+impl BackoffState {
+    /// Earliest wall instant at which the backoff rail would admit again,
+    /// or `None` when the rail is inactive (no backoff configured, no prior
+    /// failure, or `consecutive_failures == 0`). Mirrors
+    /// [`crate::quota::backoff_retry_after`] without taking the full quota
+    /// struct — the scheduler only needs the three fields tracked here.
+    ///
+    /// **All-or-nothing semantics (fail-open).** The three inputs
+    /// (`backoff`, `last_failure_at`, `consecutive_failures`) are treated
+    /// as one bundle: missing any single piece (e.g. `Some(backoff) +
+    /// consecutive_failures > 0 + last_failure_at = None`) returns `None`
+    /// rather than synthesising a window from defaults. The choice is
+    /// deliberate — if the executor failed to thread the timestamp through,
+    /// we would rather temporarily lose the deferral (the admission gate
+    /// is the safety net) than wedge the heap into a permanent
+    /// retry-after-Y2K window.
+    pub fn retry_after(self) -> Option<DateTime<Utc>> {
+        let backoff = self.backoff?;
+        let last = self.last_failure_at?;
+        if self.consecutive_failures == 0 {
+            return None;
+        }
+        let delay = backoff.delay_for(self.consecutive_failures);
+        if delay.is_zero() {
+            return None;
+        }
+        let delta = chrono::Duration::from_std(delay).ok()?;
+        last.checked_add_signed(delta)
+    }
+}
+
+/// Compute the scheduler's next-fire instant from `spec.next_after(now)`,
+/// floored at the backoff rail's `retry_after` when one is active. Returns
+/// `None` only when the cron spec itself has no future fire.
+///
+/// This is the single point §5.4 "连续失败时延后下一次触发" gets enforced
+/// inside la-scheduler: every place that would have called
+/// `spec.next_after(now)` directly now goes through here so the heap reflects
+/// the deferral instead of waking on every cron tick just to be refused at
+/// the admission gate.
+pub fn next_eligible_fire(
+    spec: &CronSpec,
+    now: DateTime<Utc>,
+    backoff: BackoffState,
+) -> Option<DateTime<Utc>> {
+    let natural = spec.next_after(now)?;
+    match backoff.retry_after() {
+        Some(retry) if retry > natural => Some(retry),
+        _ => Some(natural),
+    }
 }
 
 /// What the heap actually stores. We pull `next_fire_at` and `version` out
@@ -116,6 +197,11 @@ impl EntryTable {
         last_fired_at: Option<DateTime<Utc>>,
         next_fire_at: Option<DateTime<Utc>>,
     ) -> Result<u64, Error> {
+        // Preserve any existing backoff mirror across re-upserts: a config
+        // edit (changing the cron expression / catchup mode) should not
+        // silently clear the executor-reported failure state, which only
+        // the executor itself is authoritative over.
+        let preserved_backoff = self.entries.get(&id).map(|e| e.backoff).unwrap_or_default();
         let version = self.entries.get(&id).map(|e| e.version + 1).unwrap_or(1);
         let entry = Entry {
             id: id.clone(),
@@ -124,6 +210,7 @@ impl EntryTable {
             min_replay_interval,
             last_fired_at,
             next_fire_at,
+            backoff: preserved_backoff,
             version,
         };
         if let Some(fire) = next_fire_at {
@@ -204,18 +291,39 @@ impl EntryTable {
         Some(version)
     }
 
+    /// Overwrite the executor-reported backoff mirror without touching the
+    /// spec / catchup mode / next-fire fields. Used by
+    /// [`crate::SchedulerHandle::update_backoff_state`] and
+    /// [`crate::SchedulerHandle::clear_backoff_state`]. Returns the previous
+    /// backoff value when the entry exists, or `None` when it has been
+    /// deleted (in which case the caller has nothing to update).
+    ///
+    /// Does NOT bump the version or push a heap entry — the scheduler loop
+    /// re-pushes via [`Self::refresh_next_fire`] right after, with the
+    /// backoff-aware `next_fire_at` already folded in.
+    pub fn set_backoff(&mut self, id: &str, backoff: BackoffState) -> Option<BackoffState> {
+        let entry = self.entries.get_mut(id)?;
+        let prev = entry.backoff;
+        entry.backoff = backoff;
+        Some(prev)
+    }
+
     /// Iterator over live entries; the order is unspecified.
     pub fn iter(&self) -> impl Iterator<Item = &Entry> {
         self.entries.values()
     }
 
-    /// Reset every entry's `next_fire_at` by walking the spec from `now`.
-    /// Used after the clock-skew detector trips — past `last_fired_at` values
-    /// are kept so the recovery pass can still catch up missed fires.
+    /// Reset every entry's `next_fire_at` by walking the spec from `now`,
+    /// honouring the per-entry `backoff` mirror so a deferred cron stays
+    /// deferred across the re-anchor. Past `last_fired_at` values are kept
+    /// so a downstream recovery pass can still catch up missed fires.
     pub fn recompute_all(&mut self, now: DateTime<Utc>) {
         let ids: Vec<_> = self.entries.keys().cloned().collect();
         for id in ids {
-            let next = self.entries.get(&id).and_then(|e| e.spec.next_after(now));
+            let next = self
+                .entries
+                .get(&id)
+                .and_then(|e| next_eligible_fire(&e.spec, now, e.backoff));
             self.refresh_next_fire(&id, next, None);
         }
     }

@@ -37,7 +37,8 @@ use crate::command::Command;
 use crate::cron_spec::CronSpec;
 use crate::error::Error;
 use crate::event::{FireEvent, SchedulerEvent};
-use crate::heap::{CronId, EntryTable, HeapEntry};
+use crate::heap::{next_eligible_fire, BackoffState, CronId, EntryTable, HeapEntry};
+use crate::quota::backoff::FailureBackoff;
 
 /// Cadence at which the loop polls for clock skew (§5.2: "每 60 s").
 const SKEW_TICK: StdDuration = StdDuration::from_secs(60);
@@ -131,6 +132,75 @@ impl SchedulerHandle {
     pub async fn shutdown(&self) -> Result<(), Error> {
         let _ = self.tx.send(Command::Shutdown).await;
         Ok(())
+    }
+
+    /// Mirror the daemon executor's per-cron failure-backoff state into the
+    /// scheduler so the heap floors `next_fire_at` at
+    /// `last_failure_at + delay_for(consecutive_failures)`. Returns `true`
+    /// when the entry existed.
+    ///
+    /// ## Executor contract (WEK-52 / §5.4 "连续失败时延后下一次触发")
+    ///
+    /// The daemon's run executor is the authority on the three inputs
+    /// (`failure_backoff` parsed from the `crons` row,
+    /// `crons.consecutive_failures` counter, `runs.finished_at` of the
+    /// most recent terminal failure). The scheduler keeps a mirror so the
+    /// heap can defer the next wake-up without re-querying SQLite. The
+    /// contract is:
+    ///
+    /// - **At install / daemon restart (REQUIRED).** The scheduler's mirror
+    ///   is in-memory only and a fresh [`Self::upsert`] starts with a zero
+    ///   [`crate::BackoffState`]. Immediately after each `upsert` whose
+    ///   `crons.consecutive_failures > 0`, the daemon MUST follow with one
+    ///   `update_backoff_state(id, parsed_backoff, last_failure_at, n)`
+    ///   call seeded from SQLite. Skipping this leaves the heap floor
+    ///   inactive across restarts: the admission gate will still refuse the
+    ///   fires (it re-reads SQLite) but the scheduler reverts to the
+    ///   wake-up-on-every-tick noise this layer exists to suppress.
+    /// - **After every terminal run** (status `failed` / `timed_out` /
+    ///   `completed` / `cancelled` / `budget_exceeded`), once the executor
+    ///   has settled the new counter, call this with the
+    ///   post-update values:
+    ///     * Terminal failure → `consecutive_failures = N + 1`,
+    ///       `last_failure_at = Some(now)`, `backoff = parsed or DDL default`.
+    ///     * Successful or non-failure terminal → call
+    ///       [`Self::clear_backoff_state`] (same as passing
+    ///       `consecutive_failures = 0`).
+    /// - **After a config edit** that changes the parsed `failure_backoff`
+    ///   string, call this with the new `backoff` and the existing counter /
+    ///   timestamp so the rail reflects the user's edit immediately. A
+    ///   normal `upsert` preserves the existing mirror so the executor does
+    ///   not have to re-push after every TUI tweak.
+    /// - **Race with `delete`**: if the entry has already been removed the
+    ///   call is a no-op and replies `false`.
+    pub async fn update_backoff_state(
+        &self,
+        id: impl Into<CronId>,
+        backoff: Option<FailureBackoff>,
+        last_failure_at: Option<DateTime<Utc>>,
+        consecutive_failures: u32,
+    ) -> Result<bool, Error> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(Command::UpdateBackoffState {
+                id: id.into(),
+                backoff,
+                last_failure_at,
+                consecutive_failures,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Error::Invariant("scheduler loop closed"))?;
+        reply_rx
+            .await
+            .map_err(|_| Error::Invariant("scheduler reply dropped"))
+    }
+
+    /// Convenience for the executor's success path: clear the backoff rail
+    /// for `id` (zero counter, no recorded failure). Equivalent to
+    /// `update_backoff_state(id, None, None, 0)`.
+    pub async fn clear_backoff_state(&self, id: impl Into<CronId>) -> Result<bool, Error> {
+        self.update_backoff_state(id, None, None, 0).await
     }
 }
 
@@ -322,6 +392,21 @@ impl Scheduler {
                 };
                 let _ = reply.send(snap);
             }
+            Command::UpdateBackoffState {
+                id,
+                backoff,
+                last_failure_at,
+                consecutive_failures,
+                reply,
+            } => {
+                let new_state = BackoffState {
+                    backoff,
+                    last_failure_at,
+                    consecutive_failures,
+                };
+                let existed = self.apply_backoff_update(&id, new_state).await;
+                let _ = reply.send(existed);
+            }
             Command::Shutdown => unreachable!("handled in select arm"),
         }
     }
@@ -360,7 +445,15 @@ impl Scheduler {
             }
             other => other,
         };
-        let next = spec.next_after(now);
+        // Preserve any backoff mirror the executor may have already pushed
+        // for this id (e.g. a config-edit upsert that follows a failure
+        // observation). `EntryTable::upsert` carries the old mirror forward;
+        // we read it back so the heap's first `next_fire_at` reflects it.
+        let preserved_backoff = {
+            let guard = self.table.lock().await;
+            guard.get(&id).map(|e| e.backoff).unwrap_or_default()
+        };
+        let next = next_eligible_fire(&spec, now, preserved_backoff);
         let mut guard = self.table.lock().await;
         let version = guard.upsert(
             id,
@@ -371,6 +464,40 @@ impl Scheduler {
             next,
         )?;
         Ok(version)
+    }
+
+    /// Apply a backoff-state mirror update from the daemon executor and
+    /// re-anchor the entry's `next_fire_at` so the heap reflects the new
+    /// deferral immediately. Returns `true` when the entry existed.
+    ///
+    /// We re-walk the spec from `now` (not from `last_fired_at`) and floor
+    /// the result at the backoff retry instant. That matches the contract
+    /// the gate enforces — the rail defers the *next* fire, not a missed
+    /// historic one. Catch-up policy is untouched: a `coalesce` user that
+    /// suspended for hours during a backoff still sees the merged fire from
+    /// the skew path, because that path runs `process_missed_fires` against
+    /// the watermark *before* re-anchoring through `next_eligible_fire`.
+    async fn apply_backoff_update(&self, id: &CronId, new_state: BackoffState) -> bool {
+        let mut guard = self.table.lock().await;
+        if guard.set_backoff(id, new_state).is_none() {
+            return false;
+        }
+        // `get(&id)` is guaranteed Some — we just wrote it.
+        let spec = guard
+            .get(id)
+            .map(|e| e.spec.clone())
+            .expect("entry present after set_backoff");
+        let now = self.clock.wall_now();
+        let next = next_eligible_fire(&spec, now, new_state);
+        guard.refresh_next_fire(id, next, None);
+        debug!(
+            cron_id = %id,
+            consecutive_failures = new_state.consecutive_failures,
+            retry_after = ?new_state.retry_after(),
+            next_fire_at = ?next,
+            "scheduler backoff mirror updated",
+        );
+        true
     }
 
     /// Emit every entry whose `fire_at <= now`. If the loop was starved (so
@@ -396,7 +523,7 @@ impl Scheduler {
 
             // Snapshot the policy + spec + watermark under the lock; we drop
             // the guard before pushing events so the loop stays responsive.
-            let (spec, mode, throttle, last_fired_at) = {
+            let (spec, mode, throttle, last_fired_at, backoff) = {
                 let guard = self.table.lock().await;
                 let Some(e) = guard.get(&top.id) else {
                     // Deleted between peek and lookup; skip.
@@ -407,6 +534,7 @@ impl Scheduler {
                     e.catchup_mode,
                     e.min_replay_interval,
                     e.last_fired_at,
+                    e.backoff,
                 )
             };
 
@@ -459,7 +587,15 @@ impl Scheduler {
             // catch-up ran — leaving it at `top.fire_at` would let a
             // subsequent skew-recompute rewalk the same gap and double-fire
             // every emission this starvation pass just produced.
-            let next = spec.next_after(now);
+            //
+            // We pass through `next_eligible_fire` so an active backoff
+            // floors `next_fire_at` at `last_failure_at + delay_for(n)` —
+            // without that, a high-frequency cron in a long backoff window
+            // (e.g. every-minute cron in expo(1m,2,1h) after 6 failures)
+            // would still wake the loop on every cron tick just to push an
+            // event that the admission gate refuses as `RefuseDeferBackoff`
+            // (WEK-52).
+            let next = next_eligible_fire(&spec, now, backoff);
             let new_last = if top.fire_at < now { now } else { top.fire_at };
             let mut guard = self.table.lock().await;
             guard.refresh_next_fire(&top.id, next, Some(new_last));
@@ -518,14 +654,17 @@ impl Scheduler {
         // before, but it runs *after* catch-up so the heap reflects the
         // post-gap state. `last_fired_at` is bumped to `now` for any entry
         // we just emitted catch-up fires for, so the next starvation pass
-        // doesn't replay them.
+        // doesn't replay them. We route through `next_eligible_fire` so an
+        // active backoff still defers the post-skew wake-up (a coalesce/
+        // replay cron that catches up after a suspend should still respect
+        // the executor-reported retry window — WEK-52).
         let mut guard = self.table.lock().await;
         let now_after = self.clock.wall_now();
         for item in work {
             let next = guard
                 .entries
                 .get(&item.id)
-                .and_then(|e| e.spec.next_after(now_after));
+                .and_then(|e| next_eligible_fire(&e.spec, now_after, e.backoff));
             // If we emitted catch-up fires for this entry, advance its
             // last_fired_at watermark so subsequent ticks don't double-fire.
             let new_last = match item.last_fired {

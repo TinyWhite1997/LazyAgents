@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 use crate::catchup::CatchupMode;
 use crate::cron_spec::CronSpec;
 use crate::heap::CronId;
+use crate::quota::backoff::FailureBackoff;
 use crate::Error;
 
 /// One unit of work for the scheduler loop.
@@ -42,6 +43,23 @@ pub enum Command {
     /// bar's "next trigger" display, §5.6).
     Snapshot {
         reply: oneshot::Sender<Vec<crate::heap::HeapEntry>>,
+    },
+    /// Set / clear the per-cron `failure_backoff` mirror after the run
+    /// executor settles a terminal run (WEK-52). When the rail is active
+    /// (parsed backoff + non-zero counter + recorded last failure) the
+    /// scheduler floors `next_fire_at` at
+    /// `last_failure_at + delay_for(consecutive_failures)`, so a high-frequency
+    /// cron in backoff stops wasting wake-ups firing into an admission gate
+    /// that only returns `RefuseDeferBackoff`. Pass `backoff: None` /
+    /// `consecutive_failures: 0` to reset the rail (success / paused). Replies
+    /// with `true` if the entry existed, `false` if it had been deleted —
+    /// the executor treats `false` as "race lost, nothing to do".
+    UpdateBackoffState {
+        id: CronId,
+        backoff: Option<FailureBackoff>,
+        last_failure_at: Option<DateTime<Utc>>,
+        consecutive_failures: u32,
+        reply: oneshot::Sender<bool>,
     },
     /// Stop the loop. The send side is dropped right after; the loop exits
     /// at the next select() iteration.
