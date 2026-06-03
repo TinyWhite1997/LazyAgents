@@ -361,8 +361,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let actual: HashSet<CronSensitiveField> =
-            SENSITIVE_CRON_FIELDS.iter().copied().collect();
+        let actual: HashSet<CronSensitiveField> = SENSITIVE_CRON_FIELDS.iter().copied().collect();
 
         assert_eq!(
             actual, expected,
