@@ -361,3 +361,35 @@ async fn split_halves_allow_concurrent_send_and_recv() {
     assert_eq!(count, 100);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn uds_listener_uses_owner_only_socket_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new().expect("tempdir");
+    let sock = dir.path().join("secure.sock");
+    let listener = Listener::bind(&Endpoint::uds(&sock)).await.unwrap();
+
+    let mode = std::fs::metadata(listener.path())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[tokio::test]
+async fn uds_accept_allows_same_uid_peer_after_so_peercred_check() {
+    let dir = TempDir::new().expect("tempdir");
+    let sock = dir.path().join("peer.sock");
+    let listener = Listener::bind(&Endpoint::uds(&sock)).await.unwrap();
+
+    let client = tokio::spawn({
+        let sock = sock.clone();
+        async move { connect(&Endpoint::uds(sock)).await.unwrap() }
+    });
+
+    let server = listener.accept().await.unwrap();
+    drop(server);
+    drop(client.await.unwrap());
+}

@@ -22,6 +22,7 @@
 //! split lets integration tests drive a daemon in-process via [`Daemon`]
 //! without going through the binary's CLI parser.
 
+pub mod cron_security;
 pub mod daemonize;
 pub mod dispatcher;
 pub mod health;
