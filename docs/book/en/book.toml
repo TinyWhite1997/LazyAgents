@@ -1,0 +1,22 @@
+[book]
+title = "LazyAgents User Guide"
+authors = ["LazyAgents contributors"]
+description = "Install, run, and live with LazyAgents — a tmux-style daemon + TUI for unattended coding agents."
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../build/en"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/TinyWhite1997/LazyAgents"
+edit-url-template = "https://github.com/TinyWhite1997/LazyAgents/edit/main/docs/book/en/src/{path}"
+site-url = "/en/"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 1
