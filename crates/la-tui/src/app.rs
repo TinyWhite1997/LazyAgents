@@ -16,9 +16,11 @@
 
 use crate::crons::{CronSource, CronsState, FieldEdit};
 use crate::model::BackendBadge;
+use crate::notif_sub::HealthSnapshot;
 use crate::sidebar::{Selection, SidebarState};
 use crate::source::SessionSource;
-use crate::status::Status;
+use crate::status::{CronPulse, Status};
+use la_proto::notifications::CronFiredParams;
 
 /// Top-level tabs (PRD §5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,6 +89,24 @@ pub enum Modal {
     /// `R` on a cron row → list the next 5 fire times so the user can
     /// sanity-check the expression before enabling. Read-only modal.
     DryRunCron { cron_id: String, fires: Vec<String> },
+    /// `f` from the status bar's error badge: list every backend whose
+    /// last probe was not `Available`, with reason + docs link. The
+    /// rows are computed from the live [`crate::App::backends`]
+    /// snapshot at modal-open time (WEK-36 / M3.5: the bar's "全局错误
+    /// 徽标 → 错误任务列表" requirement, scoped to backends until a
+    /// proper Errors tab lands in M4).
+    Errors { rows: Vec<ErrorRow> },
+}
+
+/// One row of the [`Modal::Errors`] list. Mirrors the subset of
+/// [`BackendBadge`] the modal renders without re-importing the badge
+/// type into key_hints / runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorRow {
+    pub id: String,
+    pub status_label: String,
+    pub reason: Option<String>,
+    pub docs_url: Option<String>,
 }
 
 /// All input the App reacts to. The input layer translates raw events
@@ -131,6 +151,21 @@ pub enum AppMsg {
     ToggleFullHints,
     /// Status pushed from the IPC layer (cron preview, running count, …).
     StatusUpdate(Status),
+    /// Patch only the scalar counters (running / errors / cost) from a
+    /// fresh `daemon.health` push. Leaves cron-derived fields alone so
+    /// a health pulse doesn't blank out the "next cron" label.
+    HealthUpdate(HealthSnapshot),
+    /// Flip the daemon dot to "offline" without touching any other
+    /// field. Sent by the IPC subscriber the moment a disconnect is
+    /// detected, so the bar reflects the loss within one frame instead
+    /// of waiting for the next probe interval.
+    DaemonOffline,
+    /// A `cron.fired` notification just landed — the bar flashes a
+    /// `↻ cron-id` badge for [`Status::PULSE_TTL`].
+    CronFiredEvent(CronFiredParams),
+    /// `f` from a global context — open the Errors modal sourced from
+    /// the current `backends` snapshot.
+    OpenErrors,
     /// Replace the sidebar snapshot (called whenever the source's data
     /// changes — initial load, archive event, etc.).
     RefreshSessions,
@@ -237,12 +272,7 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             tab: Tab::Sessions,
             focus: Focus::Sidebar,
             modal: None,
-            status: Status {
-                daemon_online: false,
-                running: 0,
-                next_cron_label: None,
-                right_context: String::new(),
-            },
+            status: Status::default(),
             backends: Vec::new(),
             last_toast: None,
         };
@@ -337,6 +367,37 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 self.modal = Some(Modal::FullHints);
             }
             AppMsg::StatusUpdate(s) => self.status = s,
+            AppMsg::HealthUpdate(h) => {
+                self.status.daemon_online = true;
+                self.status.running = h.running as usize;
+                self.status.errors_last_5m = h.errors_last_5m;
+            }
+            AppMsg::DaemonOffline => {
+                self.status.daemon_online = false;
+            }
+            AppMsg::CronFiredEvent(p) => {
+                let fired_at = chrono::DateTime::parse_from_rfc3339(&p.fired_at)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                self.status.last_cron_pulse = Some(CronPulse {
+                    cron_id: p.cron_id,
+                    fired_at,
+                });
+            }
+            AppMsg::OpenErrors => {
+                let rows = self
+                    .backends
+                    .iter()
+                    .filter(|b| b.is_unavailable())
+                    .map(|b| ErrorRow {
+                        id: b.id.clone(),
+                        status_label: b.status_label().to_string(),
+                        reason: b.reason.clone(),
+                        docs_url: b.docs_url.clone(),
+                    })
+                    .collect();
+                self.modal = Some(Modal::Errors { rows });
+            }
             AppMsg::RefreshSessions => self.refresh_sessions(),
             AppMsg::BackendsUpdate(b) => {
                 // Sort by id so the rendered order is stable across
@@ -445,6 +506,9 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             }
             (Modal::DryRunCron { .. }, AppMsg::Cancel)
             | (Modal::DryRunCron { .. }, AppMsg::Confirm) => {
+                self.modal = None;
+            }
+            (Modal::Errors { .. }, AppMsg::Cancel) | (Modal::Errors { .. }, AppMsg::Confirm) => {
                 self.modal = None;
             }
             // Inside a modal, Quit still wins (so the user is never
@@ -835,11 +899,100 @@ mod tests {
             running: 3,
             next_cron_label: Some("next 02:00".into()),
             right_context: "main · +12".into(),
+            ..Status::default()
         };
         a.handle(AppMsg::StatusUpdate(s.clone()));
         assert_eq!(a.status.running, 3);
         assert!(a.status.daemon_online);
         assert_eq!(a.status.next_cron_label.as_deref(), Some("next 02:00"));
+    }
+
+    #[test]
+    fn health_update_patches_counters_without_clobbering_cron_label() {
+        let mut a = app();
+        a.handle(AppMsg::StatusUpdate(Status {
+            daemon_online: false,
+            running: 0,
+            next_cron_label: Some("next 02:00".into()),
+            right_context: "main".into(),
+            ..Status::default()
+        }));
+        a.handle(AppMsg::HealthUpdate(HealthSnapshot {
+            running: 2,
+            queue_depth: 0,
+            errors_last_5m: 1,
+        }));
+        assert!(a.status.daemon_online, "health update flips daemon online");
+        assert_eq!(a.status.running, 2);
+        assert_eq!(a.status.errors_last_5m, 1);
+        // Cron label is untouched.
+        assert_eq!(a.status.next_cron_label.as_deref(), Some("next 02:00"));
+        // Right context is also untouched.
+        assert_eq!(a.status.right_context, "main");
+    }
+
+    #[test]
+    fn daemon_offline_flips_only_dot() {
+        let mut a = app();
+        a.handle(AppMsg::HealthUpdate(HealthSnapshot {
+            running: 4,
+            queue_depth: 0,
+            errors_last_5m: 0,
+        }));
+        assert!(a.status.daemon_online);
+        a.handle(AppMsg::DaemonOffline);
+        assert!(!a.status.daemon_online);
+        // Counters keep their last-known value so a flicker offline → online
+        // doesn't blank the bar to "0 running" for a frame.
+        assert_eq!(a.status.running, 4);
+    }
+
+    #[test]
+    fn cron_fired_event_sets_last_pulse() {
+        let mut a = app();
+        a.handle(AppMsg::CronFiredEvent(CronFiredParams {
+            cron_id: "nightly".into(),
+            run_id: "r1".into(),
+            fired_at: "2026-06-03T00:00:00Z".into(),
+            status: "spawning".into(),
+        }));
+        let pulse = a.status.last_cron_pulse.as_ref().expect("pulse");
+        assert_eq!(pulse.cron_id, "nightly");
+        assert_eq!(pulse.fired_at.to_rfc3339(), "2026-06-03T00:00:00+00:00");
+    }
+
+    #[test]
+    fn open_errors_modal_lists_unavailable_backends_only() {
+        let mut a = app();
+        use la_proto::notifications::BackendHealthStatus;
+        a.handle(AppMsg::BackendsUpdate(vec![
+            BackendBadge {
+                id: "claude".into(),
+                display_name: "Claude".into(),
+                status: BackendHealthStatus::Available,
+                reason: None,
+                docs_url: None,
+                version: Some("2.1".into()),
+            },
+            BackendBadge {
+                id: "codex".into(),
+                display_name: "Codex".into(),
+                status: BackendHealthStatus::NotInstalled,
+                reason: Some("not on PATH".into()),
+                docs_url: Some("https://example.com/install".into()),
+                version: None,
+            },
+        ]));
+        a.handle(AppMsg::OpenErrors);
+        let Some(Modal::Errors { rows }) = &a.modal else {
+            panic!("expected Errors modal, got {:?}", a.modal);
+        };
+        assert_eq!(rows.len(), 1, "available backend filtered out");
+        assert_eq!(rows[0].id, "codex");
+        assert_eq!(rows[0].reason.as_deref(), Some("not on PATH"));
+        // Closing via Esc/Cancel clears it.
+        a.handle(AppMsg::Cancel);
+        assert!(a.modal.is_none());
     }
 
     #[test]
