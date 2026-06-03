@@ -30,13 +30,13 @@ use la_ipc::transport::{connect, Endpoint};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
 use la_proto::methods::{
-    EventTopic, EventsSubscribeParams, EventsSubscribeResult, SessionSignal, SessionState,
-    SessionsArchiveParams, SessionsArchiveResult, SessionsAttachParams, SessionsAttachResult,
-    SessionsCreateParams, SessionsCreateResult, SessionsDeleteParams, SessionsDeleteResult,
-    SessionsDetachParams, SessionsDetachResult, SessionsListParams, SessionsListResult,
-    SessionsSignalParams, SessionsSignalResult, SessionsWriteParams, SessionsWriteResult,
+    EventTopic, EventsSubscribeParams, EventsSubscribeResult, SessionState, SessionsArchiveParams,
+    SessionsArchiveResult, SessionsAttachParams, SessionsAttachResult, SessionsCreateParams,
+    SessionsCreateResult, SessionsDeleteParams, SessionsDeleteResult, SessionsDetachParams,
+    SessionsDetachResult, SessionsListParams, SessionsListResult, SessionsWriteParams,
+    SessionsWriteResult,
 };
-use la_proto::notifications::SessionOutputParams;
+use la_proto::notifications::{CronFiredParams, SessionOutputParams};
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -106,6 +106,7 @@ struct TestDaemon {
     /// this on the side so they don't have to poke the daemon's
     /// internals through unsafe extraction.
     bus: Option<la_core::EventBus>,
+    storage: Option<la_storage::Storage>,
     _tempdir: TempDir,
 }
 
@@ -131,6 +132,7 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
     };
     let daemon = Daemon::bind(config).await.expect("bind daemon");
     let bus = daemon.manager.bus();
+    let storage = daemon.manager.storage().clone();
     let (handle, join) = daemon.spawn();
 
     // Wait for the socket to be ready for connections (Listener::bind has
@@ -148,6 +150,7 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
         handle,
         join,
         bus: Some(bus),
+        storage: Some(storage),
         _tempdir: tempdir,
     }
 }
@@ -666,6 +669,82 @@ async fn two_daemons_with_distinct_versions_coexist() {
 }
 
 #[tokio::test]
+async fn cron_fired_notification_path_survives_tui_disconnect() {
+    let daemon = bootstrap_daemon("sleep 1").await;
+    let bus = daemon
+        .bus
+        .as_ref()
+        .expect("test daemon exposes event bus")
+        .clone();
+
+    let mut first = client(&daemon.socket).await;
+    let subscribed: EventsSubscribeResult = call(
+        &mut first,
+        1,
+        "events.subscribe",
+        &EventsSubscribeParams {
+            topics: vec![EventTopic::CronFired],
+        },
+    )
+    .await;
+    assert_eq!(subscribed.topics, vec![EventTopic::CronFired]);
+    drop(first);
+
+    // Publishing after the first TUI connection closes must not poison the
+    // daemon's writer task or event bus for future subscribers.
+    bus.publish(la_core::BusEvent::CronFired(CronFiredParams {
+        cron_id: "after-first-tui-close".to_string(),
+        run_id: "run-before-resubscribe".to_string(),
+        fired_at: "2026-01-01T12:00:00Z".to_string(),
+        status: "spawning".to_string(),
+    }));
+
+    let mut second = client(&daemon.socket).await;
+    let subscribed_again: EventsSubscribeResult = call(
+        &mut second,
+        2,
+        "events.subscribe",
+        &EventsSubscribeParams {
+            topics: vec![EventTopic::CronFired],
+        },
+    )
+    .await;
+    assert_eq!(subscribed_again.topics, vec![EventTopic::CronFired]);
+
+    bus.publish(la_core::BusEvent::CronFired(CronFiredParams {
+        cron_id: "after-second-tui-open".to_string(),
+        run_id: "run-after-resubscribe".to_string(),
+        fired_at: "2026-01-01T12:01:00Z".to_string(),
+        status: "running".to_string(),
+    }));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut seen = None;
+    while tokio::time::Instant::now() < deadline {
+        let msg = match tokio::time::timeout(Duration::from_millis(200), second.recv()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => continue,
+        };
+        if let Message::Notification(n) = msg {
+            if n.method == "cron.fired" {
+                let params: CronFiredParams =
+                    serde_json::from_value(n.params.expect("cron.fired params"))
+                        .expect("decode cron.fired");
+                seen = Some(params);
+                break;
+            }
+        }
+    }
+
+    let seen = seen.expect("second TUI did not receive cron.fired after first disconnected");
+    assert_eq!(seen.cron_id, "after-second-tui-open");
+    assert_eq!(seen.run_id, "run-after-resubscribe");
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+#[tokio::test]
 async fn shutdown_signals_live_sessions_within_deadline() {
     let project = tempfile::tempdir().expect("project tmp");
     // Long-running child — we want to confirm shutdown actually terminates it.
@@ -828,9 +907,6 @@ async fn chaos_external_child_kill_exits_session_without_crashing_daemon() {
 /// stop the daemon-owned session runtime or the daemon-level cron event path.
 #[tokio::test]
 async fn chaos_ipc_disconnect_keeps_session_and_cron_events_alive() {
-    use la_core::BusEvent;
-    use la_proto::notifications::CronFiredParams;
-
     let project = tempfile::tempdir().expect("project tmp");
     let daemon = bootstrap_daemon("trap 'exit 0' TERM; sleep 120").await;
     let bus = daemon.bus.clone().expect("test daemon exposes its bus");
@@ -870,13 +946,16 @@ async fn chaos_ipc_disconnect_keeps_session_and_cron_events_alive() {
         "disconnecting the first client must not reap the daemon-owned session"
     );
 
-    let sub = EventsSubscribeParams {
-        topics: vec![EventTopic::CronFired],
-    };
-    send_request(&mut conn, 3, "events.subscribe", &sub).await;
-    let ack: EventsSubscribeResult =
-        serde_json::from_value(recv_response_for(&mut conn, 3).await).expect("decode sub");
-    assert!(ack.topics.contains(&EventTopic::CronFired));
+    let sub: EventsSubscribeResult = call(
+        &mut conn,
+        3,
+        "events.subscribe",
+        &EventsSubscribeParams {
+            topics: vec![EventTopic::CronFired],
+        },
+    )
+    .await;
+    assert_eq!(sub.topics, vec![EventTopic::CronFired]);
 
     let payload = CronFiredParams {
         cron_id: "story-3-cron".into(),
@@ -887,7 +966,7 @@ async fn chaos_ipc_disconnect_keeps_session_and_cron_events_alive() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut got = None;
     while tokio::time::Instant::now() < deadline && got.is_none() {
-        bus.publish(BusEvent::CronFired(payload.clone()));
+        bus.publish(la_core::BusEvent::CronFired(payload.clone()));
         match tokio::time::timeout(Duration::from_millis(250), conn.recv()).await {
             Ok(Ok(Some(Message::Notification(n)))) if n.method == "cron.fired" => {
                 got = Some(
@@ -901,19 +980,62 @@ async fn chaos_ipc_disconnect_keeps_session_and_cron_events_alive() {
     let got = got.expect("cron.fired was not delivered after prior client disconnect");
     assert_eq!(got.cron_id, "story-3-cron");
 
-    let _: SessionsSignalResult = call(
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+/// WEK-38 chaos: a SQLite I/O failure must surface as an RPC error rather than
+/// crashing the daemon process or poisoning unrelated IPC paths. Closing the
+/// test-owned pools is a deterministic CI-safe fault injection for the same
+/// error class as a transient SQLite I/O outage.
+#[tokio::test]
+async fn chaos_sqlite_io_error_surfaces_without_crashing_daemon() {
+    let daemon = bootstrap_daemon("sleep 120").await;
+    let storage = daemon
+        .storage
+        .as_ref()
+        .expect("test daemon exposes storage")
+        .clone();
+    let mut conn = client(&daemon.socket).await;
+
+    storage.close().await;
+
+    send_request(
         &mut conn,
-        4,
-        "sessions.signal",
-        &SessionsSignalParams {
-            session_id: create.session_id,
-            signal: SessionSignal::Term,
+        1,
+        "sessions.list",
+        &SessionsListParams {
+            project: None,
+            backend: None,
+            include_archived: true,
         },
     )
     .await;
+    let err = recv_error_for(&mut conn, 1).await;
+    assert!(
+        err.message.to_ascii_lowercase().contains("storage")
+            || err.message.to_ascii_lowercase().contains("sqlite")
+            || err.message.to_ascii_lowercase().contains("closed"),
+        "storage fault should be explicit, got {err:?}"
+    );
+
+    let sub: EventsSubscribeResult = call(
+        &mut conn,
+        2,
+        "events.subscribe",
+        &EventsSubscribeParams {
+            topics: vec![EventTopic::CronFired],
+        },
+    )
+    .await;
+    assert_eq!(sub.topics, vec![EventTopic::CronFired]);
 
     daemon.handle.shutdown();
-    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+    let joined = timeout(Duration::from_secs(15), daemon.join).await;
+    assert!(
+        joined.is_ok(),
+        "daemon did not shut down after storage fault"
+    );
 }
 
 /// WEK-27 regression: a daemon with an active worktree-sweep loop
@@ -1382,6 +1504,7 @@ async fn bootstrap_daemon_with_adapters(
     };
     let daemon = Daemon::bind(config).await.expect("bind daemon");
     let bus = daemon.manager.bus();
+    let storage = daemon.manager.storage().clone();
     let (handle, join) = daemon.spawn();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
@@ -1396,6 +1519,7 @@ async fn bootstrap_daemon_with_adapters(
         handle,
         join,
         bus: Some(bus),
+        storage: Some(storage),
         _tempdir: tempdir,
     }
 }

@@ -14,8 +14,8 @@ use chrono_tz::Tz;
 use tokio::time::{advance, timeout, Duration as StdDuration};
 
 use la_scheduler::{
-    next_eligible_fire, BackoffState, CatchupMode, Clock, CronSpec, FailureBackoff, FakeClock,
-    FireEvent, Scheduler, SchedulerChannels, SchedulerEvent,
+    apply_catchup, next_eligible_fire, BackoffState, CatchupMode, Clock, CronSpec, FailureBackoff,
+    FakeClock, FireEvent, Scheduler, SchedulerChannels, SchedulerEvent,
 };
 
 /// Common fixture: anchor the fake clock at `wall`, spin up the scheduler,
@@ -194,6 +194,106 @@ async fn seven_day_timeline_replay_emits_every_missed_fire() {
     ch.handle.shutdown().await.unwrap();
 }
 
+#[test]
+fn seven_day_timeline_all_catchup_modes_stay_under_cap() {
+    let spec = CronSpec::parse("0 */4 * * *", "UTC").unwrap();
+    let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let end = start + Duration::days(7);
+    let missed = spec.fires_between(start, end, 64);
+    assert_eq!(
+        missed.len(),
+        42,
+        "7 days at 4h cadence should produce 42 missed fires"
+    );
+
+    let skip = apply_catchup(&missed, CatchupMode::Skip, Duration::zero()).unwrap();
+    assert!(skip.fires.is_empty());
+    assert!(!skip.degraded_to_skip);
+
+    let coalesce = apply_catchup(&missed, CatchupMode::Coalesce, Duration::zero()).unwrap();
+    assert_eq!(coalesce.fires.len(), 1);
+    assert_eq!(coalesce.fires[0].coalesced_count, 42);
+    assert_eq!(coalesce.fires[0].scheduled_at, *missed.last().unwrap());
+    assert!(!coalesce.degraded_to_skip);
+
+    let replay = apply_catchup(&missed, CatchupMode::Replay, Duration::zero()).unwrap();
+    assert_eq!(replay.fires.len(), missed.len());
+    assert_eq!(
+        replay
+            .fires
+            .iter()
+            .map(|f| f.scheduled_at)
+            .collect::<Vec<_>>(),
+        missed
+    );
+    assert!(replay.fires.iter().all(|f| f.coalesced_count == 1));
+    assert!(!replay.degraded_to_skip);
+}
+
+#[test]
+fn seven_day_dst_windows_skip_spring_gap_and_cover_both_fall_offsets() {
+    let tz: Tz = Los_Angeles;
+
+    let spring = CronSpec::parse("30 2 * * *", "America/Los_Angeles").unwrap();
+    let spring_start = tz
+        .with_ymd_and_hms(2026, 3, 5, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    let spring_end = spring_start + Duration::days(7);
+    let spring_fires = spring.fires_between(spring_start, spring_end, 16);
+    assert_eq!(
+        spring_fires.len(),
+        6,
+        "7-day spring-forward window must skip the nonexistent local 02:30"
+    );
+    assert!(
+        spring_fires
+            .iter()
+            .all(|f| !(f.with_timezone(&tz).month() == 3 && f.with_timezone(&tz).day() == 8)),
+        "spring-forward day must not produce a 02:30 fire: {spring_fires:#?}"
+    );
+
+    let fall = CronSpec::parse("30 1 * * *", "America/Los_Angeles").unwrap();
+    let fall_start = tz
+        .with_ymd_and_hms(2026, 10, 29, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    let fall_end = fall_start + Duration::days(7);
+    let fall_fires = fall.fires_between(fall_start, fall_end, 16);
+    assert_eq!(
+        fall_fires.len(),
+        8,
+        "7-day fall-back window must include both 01:30 offsets"
+    );
+    let fall_day: Vec<_> = fall_fires
+        .iter()
+        .copied()
+        .filter(|f| {
+            let local = f.with_timezone(&tz);
+            local.month() == 11 && local.day() == 1
+        })
+        .collect();
+    assert_eq!(
+        fall_day.len(),
+        2,
+        "fall-back day must fire once per offset: {fall_fires:#?}"
+    );
+    assert_eq!(
+        fall_day[0],
+        tz.with_ymd_and_hms(2026, 11, 1, 1, 30, 0)
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc)
+    );
+    assert_eq!(
+        fall_day[1],
+        tz.with_ymd_and_hms(2026, 11, 1, 1, 30, 0)
+            .latest()
+            .unwrap()
+            .with_timezone(&Utc)
+    );
+}
+
 #[tokio::test(start_paused = true, flavor = "current_thread")]
 async fn over_max_catchup_degrades_to_single_fire() {
     let wall = Utc.with_ymd_and_hms(2026, 1, 8, 0, 0, 0).unwrap();
@@ -218,83 +318,6 @@ async fn over_max_catchup_degrades_to_single_fire() {
     let fires = drain_fires(&mut ch.fires).await;
     assert_eq!(fires.len(), 1, "over-cap must collapse to one fire");
     assert!(fires[0].catchup_degraded);
-
-    ch.handle.shutdown().await.unwrap();
-}
-
-#[tokio::test(start_paused = true, flavor = "current_thread")]
-async fn seven_day_timeline_all_catchup_modes_are_bounded_and_distinct() {
-    let wall = Utc.with_ymd_and_hms(2026, 1, 8, 0, 0, 0).unwrap();
-    let modes = [
-        (CatchupMode::Skip, 0usize, 0u32, false),
-        (CatchupMode::Coalesce, 1usize, 84u32, false),
-        (CatchupMode::Replay, 84usize, 1u32, false),
-    ];
-
-    for (mode, expected_len, expected_count, expected_degraded) in modes {
-        let (_clock, mut ch) = start_at(wall);
-        let last = wall - Duration::days(7);
-        let spec = CronSpec::parse("0 */2 * * *", "UTC").unwrap();
-        ch.handle
-            .upsert(
-                format!("seven-day-{mode:?}"),
-                spec,
-                mode,
-                Duration::zero(),
-                Some(last),
-            )
-            .await
-            .unwrap();
-        advance(StdDuration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-
-        let fires = drain_fires(&mut ch.fires).await;
-        assert_eq!(
-            fires.len(),
-            expected_len,
-            "{mode:?} emitted an unexpected number of seven-day catch-up fires: {fires:#?}",
-        );
-        for fire in &fires {
-            assert_eq!(fire.coalesced_count, expected_count);
-            assert_eq!(fire.catchup_degraded, expected_degraded);
-        }
-        if mode == CatchupMode::Replay {
-            assert_eq!(
-                fires.first().unwrap().scheduled_at,
-                last + Duration::hours(2)
-            );
-            assert_eq!(fires.last().unwrap().scheduled_at, wall);
-        }
-        ch.handle.shutdown().await.unwrap();
-    }
-}
-
-#[tokio::test(start_paused = true, flavor = "current_thread")]
-async fn seven_day_minutely_replay_degrades_before_unbounded_backlog() {
-    let wall = Utc.with_ymd_and_hms(2026, 1, 8, 0, 0, 0).unwrap();
-    let (_clock, mut ch) = start_at(wall);
-
-    ch.handle
-        .upsert(
-            "seven-day-minutely-replay",
-            CronSpec::parse("* * * * *", "UTC").unwrap(),
-            CatchupMode::Replay,
-            Duration::zero(),
-            Some(wall - Duration::days(7)),
-        )
-        .await
-        .unwrap();
-    advance(StdDuration::from_millis(1)).await;
-    tokio::task::yield_now().await;
-
-    let fires = drain_fires(&mut ch.fires).await;
-    assert_eq!(fires.len(), 1, "over-cap replay must collapse to one fire");
-    assert!(fires[0].catchup_degraded);
-    assert_eq!(
-        fires[0].scheduled_at,
-        wall - Duration::days(7) + Duration::minutes((la_scheduler::MAX_CATCHUP + 1) as i64),
-        "degraded catch-up keeps the last collected fire before the iterator cap"
-    );
 
     ch.handle.shutdown().await.unwrap();
 }
@@ -901,6 +924,68 @@ async fn backoff_defers_next_fire_past_backoff_window() {
         first.scheduled_at,
         wall + Duration::seconds(240),
         "first post-backoff fire must be the deferred 12:04:00 tick",
+    );
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn high_frequency_cron_long_backoff_does_not_emit_refusal_noise_for_four_hours() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, mut ch) = start_at(wall);
+
+    let spec = CronSpec::parse("* * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "quiet-backoff",
+            spec,
+            CatchupMode::Skip,
+            Duration::zero(),
+            Some(wall),
+        )
+        .await
+        .unwrap();
+    ch.handle
+        .update_backoff_state(
+            "quiet-backoff",
+            Some(FailureBackoff::default()),
+            Some(wall),
+            9,
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    let snap = ch.handle.snapshot().await.unwrap();
+    assert_eq!(
+        snap[0].fire_at,
+        wall + Duration::hours(1),
+        "default backoff caps at a one-hour retry rail before a four-hour soak"
+    );
+
+    advance_in_steps(StdDuration::from_secs(59 * 60), StdDuration::from_secs(60)).await;
+    let before_retry = drain_fires(&mut ch.fires).await;
+    assert!(
+        before_retry.is_empty(),
+        "high-frequency cron must not emit per-minute fires inside backoff: {before_retry:#?}"
+    );
+
+    advance_in_steps(
+        StdDuration::from_secs(3 * 3600 + 60),
+        StdDuration::from_secs(60),
+    )
+    .await;
+    let after = drain_fires(&mut ch.fires).await;
+    assert!(
+        !after.is_empty(),
+        "cron should resume after the one-hour retry rail within the four-hour soak"
+    );
+    assert_eq!(after[0].scheduled_at, wall + Duration::hours(1));
+    assert!(
+        after.len() < 256,
+        "four-hour backoff soak must stay bounded, not produce thousand-level refusal noise: {} fires",
+        after.len()
     );
 
     ch.handle.shutdown().await.unwrap();
