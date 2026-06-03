@@ -324,27 +324,23 @@ fn reject_shell_wrapper(cmd: &CommandBuilder) -> Result<(), PtyError> {
         .next()
         .unwrap_or(&program)
         .to_ascii_lowercase();
-    let uses_shell = matches!(
+    let args = &argv[1..];
+    let has_exec_string_arg = if is_posix_shell(&program_name) {
+        posix_shell_has_command_string_arg(args)
+    } else if matches!(program_name.as_str(), "cmd" | "cmd.exe") {
+        args.iter()
+            .any(|arg| arg.to_string_lossy().eq_ignore_ascii_case("/c"))
+    } else if matches!(
         program_name.as_str(),
-        "sh" | "bash"
-            | "dash"
-            | "zsh"
-            | "ksh"
-            | "cmd"
-            | "cmd.exe"
-            | "powershell"
-            | "powershell.exe"
-            | "pwsh"
-            | "pwsh.exe"
-    );
-    if !uses_shell {
-        return Ok(());
-    }
-
-    let has_exec_string_arg = argv.iter().skip(1).any(|arg| {
-        let arg = arg.to_string_lossy();
-        matches!(arg.as_ref(), "-c" | "/c" | "/C" | "-Command" | "-command")
-    });
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    ) {
+        args.iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg.eq_ignore_ascii_case("-command") || arg.eq_ignore_ascii_case("-c")
+        })
+    } else {
+        false
+    };
     if has_exec_string_arg {
         return Err(PtyError::ShellWrapping(format!(
             "{} with command-string argument",
@@ -352,4 +348,24 @@ fn reject_shell_wrapper(cmd: &CommandBuilder) -> Result<(), PtyError> {
         )));
     }
     Ok(())
+}
+
+fn is_posix_shell(program_name: &str) -> bool {
+    matches!(
+        program_name,
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish" | "csh" | "tcsh"
+    )
+}
+
+fn posix_shell_has_command_string_arg(args: &[std::ffi::OsString]) -> bool {
+    for arg in args {
+        let arg = arg.to_string_lossy();
+        if arg == "--" {
+            return false;
+        }
+        if arg.starts_with('-') && arg.len() > 1 && arg[1..].contains('c') {
+            return true;
+        }
+    }
+    false
 }
