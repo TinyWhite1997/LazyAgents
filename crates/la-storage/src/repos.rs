@@ -409,6 +409,7 @@ impl<'a> RunsRepo<'a> {
     }
 
     pub async fn create(&self, run: NewRun) -> Result<RunRecord> {
+        let started = std::time::Instant::now();
         retry_busy(|| async {
             sqlx::query(
                 r#"
@@ -430,6 +431,8 @@ impl<'a> RunsRepo<'a> {
             .await
         })
         .await?;
+        metrics::histogram!("lad_storage_write_latency_seconds", "op" => "runs.create")
+            .record(started.elapsed().as_secs_f64());
         self.get(&run.id)
             .await?
             .ok_or(StorageError::MissingRun(run.id))
@@ -445,6 +448,7 @@ impl<'a> RunsRepo<'a> {
     /// `status` must be one of the schema enum strings ("budget_exceeded"
     /// or "cancelled" today); SQLite's CHECK on `runs.status` enforces it.
     pub async fn create_rejected(&self, rejected: NewRejectedRun<'_>) -> Result<RunRecord> {
+        let started = std::time::Instant::now();
         retry_busy(|| async {
             sqlx::query(
                 r#"
@@ -467,6 +471,10 @@ impl<'a> RunsRepo<'a> {
             .await
         })
         .await?;
+        metrics::histogram!("lad_storage_write_latency_seconds", "op" => "runs.create_rejected")
+            .record(started.elapsed().as_secs_f64());
+        metrics::counter!("lad_cron_runs_total", "status" => rejected.status.to_string())
+            .increment(1);
         self.get(rejected.id)
             .await?
             .ok_or_else(|| StorageError::MissingRun(rejected.id.to_string()))
@@ -653,6 +661,7 @@ impl<'a> RunsRepo<'a> {
     }
 
     pub async fn attach_session(&self, id: &str, session_id: &str) -> Result<bool> {
+        let started = std::time::Instant::now();
         let result = retry_busy(|| async {
             sqlx::query(
                 r#"
@@ -669,10 +678,13 @@ impl<'a> RunsRepo<'a> {
             .await
         })
         .await?;
+        metrics::histogram!("lad_storage_write_latency_seconds", "op" => "runs.attach_session")
+            .record(started.elapsed().as_secs_f64());
         Ok(result.rows_affected() > 0)
     }
 
     pub async fn update_status(&self, id: &str, status: &str) -> Result<bool> {
+        let started = std::time::Instant::now();
         let result = retry_busy(|| async {
             sqlx::query("UPDATE runs SET status = ?2 WHERE id = ?1 AND finished_at IS NULL")
                 .bind(id)
@@ -681,10 +693,13 @@ impl<'a> RunsRepo<'a> {
                 .await
         })
         .await?;
+        metrics::histogram!("lad_storage_write_latency_seconds", "op" => "runs.update_status")
+            .record(started.elapsed().as_secs_f64());
         Ok(result.rows_affected() > 0)
     }
 
     pub async fn finish(&self, id: &str, finish: RunFinish) -> Result<bool> {
+        let started = std::time::Instant::now();
         let tail_log = truncate_tail_log(finish.tail_log.clone());
         let result = retry_busy(|| async {
             sqlx::query(
@@ -713,7 +728,11 @@ impl<'a> RunsRepo<'a> {
             .await
         })
         .await?;
+        metrics::histogram!("lad_storage_write_latency_seconds", "op" => "runs.finish")
+            .record(started.elapsed().as_secs_f64());
         if result.rows_affected() > 0 {
+            metrics::counter!("lad_cron_runs_total", "status" => finish.status.clone())
+                .increment(1);
             return Ok(true);
         }
 
@@ -1176,6 +1195,7 @@ impl<'a> ChunksRepo<'a> {
         kind: ChunkKind,
         data: impl AsRef<[u8]>,
     ) -> Result<AppendOutcome> {
+        let started = std::time::Instant::now();
         let data = data.as_ref();
         let mut tx = self.storage.writer_pool().begin().await?;
         let session = session_by_id(&mut tx, session_id)
@@ -1195,6 +1215,8 @@ impl<'a> ChunksRepo<'a> {
             append_spill_line(path_buf, session_id, seq, ts, kind, data).await?;
             update_transcript_bytes(&mut tx, session_id, new_bytes).await?;
             tx.commit().await?;
+            metrics::histogram!("lad_storage_write_latency_seconds", "op" => "chunks.append")
+                .record(started.elapsed().as_secs_f64());
             return Ok(AppendOutcome::SpilledToFile { seq, path });
         }
 
@@ -1235,6 +1257,8 @@ impl<'a> ChunksRepo<'a> {
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
+            metrics::histogram!("lad_storage_write_latency_seconds", "op" => "chunks.append")
+                .record(started.elapsed().as_secs_f64());
             return Ok(AppendOutcome::SpilledToFile {
                 seq,
                 path: path_str,
@@ -1257,6 +1281,8 @@ impl<'a> ChunksRepo<'a> {
         .await?;
         update_transcript_bytes(&mut tx, session_id, new_bytes).await?;
         tx.commit().await?;
+        metrics::histogram!("lad_storage_write_latency_seconds", "op" => "chunks.append")
+            .record(started.elapsed().as_secs_f64());
         Ok(AppendOutcome::StoredInDb { seq })
     }
 

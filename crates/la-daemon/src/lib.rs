@@ -35,7 +35,7 @@ pub use daemonize::{spawn_daemonized, DaemonizeError};
 pub use dispatcher::AdapterRegistry;
 pub use health::{HealthRegistry, ProbeLoopConfig, DEFAULT_PROBE_INTERVAL};
 pub use paths::{default_socket_path, default_state_dir, socket_path_for_version, SocketDiscovery};
-pub use runtime::{Daemon, DaemonConfig, DaemonError, DaemonHandle};
+pub use runtime::{metrics_socket_path, Daemon, DaemonConfig, DaemonError, DaemonHandle};
 pub use scheduler::{SchedulerConfig, SchedulerServices};
 
 /// Daemon-advertised name on the wire (`InitializeResult.server`).

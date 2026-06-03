@@ -131,7 +131,7 @@ sqlite3 "$XDG_DATA_HOME/lazyagents/lad.sqlite" \
 
 ## Crashes / panics
 
-LazyAgents does not currently write crash dump files. A planned crash report feature (`crashes/<ts>.json` with the last 100 tracing events) is in the architecture doc but not in v1. For now: collect `LAZYAGENTS_LOG=trace` output and attach it to an issue.
+`lad` writes panic reports under the daemon state directory at `crashes/<ts>.json`. Each file includes panic location/message plus the last 100 tracing events. Attach that file to an issue if you choose to report the crash.
 
 ## Cron didn't fire
 

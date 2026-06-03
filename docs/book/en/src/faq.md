@@ -171,11 +171,11 @@ No. They're stored as plaintext in SQLite. Treat them like you'd treat the comme
 
 ### Is there structured logging?
 
-Not in v1. Logs are plain text on stderr, controlled by `LAZYAGENTS_LOG` (same syntax as `RUST_LOG`). JSON logs are tracked for a future release.
+Yes. `lad` writes newline-delimited JSON tracing events to stderr. Control verbosity with `LAZYAGENTS_LOG` or `lad --log-level` (same filter syntax as `RUST_LOG`).
 
 ### Is there a Prometheus endpoint?
 
-`lad metrics` is a stub that exits with "not yet implemented". A real metrics surface is on the roadmap.
+Yes. `lad metrics` scrapes the active daemon over a local Unix-domain socket and prints Prometheus text for RPC, session, cron, PTY spawn, and storage-write metrics.
 
 ### Where are health events?
 

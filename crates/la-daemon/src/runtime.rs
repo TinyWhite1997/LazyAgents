@@ -21,6 +21,7 @@ use la_adapter::AgentAdapter;
 use la_core::{ManagerConfig, SessionManager, WorktreeManager};
 use la_ipc::transport::{Endpoint, Listener};
 use la_storage::{Storage, StorageConfig};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -136,6 +137,8 @@ pub struct Daemon {
     /// Health probe loop join handle — awaited on graceful shutdown so
     /// the last SQLite upsert isn't truncated mid-write.
     health_loop: Option<JoinHandle<()>>,
+    /// UDS-only metrics scrape endpoint (`lad metrics`).
+    metrics_loop: Option<JoinHandle<()>>,
     /// WEK-27 archived-worktree sweep loop. Same shutdown discipline
     /// as `health_loop`: aborted on graceful shutdown so the daemon
     /// doesn't tear the SQLite handle out from under an in-flight
@@ -247,6 +250,7 @@ impl Daemon {
         let listener = Listener::bind(&endpoint).await?;
 
         let shutdown = Arc::new(Notify::new());
+        let metrics_loop = spawn_metrics_loop(&socket.socket_path, shutdown.clone()).await?;
         let registry = AdapterRegistry::from_map(adapters);
         let health_registry = HealthRegistry::new();
 
@@ -319,6 +323,7 @@ impl Daemon {
             shutdown,
             shutdown_deadline,
             health_loop,
+            metrics_loop: Some(metrics_loop),
             worktree_sweep_loop: sweep_loop,
             runs_archive_loop,
             scheduler: Some(scheduler_arc),
@@ -357,6 +362,7 @@ impl Daemon {
             shutdown,
             shutdown_deadline,
             health_loop,
+            metrics_loop,
             worktree_sweep_loop,
             runs_archive_loop,
             scheduler,
@@ -405,6 +411,10 @@ impl Daemon {
         // never blocks shutdown either.
         const BACKGROUND_LOOP_JOIN_BUDGET: Duration = Duration::from_millis(200);
         if let Some(h) = health_loop {
+            h.abort();
+            let _ = tokio::time::timeout(BACKGROUND_LOOP_JOIN_BUDGET, h).await;
+        }
+        if let Some(h) = metrics_loop {
             h.abort();
             let _ = tokio::time::timeout(BACKGROUND_LOOP_JOIN_BUDGET, h).await;
         }
@@ -559,6 +569,64 @@ fn endpoint_for(path: &Path) -> Endpoint {
         );
         Endpoint::named_pipe(pipe_name)
     }
+}
+
+pub fn metrics_socket_path(socket_path: &Path) -> PathBuf {
+    let file_name = socket_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| format!("{s}.metrics"))
+        .unwrap_or_else(|| "lad.metrics.sock".to_string());
+    socket_path.with_file_name(file_name)
+}
+
+#[cfg(unix)]
+async fn spawn_metrics_loop(
+    socket_path: &Path,
+    shutdown: Arc<Notify>,
+) -> Result<JoinHandle<()>, DaemonError> {
+    let metrics_path = metrics_socket_path(socket_path);
+    if metrics_path.exists() {
+        match tokio::net::UnixStream::connect(&metrics_path).await {
+            Ok(_) => return Err(DaemonError::AlreadyRunning(metrics_path)),
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&metrics_path).await;
+            }
+        }
+    }
+    let listener = tokio::net::UnixListener::bind(&metrics_path)?;
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                accept = listener.accept() => {
+                    match accept {
+                        Ok((mut stream, _)) => {
+                            let body = la_observ::render_prometheus();
+                            if let Err(err) = stream.write_all(body.as_bytes()).await {
+                                tracing::debug!(%err, "metrics scrape write failed");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "metrics accept failed");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
+        }
+        drop(listener);
+        let _ = tokio::fs::remove_file(&metrics_path).await;
+    });
+    Ok(handle)
+}
+
+#[cfg(not(unix))]
+async fn spawn_metrics_loop(
+    _socket_path: &Path,
+    _shutdown: Arc<Notify>,
+) -> Result<JoinHandle<()>, DaemonError> {
+    Ok(tokio::spawn(async {}))
 }
 
 /// Refuse to start if a daemon is already listening on the same path.
