@@ -27,6 +27,20 @@ jobs:
         run: cargo clippy --workspace --lib --bins -- -D warnings
       - name: la-storage migration smoke
         run: cargo test -p la-storage migrations_enable_wal_and_schema_meta
+      # WEK-40 验收：任何 la-proto 类型改动都必须同步 docs/schema/。
+      # 这里在 cargo test 之前显式跑一次 gen-schema 并 diff，
+      # 让「PR 没更新 schema」立刻在独立、易读的 step 里红，
+      # 而不是埋在 cargo test 输出里的 schema_files_match_generated_output。
+      - name: gen-schema --check (golden diff)
+        run: |
+          set -euo pipefail
+          out=$(mktemp -d)
+          cargo run -q -p la-proto --bin la-proto-gen-schema -- "$out"
+          if ! diff -ruN docs/schema "$out"; then
+            echo
+            echo '::error::docs/schema/ is stale. Re-run: cargo run -p la-proto --bin la-proto-gen-schema'
+            exit 1
+          fi
       - name: cargo test
         run: cargo test --workspace --all-targets
 
