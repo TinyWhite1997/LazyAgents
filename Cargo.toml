@@ -20,6 +20,89 @@ rust-version = "1.75"
 license = "MIT"
 repository = "https://github.com/TinyWhite1997/LazyAgents"
 
+# WEK-41 / M4.2 — release profile consumed by cargo-dist.
+#
+# Architecture §13: `lad` 与 `la` 单二进制 + lto=thin + strip 目标 < 30 MiB。
+# cargo-dist builds the `dist` profile (inherited from release) rather than
+# `release` itself, so tweaking this does not break a developer's local
+# `cargo build --release` workflow.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+debug = false
+opt-level = 3
+panic = "abort"
+
+# Config for 'dist' (formerly cargo-dist).
+#
+# Acceptance (WEK-41):
+# Acceptance (WEK-41):
+#   • 5-platform release artifact (linux x64/arm64, macos arm64/x64,
+#     windows x64) — see `targets` below. The task spec called these
+#     "6 platforms" but x64+arm64×{linux,macos} + windows x64 is 5;
+#     `aarch64-pc-windows-msvc` (Windows ARM) is intentionally OUT of
+#     scope for v1 because no contributor runs it for daily dogfood
+#     and GitHub's Windows ARM runners are still preview. Revisit at
+#     M5 if user demand surfaces.
+#   • tar/zip + install.sh — `shell` + `powershell` + `homebrew` installers
+#     emit the platform-correct archive + bootstrapper
+#   • cosign-equivalent binary signing — GitHub Artifact Attestations
+#     (sigstore-backed) replace standalone cosign for keyless signing in CI.
+#     This is what `dist` ships natively as of 0.32; rolling our own `cosign
+#     sign-blob` would re-duplicate the same Fulcio/Rekor pipeline.
+#   • Homebrew tap — `tap` points at `TinyWhite1997/homebrew-tap`. The
+#     repo must exist before the first publish; until then `publish-jobs`
+#     stays commented out so a tag push plans+builds+hosts without
+#     erroring on the missing tap.
+#   • Scoop bucket — DEFERRED to a follow-up (see issue comment thread on
+#     WEK-41). cargo-dist 0.32 ships native installer support only for
+#     `shell` / `powershell` / `npm` / `homebrew` / `msi`; there is no
+#     first-party Scoop installer and no `scoop-tap` field. Shipping a
+#     Scoop manifest cleanly requires either (a) a custom `publish-jobs`
+#     script that consumes `dist-manifest.json` and writes the bucket
+#     repo, or (b) a third-party generator like `scoop-bucket-helper`.
+#     Either path is wider than the WEK-5 Linux-only acceptance bar, so
+#     it is tracked as a follow-up rather than forced into this issue.
+#
+# WEK-5 scope: Linux-only validation. macOS/Windows targets remain in this
+# list so the GHA matrix is wired and ready; cross-platform smoke is a
+# follow-up before GA tagging.
+[workspace.metadata.dist]
+# Pinned to the latest stable release; bump in sync with the installer
+# `dist init` would regenerate.
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "powershell", "homebrew"]
+# Five v1 release targets per task spec (originally written as "6
+# platforms" but x64+arm64×{linux,macos} + windows x64 = 5; Windows
+# ARM excluded — see acceptance comment above).
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Archives: tar.xz on unix, zip on windows (dist defaults). Keep explicit
+# so the install.sh shipped by the `shell` installer can locate the right
+# asset.
+unix-archive = ".tar.xz"
+windows-archive = ".zip"
+# GitHub Artifact Attestations = sigstore (Fulcio + Rekor) keyless signing.
+# Equivalent to `cosign sign-blob --identity-token <oidc>` per artifact;
+# verifiable with `gh attestation verify <file> --repo TinyWhite1997/LazyAgents`.
+github-attestations = true
+# Homebrew tap (must exist as TinyWhite1997/homebrew-tap before tagging).
+tap = "TinyWhite1997/homebrew-tap"
+# Publisher stays disabled until `TinyWhite1997/homebrew-tap` exists — flip
+# this on in the M4 RC follow-up. Building + hosting still happens without
+# it. (Scoop is intentionally NOT listed — see comment above.)
+# publish-jobs = ["homebrew"]
+pr-run-mode = "plan"
+install-updater = false
+
 [workspace.dependencies]
 async-trait = "0.1"
 bytes = "1.7"

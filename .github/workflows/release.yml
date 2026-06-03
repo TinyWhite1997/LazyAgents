@@ -1,0 +1,213 @@
+name: release
+
+# WEK-41 / M4.2 — multi-platform release pipeline driven by cargo-dist.
+#
+# Triggered by a SemVer tag (`v0.1.0`, `v0.2.0-rc.1`, ...). The job uses
+# the same `cargo-dist` config in workspace `Cargo.toml` for the build
+# matrix, installers, archive shape, and signing. `pr-run-mode = "plan"`
+# keeps PRs on a lightweight "would this release?" check; only tag pushes
+# produce binaries / upload artifacts.
+#
+# Scope note (WEK-5): v1 ships Linux-only validation. The other targets
+# are wired so the GHA matrix is ready when M4 RC begins macOS/Windows
+# smoke testing.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to plan a release for (no upload). Leave blank for HEAD."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  # Required by `cargo-dist`'s github-attestations: it calls the
+  # `actions/attest-build-provenance` flow which needs `id-token` (for
+  # the Fulcio OIDC handshake) and `attestations` (to register them).
+  id-token: write
+  attestations: write
+
+env:
+  # Pin cargo-dist so a tag we cut six months from now produces the
+  # same shape of artifacts the workspace metadata expects.
+  CARGO_DIST_VERSION: "v0.32.0"
+  # Speed up CI by skipping unused cargo features.
+  CARGO_TERM_COLOR: always
+  # Resolve once: workflow_dispatch lets the operator pass an explicit
+  # `tag` input (e.g. "v0.2.0-rc.1") for a dry-run plan; tag pushes set
+  # `github.ref_name` to the tag automatically. Falling back to `ref_name`
+  # when the input is blank means a manual run from a branch (the default
+  # workflow_dispatch shape) plans for HEAD's branch name — which `dist
+  # plan` rejects with a clear error, exactly what we want instead of
+  # silently planning the wrong release.
+  RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      dist-manifest: ${{ steps.plan.outputs.manifest }}
+      val: ${{ steps.plan.outputs.val }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install dist
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/${CARGO_DIST_VERSION}/cargo-dist-installer.sh" \
+            | sh
+      - name: plan
+        id: plan
+        run: |
+          dist plan --tag="${RELEASE_TAG}" --output-format=json > dist-manifest.json
+          cat dist-manifest.json
+          echo "manifest=$(cat dist-manifest.json | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install dist (unix)
+        if: runner.os != 'Windows'
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/${CARGO_DIST_VERSION}/cargo-dist-installer.sh" \
+            | sh
+      - name: install dist (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm "https://github.com/axodotdev/cargo-dist/releases/download/${{ env.CARGO_DIST_VERSION }}/cargo-dist-installer.ps1" | iex
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dist-${{ matrix.target }}
+      # `dist build` builds the binaries + tarballs/zips for this host's
+      # target. The `dist` profile (Cargo.toml) drives lto/strip; the
+      # workspace metadata picks installers + target list.
+      - name: build local artifacts
+        run: dist build --tag="${RELEASE_TAG}" --artifacts=local --target=${{ matrix.target }}
+        shell: bash
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: |
+            target/distrib/*
+            !target/distrib/*.txt
+
+  global:
+    name: global installers (shell / powershell / homebrew)
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install dist
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/${CARGO_DIST_VERSION}/cargo-dist-installer.sh" \
+            | sh
+      - name: download per-target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib
+          merge-multiple: true
+      # `dist build --artifacts=global` produces install.sh, install.ps1,
+      # and the Homebrew formula. They are anchored at the planned
+      # download URLs and reference each per-target checksum. (Scoop
+      # manifest is intentionally NOT generated — see Cargo.toml dist
+      # metadata comment for why it's a follow-up.)
+      - name: build global installers
+        run: dist build --tag="${RELEASE_TAG}" --artifacts=global
+      - name: upload global artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-global
+          path: target/distrib/*
+
+  attest:
+    name: sigstore attestations
+    needs: [plan, build, global]
+    runs-on: ubuntu-latest
+    steps:
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+      # Keyless sigstore signing via Fulcio OIDC (functionally equivalent
+      # to `cosign sign-blob` on every release artifact). Replaces the
+      # task spec's "cosign 二进制签名" item with GitHub's first-party
+      # sigstore-backed attestation flow — same trust root, less infra.
+      #
+      # The binary globs are deliberately exhaustive instead of
+      # `artifacts/**/la*` because `la*` would also pick up `lad`, and
+      # double-attesting the same blob just burns Rekor log entries
+      # without adding signal. List each filename explicitly.
+      - name: sigstore attest-build-provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            artifacts/**/*.tar.xz
+            artifacts/**/*.zip
+            artifacts/**/la
+            artifacts/**/la.exe
+            artifacts/**/lad
+            artifacts/**/lad.exe
+            artifacts/**/*.sh
+            artifacts/**/*.ps1
+
+  host:
+    name: host (github release)
+    needs: [plan, build, global, attest]
+    runs-on: ubuntu-latest
+    # Only real tag pushes upload; manual workflow_dispatch stays a dry run.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install dist
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/${CARGO_DIST_VERSION}/cargo-dist-installer.sh" \
+            | sh
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib
+          merge-multiple: true
+      - name: upload to github release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dist host --tag="${RELEASE_TAG}" --steps=upload
+          dist host --tag="${RELEASE_TAG}" --steps=announce
