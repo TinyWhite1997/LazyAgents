@@ -226,7 +226,8 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
     let palette = Palette::for_theme(app.ui_prefs.theme);
     let key_hints_mode = app.ui_prefs.key_hints;
     let compact = app.ui_prefs.compact;
-    let show_hints_row = matches!(key_hints_mode, KeyHintsMode::Rich | KeyHintsMode::Compact) && !compact;
+    let show_hints_row =
+        matches!(key_hints_mode, KeyHintsMode::Rich | KeyHintsMode::Compact) && !compact;
 
     let status_height: u16 = if compact { 1 } else { 2 };
     let hint_height: u16 = if show_hints_row { 1 } else { 0 };
@@ -246,7 +247,11 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
     let tabs_area = chunks[0];
     let main_area = chunks[1];
     let status_area = chunks[2];
-    let hint_area = if hint_height > 0 { Some(chunks[3]) } else { None };
+    let hint_area = if hint_height > 0 {
+        Some(chunks[3])
+    } else {
+        None
+    };
 
     let tab_ranges = render_tabs(frame, tabs_area, app.tab, &palette);
 
@@ -300,7 +305,14 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
             render_content_placeholder(frame, content_area, &app.sidebar.selection(), &palette);
         }
         Tab::Crons => {
-            render_crons(frame, sidebar_area, content_area, &app.crons, app.focus, &palette);
+            render_crons(
+                frame,
+                sidebar_area,
+                content_area,
+                &app.crons,
+                app.focus,
+                &palette,
+            );
         }
     }
 

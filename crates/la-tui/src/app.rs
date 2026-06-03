@@ -570,8 +570,7 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             AppMsg::CycleKeyHints => {
                 self.ui_prefs.key_hints = self.ui_prefs.key_hints.next();
                 self.persist_ui_prefs();
-                self.last_toast =
-                    Some(format!("key hints: {}", self.ui_prefs.key_hints.label()));
+                self.last_toast = Some(format!("key hints: {}", self.ui_prefs.key_hints.label()));
                 None
             }
             AppMsg::ToggleCompact => {

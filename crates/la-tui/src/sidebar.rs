@@ -507,12 +507,9 @@ fn backend_lines(b: &BackendBadge, palette: &Palette) -> Vec<Line<'static>> {
     let body = palette.color(Accent::Body);
 
     let (glyph_color, name_style) = match b.status {
-        BackendHealthStatus::Available => (
-            ok,
-            Style::default()
-                .fg(body)
-                .add_modifier(Modifier::BOLD),
-        ),
+        BackendHealthStatus::Available => {
+            (ok, Style::default().fg(body).add_modifier(Modifier::BOLD))
+        }
         BackendHealthStatus::NotInstalled => (
             muted,
             // Grey + DIM is the canonical "灰态" rendering the PRD asks
@@ -530,12 +527,9 @@ fn backend_lines(b: &BackendBadge, palette: &Palette) -> Vec<Line<'static>> {
                 .fg(muted)
                 .add_modifier(Modifier::DIM | Modifier::BOLD),
         ),
-        BackendHealthStatus::ProtocolDrift => (
-            err,
-            Style::default()
-                .fg(warn)
-                .add_modifier(Modifier::BOLD),
-        ),
+        BackendHealthStatus::ProtocolDrift => {
+            (err, Style::default().fg(warn).add_modifier(Modifier::BOLD))
+        }
         BackendHealthStatus::Error => (
             err,
             Style::default()
@@ -559,9 +553,7 @@ fn backend_lines(b: &BackendBadge, palette: &Palette) -> Vec<Line<'static>> {
         Span::styled(b.display_name.clone(), name_style),
         Span::styled(
             suffix,
-            Style::default()
-                .fg(muted)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(muted).add_modifier(Modifier::DIM),
         ),
     ])];
 

@@ -281,7 +281,9 @@ fn key_hints_hidden_drops_bottom_row() {
         .map(|x| buf[(x, buf.area.height - 1)].symbol().to_string())
         .collect();
     assert!(
-        !last_row.contains("open") && !last_row.contains("delete") && !last_row.contains("all keys"),
+        !last_row.contains("open")
+            && !last_row.contains("delete")
+            && !last_row.contains("all keys"),
         "Hidden mode must drop hint row, but last row carries hints: {last_row:?}"
     );
 
@@ -387,7 +389,12 @@ fn compact_mode_renders_single_color_backend_badges() {
             for x in 0..buf.area.width {
                 let s = buf[(x, y)].symbol();
                 if !s.trim().is_empty() && s != "│" && s != "─" {
-                    glyph_colors.push(buf[(x, y)].style().fg.unwrap_or(ratatui::style::Color::Reset));
+                    glyph_colors.push(
+                        buf[(x, y)]
+                            .style()
+                            .fg
+                            .unwrap_or(ratatui::style::Color::Reset),
+                    );
                     break;
                 }
             }
@@ -486,12 +493,7 @@ fn dark_and_light_themes_actually_diverge_on_real_cells() {
     /// up an identical glyph from a different panel (the `○` for the
     /// status-bar offline dot collides with `RunState::Idle`'s glyph
     /// in the sidebar).
-    fn find_fg_in(
-        buf: &ratatui::buffer::Buffer,
-        needle: &str,
-        y0: u16,
-        y1: u16,
-    ) -> Option<Color> {
+    fn find_fg_in(buf: &ratatui::buffer::Buffer, needle: &str, y0: u16, y1: u16) -> Option<Color> {
         let area = buf.area();
         for y in y0..=y1.min(area.height.saturating_sub(1)) {
             for x in 0..area.width {
@@ -533,12 +535,7 @@ fn dark_and_light_themes_actually_diverge_on_real_cells() {
 
     // 2) Active tab chip background: pre-M4.3 was hardcoded Cyan; now
     //    must be `Accent::Primary` per palette. The tab bar is row 0.
-    fn find_bg_in(
-        buf: &ratatui::buffer::Buffer,
-        needle: &str,
-        y0: u16,
-        y1: u16,
-    ) -> Option<Color> {
+    fn find_bg_in(buf: &ratatui::buffer::Buffer, needle: &str, y0: u16, y1: u16) -> Option<Color> {
         let area = buf.area();
         for y in y0..=y1.min(area.height.saturating_sub(1)) {
             for x in 0..area.width {

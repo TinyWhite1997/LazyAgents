@@ -130,15 +130,18 @@ pub fn save(path: &Path, prefs: &UiPrefs) -> std::io::Result<()> {
         }
     };
 
-    let root = doc
-        .as_table_mut()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "root is not a table"))?;
+    let root = doc.as_table_mut().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "root is not a table")
+    })?;
 
     // Overwrite `[ui]` in place. We rebuild the table from scratch
     // (instead of patching individual keys) so removed-from-schema keys
     // do not linger in old configs forever.
     let mut ui = toml::value::Table::new();
-    ui.insert("theme".into(), toml::Value::String(prefs.theme.label().into()));
+    ui.insert(
+        "theme".into(),
+        toml::Value::String(prefs.theme.label().into()),
+    );
     ui.insert(
         "key_hints".into(),
         toml::Value::String(prefs.key_hints.label().into()),

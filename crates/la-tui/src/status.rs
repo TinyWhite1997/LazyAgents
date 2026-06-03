@@ -90,12 +90,7 @@ pub fn render_status(frame: &mut Frame<'_>, area: Rect, status: &Status) {
 
 /// Like [`render_status`] but with a caller-supplied palette so the
 /// runner can pass the active theme through (WEK-42 / M4.3).
-pub fn render_status_themed(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    status: &Status,
-    palette: &Palette,
-) {
+pub fn render_status_themed(frame: &mut Frame<'_>, area: Rect, status: &Status, palette: &Palette) {
     render_status_at(frame, area, status, Utc::now(), palette)
 }
 

@@ -83,8 +83,11 @@ pub enum KeyHintsMode {
 }
 
 impl KeyHintsMode {
-    pub const ALL: [KeyHintsMode; 3] =
-        [KeyHintsMode::Rich, KeyHintsMode::Compact, KeyHintsMode::Hidden];
+    pub const ALL: [KeyHintsMode; 3] = [
+        KeyHintsMode::Rich,
+        KeyHintsMode::Compact,
+        KeyHintsMode::Hidden,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
