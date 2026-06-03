@@ -20,7 +20,9 @@ use crate::notif_sub::HealthSnapshot;
 use crate::sidebar::{Selection, SidebarState};
 use crate::source::SessionSource;
 use crate::status::{CronPulse, Status};
+use crate::ui_prefs::UiPrefs;
 use la_proto::notifications::CronFiredParams;
+use std::path::PathBuf;
 
 /// Top-level tabs (PRD §5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -214,6 +216,27 @@ pub enum AppMsg {
     CronEditorEnter,
     /// `Esc` from the editor with a draft open — discard it.
     CronCancelDraft,
+
+    // --- UI prefs (WEK-42 / M4.3) -----------------------------------
+    //
+    // Three keystrokes mutate `[ui]` and persist back to config.toml
+    // asynchronously. The App owns the in-memory copy; the runner reads
+    // it each frame to pick a Palette + decide the bottom-row layout.
+    //
+    // We intentionally cycle through fixed enums (`Theme::next()` /
+    // `KeyHintsMode::next()`) rather than offering a chooser modal:
+    // M4.3 acceptance is "切换无闪屏", and a fast in-place cycle is the
+    // least disruptive UX.
+    /// `T` — Auto → Dark → Light → Auto.
+    CycleTheme,
+    /// `H` — Rich → Compact → Hidden → Rich. Distinct from the global
+    /// `?` (which opens the FullHints modal); `H` reshapes the bottom
+    /// row instead.
+    CycleKeyHints,
+    /// `C` — flip the compact layout flag. Compact mode collapses the
+    /// status + hint row into one line and dims backend badges to a
+    /// single colour.
+    ToggleCompact,
 }
 
 /// What the runner should do after a message has been handled.
@@ -246,6 +269,15 @@ pub struct App<S: SessionSource, C: CronSource = crate::crons::MockCronSource> {
     /// changes to save"). The runner is free to ignore it — it exists
     /// to keep tests deterministic without poking at private state.
     pub last_toast: Option<String>,
+    /// Live `[ui]` preferences (WEK-42 / M4.3). Mutated in place by the
+    /// `CycleTheme` / `CycleKeyHints` / `ToggleCompact` handlers; the
+    /// runner reads it each frame to build the [`crate::theme::Palette`]
+    /// and decide the bottom-row layout.
+    pub ui_prefs: UiPrefs,
+    /// Where to persist `ui_prefs` on every mutation. `None` disables
+    /// persistence (default for in-process tests; production wires
+    /// [`crate::ui_prefs::default_config_path`]).
+    pub ui_prefs_path: Option<PathBuf>,
 }
 
 impl<S: SessionSource> App<S, crate::crons::MockCronSource> {
@@ -275,9 +307,21 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             status: Status::default(),
             backends: Vec::new(),
             last_toast: None,
+            ui_prefs: UiPrefs::default(),
+            ui_prefs_path: None,
         };
         app.refresh_sessions();
         app
+    }
+
+    /// Inject the persisted UI prefs and (optionally) the path to write
+    /// future mutations to. The binary calls this once at startup after
+    /// resolving [`crate::ui_prefs::default_config_path`]; tests can
+    /// leave both parameters as defaults and skip persistence entirely.
+    pub fn with_ui_prefs(mut self, prefs: UiPrefs, path: Option<PathBuf>) -> Self {
+        self.ui_prefs = prefs;
+        self.ui_prefs_path = path;
+        self
     }
 
     pub fn source(&self) -> &S {
@@ -452,8 +496,42 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 }
                 self.focus = Focus::Sidebar;
             }
+
+            // --- UI prefs ----------------------------------------------
+            AppMsg::CycleTheme => {
+                self.ui_prefs.theme = self.ui_prefs.theme.next();
+                self.persist_ui_prefs();
+                self.last_toast = Some(format!("theme: {}", self.ui_prefs.theme.label()));
+            }
+            AppMsg::CycleKeyHints => {
+                self.ui_prefs.key_hints = self.ui_prefs.key_hints.next();
+                self.persist_ui_prefs();
+                self.last_toast =
+                    Some(format!("key hints: {}", self.ui_prefs.key_hints.label()));
+            }
+            AppMsg::ToggleCompact => {
+                self.ui_prefs.compact = !self.ui_prefs.compact;
+                self.persist_ui_prefs();
+                self.last_toast = Some(format!(
+                    "compact: {}",
+                    if self.ui_prefs.compact { "on" } else { "off" }
+                ));
+            }
         }
         AppOutcome::Continue
+    }
+
+    /// Write the current `ui_prefs` to `ui_prefs_path` if one is set.
+    /// Failures are downgraded to a toast (the in-memory pref still
+    /// applies for the rest of the session) so a read-only config dir or
+    /// a malformed sibling section doesn't kill the user's keystroke.
+    fn persist_ui_prefs(&mut self) {
+        let Some(path) = self.ui_prefs_path.as_ref() else {
+            return;
+        };
+        if let Err(e) = crate::ui_prefs::save(path, &self.ui_prefs) {
+            self.last_toast = Some(format!("config save failed: {e}"));
+        }
     }
 
     /// Apply a background system notification — daemon health, cron

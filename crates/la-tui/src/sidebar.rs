@@ -394,6 +394,22 @@ pub fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &SidebarState, f
 /// the chosen backend is unavailable (the dispatcher refuses the
 /// `sessions.create` with the right business code).
 pub fn render_backends(frame: &mut Frame<'_>, area: Rect, badges: &[BackendBadge]) {
+    render_backends_with_style(frame, area, badges, false)
+}
+
+/// WEK-42 / M4.3: compact-mode entry point.
+///
+/// Architecture §11.1 acceptance for this issue: "侧栏单色后端徽标"
+/// (sidebar single-colour backend badge). When `compact` is true we
+/// collapse the per-state colour code into one muted glyph and drop the
+/// reason / docs sub-lines so a fleet of 10 backends fits in the same
+/// space as 2-3 verbose ones would in the default layout.
+pub fn render_backends_with_style(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    badges: &[BackendBadge],
+    compact: bool,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Backends")
@@ -410,13 +426,49 @@ pub fn render_backends(frame: &mut Frame<'_>, area: Rect, badges: &[BackendBadge
         return;
     }
 
-    let lines: Vec<ListItem> = badges
-        .iter()
-        .flat_map(|b| backend_lines(b))
-        .map(ListItem::new)
-        .collect();
+    let lines: Vec<ListItem> = if compact {
+        badges
+            .iter()
+            .map(|b| ListItem::new(backend_compact_line(b)))
+            .collect()
+    } else {
+        badges
+            .iter()
+            .flat_map(|b| backend_lines(b))
+            .map(ListItem::new)
+            .collect()
+    };
     let list = List::new(lines).block(block);
     frame.render_widget(list, area);
+}
+
+/// Single-row, monochrome badge — `■ name (status)` or `■ name v1.2.3`.
+/// Status nuance is preserved in the status-label suffix; only the
+/// glyph colour collapses to one neutral tone.
+fn backend_compact_line(b: &BackendBadge) -> Line<'static> {
+    let glyph_color = Color::Gray;
+    let suffix = if b.status == BackendHealthStatus::Available {
+        match &b.version {
+            Some(v) => format!("  v{v}"),
+            None => String::new(),
+        }
+    } else {
+        format!("  ({})", b.status_label())
+    };
+    Line::from(vec![
+        Span::styled(b.glyph().to_string(), Style::default().fg(glyph_color)),
+        Span::raw(" "),
+        Span::styled(
+            b.display_name.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            suffix,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+    ])
 }
 
 /// One or two `Line`s per backend: the primary status row + a wrapped

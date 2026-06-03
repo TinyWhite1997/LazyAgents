@@ -29,12 +29,13 @@ use ratatui::Terminal;
 use crate::app::{App, AppMsg, AppOutcome, Focus, Modal, Tab};
 use crate::crons::{human_label, CronSource, CronsState, EditField};
 use crate::input::{translate, HitBoxes};
-use crate::key_hints::{format_hint_bar, HintRegistry};
+use crate::key_hints::{format_hint_bar, Hint, HintRegistry, Importance};
 use crate::notif_sub::NotifEvent;
 use crate::sidebar::{render_backends, render_sidebar, Selection};
 use crate::source::SessionSource;
-use crate::status::render_status;
+use crate::status::{render_status, render_status_compact};
 use crate::tabs::render_tabs;
+use crate::theme::{Accent, KeyHintsMode, Palette};
 
 /// Back-compat re-export — pre-WEK-36 callers spelled this as
 /// `crate::health_sub::HealthEvent`. New code should use [`NotifEvent`].
@@ -206,21 +207,46 @@ fn derive_next_cron_label(
 pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S, C>) -> HitBoxes {
     let size = frame.area();
 
-    // Vertical stack: tab bar (3 rows incl. border) · main row (rest) · status (2) · hints (1).
+    // WEK-42 / M4.3: bottom row layout depends on `[ui]`.
+    //
+    // | compact | key_hints | rows                                  |
+    // |---------|-----------|---------------------------------------|
+    // |  false  | Rich      | status (2) + hint (1) — pre-M4.3      |
+    // |  false  | Compact   | status (2) + hint (1) — same height,  |
+    // |         |           |   bar truncates to Primary only       |
+    // |  false  | Hidden    | status (2) — hint row dropped         |
+    // |  true   | Rich      | status+hint merged into 1 row         |
+    // |  true   | Compact   | status+hint merged into 1 row         |
+    // |  true   | Hidden    | status (1) — hint dropped, no border  |
+    //
+    // The merged variant repaints with `render_status_with_layout`
+    // (status spans only) and appends a single hint span trail. This
+    // reclaims one full vertical line, which on small terminals is
+    // what makes the conversation pane usable.
+    let palette = Palette::for_theme(app.ui_prefs.theme);
+    let key_hints_mode = app.ui_prefs.key_hints;
+    let compact = app.ui_prefs.compact;
+    let show_hints_row = matches!(key_hints_mode, KeyHintsMode::Rich | KeyHintsMode::Compact) && !compact;
+
+    let status_height: u16 = if compact { 1 } else { 2 };
+    let hint_height: u16 = if show_hints_row { 1 } else { 0 };
+
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
+    constraints.push(Constraint::Length(2)); // tab bar
+    constraints.push(Constraint::Min(5)); // main
+    constraints.push(Constraint::Length(status_height));
+    if hint_height > 0 {
+        constraints.push(Constraint::Length(hint_height));
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // tab bar
-            Constraint::Min(5),    // main area
-            Constraint::Length(2), // status bar
-            Constraint::Length(1), // hint bar
-        ])
+        .constraints(constraints)
         .split(size);
 
     let tabs_area = chunks[0];
     let main_area = chunks[1];
     let status_area = chunks[2];
-    let hint_area = chunks[3];
+    let hint_area = if hint_height > 0 { Some(chunks[3]) } else { None };
 
     let tab_ranges = render_tabs(frame, tabs_area, app.tab);
 
@@ -241,6 +267,9 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
             // of unhealthy backends doesn't crowd the session list.
             let backends_rows = if app.backends.is_empty() {
                 3
+            } else if compact {
+                // Compact: every backend is one row, no reason / docs.
+                (app.backends.len() + 2).clamp(4, 8)
             } else {
                 let raw: usize = app
                     .backends
@@ -254,7 +283,15 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(backends_rows as u16), Constraint::Min(3)])
                 .split(sidebar_area);
-            render_backends(frame, sidebar_split[0], &app.backends);
+            crate::sidebar::render_backends_with_style(
+                frame,
+                sidebar_split[0],
+                &app.backends,
+                compact,
+            );
+            // Suppress unused-import warning when the legacy entry point
+            // isn't called from this code path.
+            let _ = render_backends;
             render_sidebar(
                 frame,
                 sidebar_split[1],
@@ -264,26 +301,66 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
             render_content_placeholder(frame, content_area, &app.sidebar.selection());
         }
         Tab::Crons => {
-            render_crons(frame, sidebar_area, content_area, &app.crons, app.focus);
+            render_crons(frame, sidebar_area, content_area, &app.crons, app.focus, &palette);
         }
     }
 
-    render_status(frame, status_area, &app.status);
-
-    let hints = HintRegistry::for_context(
+    // Hints catalogue for the current context. Computed once and shared
+    // between the inline-into-status path (compact mode) and the
+    // standalone hint row.
+    let hints_full = HintRegistry::for_context(
         app.tab,
         app.focus,
         &app.sidebar.selection(),
         app.modal.clone(),
     );
-    let hint_text = format_hint_bar(&hints, hint_area.width as usize);
-    let hint_para = Paragraph::new(Line::from(Span::styled(
-        hint_text,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::DIM),
-    )));
-    frame.render_widget(hint_para, hint_area);
+    let hints_for_bar: Vec<Hint> = if matches!(key_hints_mode, KeyHintsMode::Compact) {
+        // Compact: keep just the primary action (top of the catalogue)
+        // and meta keys, so users still see `q quit` / `? all keys`.
+        hints_full
+            .iter()
+            .filter(|h| h.importance == Importance::Primary || h.importance == Importance::Meta)
+            .cloned()
+            .collect()
+    } else {
+        hints_full.clone()
+    };
+
+    if compact {
+        // One merged row: status spans + ` ▏ ` + hint bar, both styled
+        // off the palette so theme changes propagate consistently.
+        render_status_compact(frame, status_area, &app.status);
+        if matches!(key_hints_mode, KeyHintsMode::Rich | KeyHintsMode::Compact) {
+            let hint_text = format_hint_bar(&hints_for_bar, (status_area.width / 2) as usize);
+            let inline = Paragraph::new(Line::from(vec![
+                Span::raw("  ▏ "),
+                Span::styled(
+                    hint_text,
+                    Style::default()
+                        .fg(palette.color(Accent::Muted))
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]))
+            .alignment(ratatui::layout::Alignment::Right);
+            // Overlay on the same row as the status bar. ratatui paints
+            // status first; the right-aligned paragraph repaints the
+            // right half. The status renderer left-aligns its content
+            // so the overlap is empty space.
+            frame.render_widget(inline, status_area);
+        }
+    } else {
+        render_status(frame, status_area, &app.status);
+        if let Some(area) = hint_area {
+            let hint_text = format_hint_bar(&hints_for_bar, area.width as usize);
+            let hint_para = Paragraph::new(Line::from(Span::styled(
+                hint_text,
+                Style::default()
+                    .fg(palette.color(Accent::Muted))
+                    .add_modifier(Modifier::DIM),
+            )));
+            frame.render_widget(hint_para, area);
+        }
+    }
 
     if let Some(modal) = &app.modal {
         render_modal(
@@ -293,6 +370,7 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
             &app.sidebar.selection(),
             app.tab,
             app.focus,
+            &palette,
         );
     }
 
@@ -343,6 +421,7 @@ fn render_crons(
     editor_area: Rect,
     state: &CronsState,
     focus: Focus,
+    _palette: &Palette,
 ) {
     render_crons_list(frame, list_area, state, focus == Focus::Sidebar);
     render_crons_editor(frame, editor_area, state, focus == Focus::Main);
@@ -533,6 +612,7 @@ fn render_modal(
     selection: &Selection,
     tab: Tab,
     focus: Focus,
+    _palette: &Palette,
 ) {
     match modal {
         Modal::ConfirmDelete { session_id } => {

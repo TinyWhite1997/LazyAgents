@@ -86,9 +86,39 @@ pub fn render_status(frame: &mut Frame<'_>, area: Rect, status: &Status) {
     render_status_at(frame, area, status, Utc::now())
 }
 
+/// WEK-42 / M4.3: compact-mode entry point.
+///
+/// The default [`render_status`] paints a `Borders::TOP` separator on
+/// the first row of its area — that's correct when the bar owns two
+/// rows (separator + content) but eats the content row when the runner
+/// shrinks the area to one line for compact mode. The compact variant
+/// drops the border entirely so the single row carries the spans
+/// themselves.
+pub fn render_status_compact(frame: &mut Frame<'_>, area: Rect, status: &Status) {
+    render_status_compact_at(frame, area, status, Utc::now())
+}
+
+pub fn render_status_compact_at(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    status: &Status,
+    now: DateTime<Utc>,
+) {
+    let spans = status_spans(status, now);
+    let para = Paragraph::new(Line::from(spans));
+    frame.render_widget(para, area);
+}
+
 /// Like [`render_status`] but with a caller-supplied `now`. Lets tests
 /// pin the pulse-decay deterministically.
 pub fn render_status_at(frame: &mut Frame<'_>, area: Rect, status: &Status, now: DateTime<Utc>) {
+    let spans = status_spans(status, now);
+    let para = Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::TOP));
+    frame.render_widget(para, area);
+}
+
+/// Shared span builder used by the two- and one-row renderers.
+fn status_spans<'a>(status: &Status, now: DateTime<Utc>) -> Vec<Span<'a>> {
     let mut left: Vec<Span<'_>> = Vec::with_capacity(16);
 
     // ● daemon  (green) / ○ daemon  (red).
@@ -138,9 +168,7 @@ pub fn render_status_at(frame: &mut Frame<'_>, area: Rect, status: &Status, now:
     // grabber and benefits from a stable position.
     push_sep(&mut left);
     left.push(errors_badge(status.errors_last_5m));
-
-    let para = Paragraph::new(Line::from(left)).block(Block::default().borders(Borders::TOP));
-    frame.render_widget(para, area);
+    left
 }
 
 fn push_sep<'a>(spans: &mut Vec<Span<'a>>) {

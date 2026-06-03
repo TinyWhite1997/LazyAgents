@@ -106,6 +106,13 @@ fn translate_key(
         KeyCode::Char('f') => AppMsg::OpenErrors,
         KeyCode::Esc => AppMsg::Cancel,
 
+        // WEK-42 / M4.3: uppercase UI-pref cycles. Capitals chosen so
+        // they don't shadow the lowercase Sessions actions (`d`, `n`)
+        // and feel discoverable as "shift = global preference toggle".
+        KeyCode::Char('T') => AppMsg::CycleTheme,
+        KeyCode::Char('H') => AppMsg::CycleKeyHints,
+        KeyCode::Char('C') => AppMsg::ToggleCompact,
+
         // Ctrl-C is treated as Quit so muscle memory works even when the
         // modal swallows everything else.
         KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => AppMsg::Quit,
@@ -174,7 +181,7 @@ fn translate_crons_key(code: KeyCode, mods: KeyModifiers, focus: Focus) -> Optio
 }
 
 /// The minimum global set every context honours: quit / help / tab
-/// switch. Used as a fallback when the active-tab translator declined.
+/// switch / UI prefs.
 fn translate_globals(code: KeyCode, mods: KeyModifiers) -> Option<AppMsg> {
     Some(match code {
         KeyCode::Char('q') => AppMsg::Quit,
@@ -184,6 +191,13 @@ fn translate_globals(code: KeyCode, mods: KeyModifiers) -> Option<AppMsg> {
         KeyCode::Char('1') => AppMsg::SetTab(Tab::Sessions),
         KeyCode::Char('2') => AppMsg::SetTab(Tab::Crons),
         KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => AppMsg::Quit,
+        // WEK-42 / M4.3: uppercase T/H/C are the only chord-free
+        // globals not already claimed by the Sessions / Crons tabs.
+        // Lowercase t/h/c would collide with vim-style navigation
+        // (`h` = fold, `t` is reserved for future inline filter).
+        KeyCode::Char('T') => AppMsg::CycleTheme,
+        KeyCode::Char('H') => AppMsg::CycleKeyHints,
+        KeyCode::Char('C') => AppMsg::ToggleCompact,
         _ => return None,
     })
 }

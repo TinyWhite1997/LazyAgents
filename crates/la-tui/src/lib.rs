@@ -66,7 +66,9 @@ pub mod sidebar;
 pub mod source;
 pub mod status;
 pub mod tabs;
+pub mod theme;
 pub mod transcript;
+pub mod ui_prefs;
 pub mod update_check;
 pub mod vte_term;
 
@@ -82,5 +84,7 @@ pub use model::{Backend, BackendBadge, ProjectGroup, RunState, SessionRow};
 pub use notif_sub::{HealthEvent, HealthSnapshot, NotifEvent};
 pub use source::{MockSessionSource, SessionSource};
 pub use status::{CronPulse, Status};
+pub use theme::{Accent, KeyHintsMode, Palette, Theme};
 pub use transcript::{ScrollAction, Transcript, TranscriptView};
+pub use ui_prefs::UiPrefs;
 pub use vte_term::{StyledCell, TerminalLine, TerminalScreen};

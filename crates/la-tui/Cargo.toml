@@ -41,6 +41,11 @@ chrono-tz = { workspace = true }
 # runtime into the call path. Stick to rustls (no native-tls / OpenSSL)
 # so musl + windows builds don't have to link a system TLS lib.
 ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
+# WEK-42 / M4.3: persist `[ui]` (theme / key_hints / compact) into
+# `$XDG_CONFIG_HOME/lazyagents/config.toml`. Architecture §11.1 designates
+# the file as the source of truth; the la-tui copy keys it semantically
+# rather than going through la-storage so the §2.1 dep rule still holds.
+toml = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
