@@ -431,6 +431,33 @@ done
         String::from_utf8_lossy(&ready)
     );
 
+    // WEK-70 readiness fence: `ready-from-shtest` is printed BEFORE the
+    // shell enters its `read` loop. Without a probe, `hello-m1` can land
+    // on the PTY master while the shell is still between `printf` and
+    // the first `read` — the byte is buffered by the line discipline,
+    // but if the shell hasn't installed its `read` yet, the `IFS= read`
+    // can swallow it as part of the same line as the next write, or
+    // (under burst) miss the carriage return entirely. Send a known
+    // nonce first and wait for its echo: once we see `echo:SYNCFENCE-N`
+    // the loop is demonstrably iterating and the next write is safe.
+    let fence = format!("SYNCFENCE-{}", session_id);
+    let fence_probe = format!("{fence}\r");
+    let _: SessionsWriteResult = call(
+        &mut conn,
+        100,
+        "sessions.write",
+        &SessionsWriteParams::try_from_bytes(session_id.clone(), fence_probe.as_bytes()).unwrap(),
+    )
+    .await;
+    let fence_needle = format!("echo:{fence}");
+    let fenced =
+        drain_output_until(&mut conn, fence_needle.as_bytes(), Duration::from_secs(5)).await;
+    assert!(
+        contains(&fenced, fence_needle.as_bytes()),
+        "readiness fence echo never observed; got {:?}",
+        String::from_utf8_lossy(&fenced)
+    );
+
     let _: SessionsWriteResult = call(
         &mut conn,
         3,
