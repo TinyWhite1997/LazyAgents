@@ -1823,18 +1823,8 @@ mod archive_unit_tests {
 
         let outcome = storage.runs().archive_older_than_days(90).await.unwrap();
         assert_eq!(outcome.archived_rows, 0);
-        assert!(storage
-            .runs()
-            .get("running-old")
-            .await
-            .unwrap()
-            .is_some());
-        assert!(storage
-            .runs()
-            .get("pending-old")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(storage.runs().get("running-old").await.unwrap().is_some());
+        assert!(storage.runs().get("pending-old").await.unwrap().is_some());
     }
 
     /// Rev2 §S5: if the fsync (or any pre-commit step) fails, the

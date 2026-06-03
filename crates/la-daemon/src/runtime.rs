@@ -16,9 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{
-    DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc,
-};
+use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
 use la_adapter::AgentAdapter;
 use la_core::{ManagerConfig, SessionManager, WorktreeManager};
 use la_ipc::transport::{Endpoint, Listener};
@@ -709,12 +707,9 @@ where
 {
     let local_now = now.with_timezone(tz);
     let local_date = local_now.date_naive();
-    let target_time = NaiveTime::from_hms_opt(
-        RUNS_ARCHIVE_LOCAL_HOUR,
-        RUNS_ARCHIVE_LOCAL_MINUTE,
-        0,
-    )
-    .expect("hard-coded HH:MM is valid");
+    let target_time =
+        NaiveTime::from_hms_opt(RUNS_ARCHIVE_LOCAL_HOUR, RUNS_ARCHIVE_LOCAL_MINUTE, 0)
+            .expect("hard-coded HH:MM is valid");
 
     // Search forward day-by-day until we land on a local instant that is
     // strictly later than `local_now`. Limited to a bounded number of
@@ -933,14 +928,12 @@ mod tests {
     fn delay_realigns_to_next_local_0317_at_fixed_offset() {
         // 03:00 UTC at UTC+0 → 17 minutes to next local 03:17.
         let tz = FixedOffset::east_opt(0).unwrap();
-        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 3, 0, 0)
-            .unwrap();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 3, 0, 0).unwrap();
         let delay = delay_until_next_local_archive_fire(&tz, now);
         assert_eq!(delay, Duration::from_secs(17 * 60));
 
         // 03:17 UTC at UTC+0 → next fire is tomorrow.
-        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 3, 17, 0)
-            .unwrap();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 3, 17, 0).unwrap();
         let delay = delay_until_next_local_archive_fire(&tz, now);
         // Must be > 23h (next day's 03:17). Generous bound — 24h ± 1s.
         assert!(delay >= Duration::from_secs(24 * 60 * 60));
@@ -949,8 +942,7 @@ mod tests {
         // 03:00 UTC at UTC+9 → local is 12:00 same day → next 03:17 local
         // is tomorrow 03:17 +09:00 = today 18:17 UTC.
         let tz = FixedOffset::east_opt(9 * 3600).unwrap();
-        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 3, 0, 0)
-            .unwrap();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 3, 0, 0).unwrap();
         let delay = delay_until_next_local_archive_fire(&tz, now);
         assert_eq!(delay, Duration::from_secs(15 * 3600 + 17 * 60));
     }
@@ -1004,8 +996,7 @@ mod tests {
         // One second after that fire. Next fire should be tomorrow's
         // 03:17 PST, which is ~24h away (the day after DST is a
         // normal-length PST day).
-        let after_fire =
-            chrono::TimeZone::with_ymd_and_hms(&Utc, 2025, 11, 2, 11, 17, 1).unwrap();
+        let after_fire = chrono::TimeZone::with_ymd_and_hms(&Utc, 2025, 11, 2, 11, 17, 1).unwrap();
         assert_lands_on_local_0317(after_fire);
     }
 }
