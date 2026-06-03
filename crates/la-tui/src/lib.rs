@@ -67,6 +67,7 @@ pub mod source;
 pub mod status;
 pub mod tabs;
 pub mod transcript;
+pub mod update_check;
 pub mod vte_term;
 
 pub use app::{App, AppMsg, Focus, Tab};

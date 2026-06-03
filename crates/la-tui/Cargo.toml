@@ -36,6 +36,11 @@ tracing-subscriber = { workspace = true }
 cron = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+# WEK-41 / M4.2: `la --check-update` 同步拉 GitHub Releases manifest.
+# ureq is the smallest blocking HTTPS client that doesn't pull tokio's
+# runtime into the call path. Stick to rustls (no native-tls / OpenSSL)
+# so musl + windows builds don't have to link a system TLS lib.
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

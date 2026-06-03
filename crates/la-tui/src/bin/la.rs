@@ -11,6 +11,22 @@
 //!
 //! Disable the auto-spawn with `LAZYAGENTS_NO_AUTODAEMON=1` — useful for
 //! tests that want the "no daemon" fallback explicitly.
+//!
+//! ## CLI surface
+//!
+//! Intentionally minimal — `la` is a TUI, not a CLI. Three top-level
+//! flags only:
+//!   * `--version` / `-V` — print the compiled version and exit
+//!   * `--check-update` — pull the latest GitHub Release manifest,
+//!     compare against the running binary, print result, exit. Never
+//!     auto-installs (WEK-41 acceptance "默认不自动升级"). See
+//!     [`la_tui::update_check`] for the policy details.
+//!   * `--help` / `-h` — print the flag summary and exit
+//!
+//! Anything beyond these three drops through to the normal TUI startup
+//! path. We hand-roll the parser so the binary doesn't pull `clap` into
+//! release builds — keeps the size budget honest for the < 30 MiB
+//! acceptance line.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,18 +36,96 @@ use std::time::{Duration, Instant};
 use la_ipc::transport::{connect, Endpoint};
 use la_ipc::SocketDiscovery;
 use la_tui::status::Status;
+use la_tui::update_check;
 use la_tui::{App, AppMsg, MockSessionSource};
 use tokio::runtime::Runtime;
 
 const AUTO_DAEMON_ENV: &str = "LAZYAGENTS_NO_AUTODAEMON";
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Parse result for the top-level CLI flags. Anything other than
+/// [`CliAction::RunTui`] short-circuits the TUI startup path.
+enum CliAction {
+    RunTui,
+    PrintVersion,
+    CheckUpdate,
+    PrintHelp,
+    /// `--flag-name` was unknown. Surface it as exit 2 so wrapper
+    /// scripts (`la --check-updates` typo etc.) fail fast.
+    Unknown(String),
+}
+
+fn parse_cli() -> CliAction {
+    let mut args = std::env::args().skip(1);
+    // We only honor the FIRST recognized flag — chaining `--version
+    // --check-update` is undefined and not worth the complexity.
+    match args.next().as_deref() {
+        None => CliAction::RunTui,
+        Some("--version" | "-V") => CliAction::PrintVersion,
+        Some("--check-update") => CliAction::CheckUpdate,
+        Some("--help" | "-h") => CliAction::PrintHelp,
+        Some(other) if other.starts_with('-') => CliAction::Unknown(other.to_string()),
+        // Positional args are reserved for future subcommands (e.g.
+        // `la attach <session>`); for now drop straight into the TUI.
+        Some(_) => CliAction::RunTui,
+    }
+}
+
+fn print_help() {
+    let bin = env!("CARGO_PKG_NAME");
+    let version = env!("CARGO_PKG_VERSION");
+    println!("{bin} {version} — LazyAgents TUI client");
+    println!();
+    println!("USAGE:");
+    println!("  la                 launch the TUI (spawns `lad` if not running)");
+    println!("  la --version       print version and exit");
+    println!("  la --check-update  check GitHub for a newer release and exit");
+    println!("  la --help          print this message");
+    println!();
+    println!("ENV:");
+    println!("  LAZYAGENTS_NO_AUTODAEMON=1   skip auto-spawning `lad daemonize`");
+    println!("  LAZYAGENTS_UPDATE_MANIFEST_URL  override the --check-update endpoint");
+}
+
 fn main() -> ExitCode {
-    if let Err(e) = real_main() {
-        eprintln!("la: {e}");
+    match parse_cli() {
+        CliAction::RunTui => {
+            if let Err(e) = real_main() {
+                eprintln!("la: {e}");
+                return ExitCode::from(1);
+            }
+            ExitCode::SUCCESS
+        }
+        CliAction::PrintVersion => {
+            println!("la {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        CliAction::PrintHelp => {
+            print_help();
+            ExitCode::SUCCESS
+        }
+        CliAction::CheckUpdate => run_check_update(),
+        CliAction::Unknown(flag) => {
+            eprintln!("la: unknown flag `{flag}`. See `la --help`.");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_check_update() -> ExitCode {
+    let outcome = update_check::check_for_update();
+    // Errors go to stderr (non-fatal); successful results go to stdout.
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    let render_result = match &outcome {
+        update_check::CheckOutcome::Unavailable(_) => update_check::render(&outcome, &mut stderr),
+        _ => update_check::render(&outcome, &mut stdout),
+    };
+    if let Err(e) = render_result {
+        eprintln!("la: write check-update result: {e}");
         return ExitCode::from(1);
     }
-    ExitCode::SUCCESS
+    ExitCode::from(update_check::exit_code(&outcome))
 }
 
 fn real_main() -> io::Result<()> {
