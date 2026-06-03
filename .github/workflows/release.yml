@@ -166,15 +166,21 @@ jobs:
       # to `cosign sign-blob` on every release artifact). Replaces the
       # task spec's "cosign 二进制签名" item with GitHub's first-party
       # sigstore-backed attestation flow — same trust root, less infra.
+      #
+      # The binary globs are deliberately exhaustive instead of
+      # `artifacts/**/la*` because `la*` would also pick up `lad`, and
+      # double-attesting the same blob just burns Rekor log entries
+      # without adding signal. List each filename explicitly.
       - name: sigstore attest-build-provenance
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             artifacts/**/*.tar.xz
             artifacts/**/*.zip
-            artifacts/**/lad*
             artifacts/**/la
             artifacts/**/la.exe
+            artifacts/**/lad
+            artifacts/**/lad.exe
             artifacts/**/*.sh
             artifacts/**/*.ps1
 

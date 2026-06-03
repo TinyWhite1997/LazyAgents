@@ -38,8 +38,14 @@ panic = "abort"
 # Config for 'dist' (formerly cargo-dist).
 #
 # Acceptance (WEK-41):
-#   • 6-platform release artifact (linux x64/arm64, macos arm64/x64, windows
-#     x64) — see `targets` below
+# Acceptance (WEK-41):
+#   • 5-platform release artifact (linux x64/arm64, macos arm64/x64,
+#     windows x64) — see `targets` below. The task spec called these
+#     "6 platforms" but x64+arm64×{linux,macos} + windows x64 is 5;
+#     `aarch64-pc-windows-msvc` (Windows ARM) is intentionally OUT of
+#     scope for v1 because no contributor runs it for daily dogfood
+#     and GitHub's Windows ARM runners are still preview. Revisit at
+#     M5 if user demand surfaces.
 #   • tar/zip + install.sh — `shell` + `powershell` + `homebrew` installers
 #     emit the platform-correct archive + bootstrapper
 #   • cosign-equivalent binary signing — GitHub Artifact Attestations
@@ -69,7 +75,9 @@ panic = "abort"
 cargo-dist-version = "0.32.0"
 ci = "github"
 installers = ["shell", "powershell", "homebrew"]
-# Six v1 release targets per task spec.
+# Five v1 release targets per task spec (originally written as "6
+# platforms" but x64+arm64×{linux,macos} + windows x64 = 5; Windows
+# ARM excluded — see acceptance comment above).
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",

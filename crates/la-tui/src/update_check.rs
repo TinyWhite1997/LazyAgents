@@ -171,6 +171,17 @@ fn is_newer(candidate: &str, current: &str) -> bool {
 /// Returns `(major, minor, patch, has_no_prerelease)`. The fourth tuple
 /// element flips a release ahead of any `-rc` / `-pre` at the same
 /// numeric version.
+///
+/// **Assumption**: all `-rc` / `-pre` / `-beta` tagged releases on
+/// GitHub are also marked `prerelease: true` in their manifest. If they
+/// are (the normal case), [`check_with_url`] short-circuits prereleases
+/// before reaching this function, so the suffix collapse below never
+/// runs against a "promoted" release. If a maintainer ever publishes a
+/// `0.2.0-rc.2` release with `prerelease: false` by mistake, this
+/// function will treat it as equal to `0.2.0-rc.1` (suffix vs suffix,
+/// both rank below `0.2.0`) and may fail to advertise the upgrade — the
+/// fix is to re-tag with `prerelease: true` upstream, not to make this
+/// comparison cleverer.
 fn parse_version(v: &str) -> Option<(u64, u64, u64, bool)> {
     let (numeric, suffix) = match v.split_once('-') {
         Some((n, s)) => (n, Some(s)),
