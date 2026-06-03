@@ -95,9 +95,9 @@ No, not in v1. `sessions.delete` removes the row and CASCADEs the `session_chunk
 
 If you don't need any of that, classic `cron` + a shell script is simpler.
 
-### Why does enabling a cron require two clicks?
+### What protects a freshly-saved cron from going live by accident?
 
-Anti-footgun. The first call returns a 5-minute confirmation token + a summary (next 5 fire times, daily run estimate, budget impact); the second presents the token. Editing any sensitive field (backend, schedule, prompt, args, budget) **auto-disables** and invalidates pending tokens. The TUI hides the round-trip behind a single `Space` press, but the gate prevents a malicious edit from going from save → live behind your back.
+`crons.upsert` always lands a cron disabled — you have to call `crons.set_enabled { cron_id, enabled: true }` to turn it on. Editing any sensitive field afterwards (backend, schedule, prompt, args, budget — see `SENSITIVE_CRON_FIELDS` in `crates/la-daemon/src/cron_security.rs`) **auto-disables** it again, forcing another `set_enabled` before the next fire. The daemon also has a confirmation-token + summary helper (5-minute TTL, single-use) intended to add a two-step gate on `set_enabled`; it lives in `cron_security` but is not yet wired into the RPC surface in v1. Plan accordingly when scripting against `crons.*`.
 
 ### Can I put credentials in a cron prompt?
 

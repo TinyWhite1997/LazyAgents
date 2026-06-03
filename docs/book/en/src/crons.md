@@ -45,7 +45,7 @@ The full rationale is in [ADR-0002](https://github.com/TinyWhite1997/LazyAgents/
 }}
 ```
 
-Then a two-step enable: a first `crons.set_enabled` returns a 5-minute confirmation token + summary, and a second call with the token actually flips it on. See [Enabling a cron is a two-step gate](#enabling-a-cron-is-a-two-step-gate) below.
+Then enable it with `crons.set_enabled { cron_id, enabled: true }`. See [Enabling a cron](#enabling-a-cron) below for the wire shape and the v1 protections that actually run today (auto-disable on sensitive edits + 64 KiB prompt cap).
 
 ### TUI editor (M3.5 wiring, today mock-backed)
 
@@ -70,7 +70,7 @@ In the TUI you switch to the **Crons** tab and press **`n`** to open the editor.
 | `j` / `k` / `↓` / `↑` | Move cursor | Same |
 | `n` | New cron draft | Same; save will call `crons.upsert` |
 | `e` / `i` / `Enter` | Edit the highlighted cron | Same |
-| `Space` | Toggle local enabled flag | `crons.set_enabled` two-step gate |
+| `Space` | Toggle local enabled flag | `crons.set_enabled` (single call in v1; token-gated when the security helper is wired through) |
 | `r` | Mock `trigger_now` | `crons.run_now` |
 | `R` | Local dry-run preview | `crons.dry_run` |
 | `d` | Delete from mock | `crons.delete` (with confirmation modal) |
@@ -79,11 +79,25 @@ In the TUI you switch to the **Crons** tab and press **`n`** to open the editor.
 
 Until M3.5 lands, **don't rely on the TUI to schedule real work** — anything you do here is local-only and disappears when you quit `la`.
 
-## Enabling a cron is a two-step gate
+## Enabling a cron
 
-Crons don't become enabled on save — you have to explicitly enable them. The first call to `crons.set_enabled` returns a confirmation token and a summary (next 5 fire times, daily run estimate, budget check). The second call must present that token within 5 minutes. This is by design: changing any sensitive field (backend, args, prompt, schedule, timezone, runtime limits, budget) **auto-disables** the cron and invalidates pending tokens, so a malicious edit can't go from save → live without your confirmation.
+Crons don't become enabled on save — `crons.upsert` always lands them disabled. To enable one in v1, send a single `crons.set_enabled`:
 
-Once M3.5 wires the TUI to the live source, pressing `Space` and confirming will perform that round-trip transparently. In v1 you do the two calls yourself over the socket.
+```json
+{"jsonrpc":"2.0","id":3,"method":"crons.set_enabled","params":{
+  "cron_id": "<the id returned by upsert>",
+  "enabled": true
+}}
+```
+
+The wire params are just `{cron_id, enabled}`; the response carries the updated cron row. There is **no token round-trip exposed on the RPC surface in v1** — the daemon's `cron_security` module has a confirmation-token + summary helper (5-minute TTL, single-use, invalidated by any sensitive-field edit) intended to gate `set_enabled`, but it is not yet wired into the proto or dispatcher. Treat that as planned hardening, not a current user-facing API.
+
+What v1 *does* enforce today:
+
+- **Auto-disable on sensitive edits.** Changing backend, args, prompt, schedule, timezone, runtime limits, max-per-day, or daily budget bumps the cron back to `enabled = false`, so any next-run after a sensitive change requires you to call `set_enabled` again. The "sensitive" allowlist matches `SENSITIVE_CRON_FIELDS` in `crates/la-daemon/src/cron_security.rs`.
+- **Prompt is hard-capped at 64 KiB** at the IPC boundary (`MAX_PROMPT_BYTES`). Larger prompts are rejected before they hit the scheduler.
+
+Once the token gate ships, a `set_enabled` call will hand back a confirmation token + summary and a follow-up call with the token will flip the bit. Until then, the v1 protection is the auto-disable behaviour plus the sensitive-field allowlist — keep that in mind when scripting against `crons.*`.
 
 ## What fires when the cron triggers
 
