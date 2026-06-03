@@ -243,12 +243,14 @@ async fn probe_once_and_broadcast(cfg: &ProbeLoopConfig) {
     }
     wire_entries.sort_by(|a, b| a.id.cmp(&b.id));
 
+    let running = cfg.manager.active_count().await as u32;
+    metrics::gauge!("lad_session_active").set(running as f64);
     let params = DaemonHealthParams {
         // M3 will populate this when the scheduler lands; until then we
         // honestly report zero. Keeping the field on the wire shape
         // stable matters more than guessing a placeholder.
         queue_depth: 0,
-        running: cfg.manager.active_count().await as u32,
+        running,
         // Treat any non-Available probe in *this* round as a counted
         // error; the value is "errors observed in the last 5m" per the
         // existing field doc, but absent a real metric pipeline the

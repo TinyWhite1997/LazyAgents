@@ -7,6 +7,7 @@ members = [
     "crates/la-adapter",
     "crates/la-storage",
     "crates/la-scheduler",
+    "crates/la-observ",
     "crates/la-core",
     "crates/la-daemon",
     "crates/la-tui",
@@ -112,7 +113,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 portable-pty = "0.8"
 thiserror = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 schemars = { version = "0.8", features = ["preserve_order"] }

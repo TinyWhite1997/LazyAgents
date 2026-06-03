@@ -25,7 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use la_adapter::{AdapterDescriptor, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec};
-use la_daemon::{Daemon, DaemonConfig, SocketDiscovery};
+use la_daemon::{metrics_socket_path, Daemon, DaemonConfig, SocketDiscovery};
 use la_ipc::transport::{connect, Endpoint};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
@@ -153,6 +153,28 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
         storage: Some(storage),
         _tempdir: tempdir,
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn metrics_socket_uses_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let daemon = bootstrap_daemon("sleep 1").await;
+    let metrics_socket = metrics_socket_path(&daemon.socket);
+    let mode = std::fs::metadata(&metrics_socket)
+        .expect("metrics socket metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(
+        mode, 0o600,
+        "metrics socket must match the main IPC socket security boundary",
+    );
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
 
 async fn client(socket: &std::path::Path) -> Connection<tokio::net::UnixStream> {

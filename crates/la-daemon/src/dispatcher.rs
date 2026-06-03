@@ -53,6 +53,7 @@ use la_proto::PROTOCOL_VERSION;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinSet;
+use tracing::Instrument;
 
 /// Shared per-process state handed to every connection. Wraps the
 /// [`SessionManager`], the adapter registry, and a clone-cheap notifier
@@ -346,7 +347,13 @@ async fn collect_new_subs(
 async fn drain_subscription(_id: SessionId, mut sub: Subscription, send: Arc<dyn MessageSink>) {
     while let Some(event) = sub.recv().await {
         let result = match event {
-            HubEvent::Output(p) => Notification::new(SessionOutput::NAME, &*p),
+            HubEvent::Output(p) => {
+                if let Ok(bytes) = p.data_bytes() {
+                    metrics::counter!("lad_session_output_bytes_total")
+                        .increment(bytes.len() as u64);
+                }
+                Notification::new(SessionOutput::NAME, &*p)
+            }
             HubEvent::Gap(p) => Notification::new(SessionGap::NAME, &p),
         };
         match result {
@@ -379,7 +386,16 @@ async fn deliver_bus_event(state: &ConnState, event: BusEvent) {
         BusEvent::WorktreeCommitCreated(p) if topics.worktree_commit => {
             Notification::new(WorktreeCommitCreated::NAME, &p)
         }
-        BusEvent::CronFired(p) if topics.cron_fired => Notification::new(CronFired::NAME, &p),
+        BusEvent::CronFired(p) if topics.cron_fired => {
+            tracing::info!(
+                trace_id = %la_observ::new_trace_id(),
+                cron_id = %p.cron_id,
+                run_id = %p.run_id,
+                status = %p.status,
+                "cron fired notification delivered",
+            );
+            Notification::new(CronFired::NAME, &p)
+        }
         _ => return,
     };
     match notification {
@@ -395,7 +411,16 @@ async fn deliver_bus_event(state: &ConnState, event: BusEvent) {
 async fn handle_request(req: Request, state: &ConnState, ctx: &ConnectionContext) -> Response {
     let id = req.id.clone();
     let method = req.method.clone();
-    let result = dispatch(req, state, ctx).await;
+    let trace_id = la_observ::new_trace_id();
+    let span = tracing::info_span!("rpc", trace_id = %trace_id, method = %method);
+    let result = dispatch(req, state, ctx).instrument(span).await;
+    let result_label = if result.is_ok() { "ok" } else { "error" };
+    metrics::counter!(
+        "lad_rpc_requests_total",
+        "method" => method.clone(),
+        "result" => result_label,
+    )
+    .increment(1);
     match result {
         Ok(value) => Response {
             jsonrpc: la_proto::jsonrpc::Version,
@@ -726,11 +751,14 @@ async fn handle_sessions_create(
         None
     };
 
+    let spawn_started = std::time::Instant::now();
     let spawned = state
         .manager
         .spawn_with_options(&*adapter, project_id, req, worktree_opts)
         .await
         .map_err(core_to_rpc)?;
+    metrics::histogram!("lad_pty_spawn_duration_seconds")
+        .record(spawn_started.elapsed().as_secs_f64());
 
     let initial_pty = ProtoPtySize {
         rows: 32,

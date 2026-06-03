@@ -6,8 +6,8 @@
 //!   exits cleanly on SIGINT/SIGTERM.
 //! - `lad daemonize` — fork-and-setsid into a detached `start`; waits for
 //!   the socket to appear before exiting 0.
-//! - `lad metrics` — placeholder (post-M1; prints a stub for now so
-//!   `lad --help` lists it).
+//! - `lad metrics` — scrape the active daemon's Prometheus text metrics
+//!   over a local Unix-domain socket.
 //! - `lad doctor` — prints the resolved socket path + state dir and
 //!   reports whether a daemon is already alive.
 //! - `lad backup --output <path>` — writes a consistent SQLite snapshot.
@@ -17,15 +17,17 @@
 //! the binary at all.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use la_adapter::{
     claude::ClaudeAdapter, codex::CodexAdapter, opencode::OpencodeAdapter, AgentAdapter,
+    ProbeResult,
 };
 #[cfg(debug_assertions)]
-use la_adapter::{AdapterDescriptor, ProbeResult, SpawnRequest, SpawnSpec};
+use la_adapter::{AdapterDescriptor, SpawnRequest, SpawnSpec};
 use la_daemon::paths::{ensure_runtime_dir, SocketDiscovery, SocketLocation};
 use la_daemon::{
     spawn_daemonized, Daemon, DaemonConfig, DaemonError, DaemonizeError, SERVER_VERSION,
@@ -40,7 +42,7 @@ USAGE:
 COMMANDS:
     start              Run the daemon in the foreground.
     daemonize          Fork into a detached background process.
-    metrics            (stub) Print the active daemon's metrics.
+    metrics            Print the active daemon's Prometheus text metrics.
     doctor             Diagnose socket / state paths and reachability.
     backup             Write a consistent SQLite snapshot to --output <path>.
 
@@ -167,14 +169,10 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
     })
 }
 
-fn init_tracing(level: &str) {
-    let filter = tracing_subscriber::EnvFilter::try_new(level)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init();
+fn init_observability(level: &str, state_dir: &std::path::Path) {
+    la_observ::init_json_tracing(level);
+    la_observ::install_metrics_recorder();
+    la_observ::install_crash_reporter(state_dir.join("crashes"));
 }
 
 fn run(p: Parsed) -> ExitCode {
@@ -189,10 +187,24 @@ fn run(p: Parsed) -> ExitCode {
                 .state_dir_override
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
+            let metrics_socket = la_daemon::metrics_socket_path(&loc.socket_path);
             println!("socket path:    {}", loc.socket_path.display());
+            println!("metrics socket: {}", metrics_socket.display());
             println!("runtime dir:    {}", loc.runtime_dir.display());
             println!("state dir:      {}", state_dir.display());
             println!("server version: {SERVER_VERSION}");
+            println!(
+                "runtime writable: {}",
+                check_writable_dir(&loc.runtime_dir)
+                    .map(|_| "ok".to_string())
+                    .unwrap_or_else(|e| format!("failed ({e})"))
+            );
+            println!(
+                "state writable:   {}",
+                check_writable_dir(&state_dir)
+                    .map(|_| "ok".to_string())
+                    .unwrap_or_else(|e| format!("failed ({e})"))
+            );
             #[cfg(unix)]
             {
                 use std::os::unix::net::UnixStream;
@@ -201,6 +213,10 @@ fn run(p: Parsed) -> ExitCode {
                     Err(_) => println!("status:         no daemon listening"),
                 }
             }
+            println!("adapters:");
+            for (id, result) in probe_adapters() {
+                println!("  {id}: {}", render_probe(&result));
+            }
             ExitCode::SUCCESS
         }
         Command::Backup { output } => {
@@ -208,7 +224,11 @@ fn run(p: Parsed) -> ExitCode {
                 eprintln!("lad: backup requires --output <path>");
                 return ExitCode::from(2);
             }
-            init_tracing(&p.log_level);
+            let state_dir = p
+                .state_dir_override
+                .clone()
+                .unwrap_or_else(la_daemon::default_state_dir);
+            init_observability(&p.log_level, &state_dir);
             match run_backup(p.state_dir_override, output) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -218,11 +238,24 @@ fn run(p: Parsed) -> ExitCode {
             }
         }
         Command::Metrics => {
-            eprintln!("lad metrics: not yet implemented (tracked under M3 observability work).");
-            ExitCode::from(3)
+            let loc = resolve_socket(&p.socket_override);
+            match scrape_metrics(&loc.socket_path) {
+                Ok(text) => {
+                    print!("{text}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("lad metrics: {err}");
+                    ExitCode::from(1)
+                }
+            }
         }
         Command::Daemonize => {
-            init_tracing(&p.log_level);
+            let state_dir = p
+                .state_dir_override
+                .clone()
+                .unwrap_or_else(la_daemon::default_state_dir);
+            init_observability(&p.log_level, &state_dir);
             let loc = resolve_socket(&p.socket_override);
             if let Err(err) = ensure_runtime_dir(&loc.runtime_dir) {
                 eprintln!(
@@ -280,7 +313,11 @@ fn run(p: Parsed) -> ExitCode {
             }
         }
         Command::Start => {
-            init_tracing(&p.log_level);
+            let state_dir = p
+                .state_dir_override
+                .clone()
+                .unwrap_or_else(la_daemon::default_state_dir);
+            init_observability(&p.log_level, &state_dir);
             match run_foreground(p) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -290,6 +327,23 @@ fn run(p: Parsed) -> ExitCode {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn scrape_metrics(socket_path: &std::path::Path) -> std::io::Result<String> {
+    let metrics_socket = la_daemon::metrics_socket_path(socket_path);
+    let mut stream = std::os::unix::net::UnixStream::connect(&metrics_socket)?;
+    let mut text = String::new();
+    stream.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+#[cfg(not(unix))]
+fn scrape_metrics(_socket_path: &std::path::Path) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "metrics endpoint is UDS-only in v1",
+    ))
 }
 
 fn run_backup(
@@ -306,6 +360,47 @@ fn run_backup(
         println!("backup written: {}", output.display());
         Ok(())
     })
+}
+
+fn check_writable_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(".lazyagents-write-probe");
+    std::fs::write(&probe, b"ok")?;
+    std::fs::remove_file(probe)?;
+    Ok(())
+}
+
+fn probe_adapters() -> Vec<(&'static str, ProbeResult)> {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            return vec![(
+                "all",
+                ProbeResult::Error {
+                    detail: format!("tokio runtime build failed: {err}"),
+                },
+            )]
+        }
+    };
+    runtime.block_on(async {
+        vec![
+            ("claude", ClaudeAdapter::new().probe().await),
+            ("codex", CodexAdapter::new().probe().await),
+            ("opencode", OpencodeAdapter::new().probe().await),
+        ]
+    })
+}
+
+fn render_probe(result: &ProbeResult) -> String {
+    match result {
+        ProbeResult::Available { version } => format!("available version={version}"),
+        ProbeResult::NotInstalled { hint } => format!("not_installed hint={hint}"),
+        ProbeResult::Unauthenticated { docs_url } => format!("unauthenticated docs={docs_url}"),
+        ProbeResult::Error { detail } => format!("error detail={detail}"),
+    }
 }
 
 fn run_foreground(p: Parsed) -> Result<(), DaemonError> {

@@ -171,11 +171,11 @@ root 能读任何东西。LazyAgents 不试图防范它。
 
 ### 有结构化日志吗？
 
-v1 没有。日志是 stderr 上的纯文本，由 `LAZYAGENTS_LOG` 控制（与 `RUST_LOG` 同语法）。JSON 日志在未来版本规划中。
+有。`lad` 会向 stderr 输出逐行 JSON tracing 事件。用 `LAZYAGENTS_LOG` 或 `lad --log-level` 控制详细程度（过滤语法与 `RUST_LOG` 一致）。
 
 ### 有 Prometheus endpoint 吗？
 
-`lad metrics` 是一个 stub，退出时打印 "not yet implemented"。真正的 metrics 面在 roadmap 上。
+有。`lad metrics` 通过本机 Unix-domain socket 抓取当前 daemon，并输出 Prometheus text，覆盖 RPC、session、cron、PTY spawn 与 storage write 指标。
 
 ### 健康事件在哪？
 

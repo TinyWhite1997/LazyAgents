@@ -131,7 +131,7 @@ sqlite3 "$XDG_DATA_HOME/lazyagents/lad.sqlite" \
 
 ## 崩溃 / panic
 
-LazyAgents 当前不写崩溃 dump 文件。架构文档里有一项规划 —— `crashes/<ts>.json` 含最近 100 条 tracing 事件 —— 但 v1 没实现。当下：抓取 `LAZYAGENTS_LOG=trace` 附在 issue 上。
+`lad` 会在 daemon state 目录下写 `crashes/<ts>.json`。文件包含 panic 位置 / 消息，以及最近 100 条 tracing 事件。你选择上报崩溃时，把这个文件附到 issue 即可。
 
 ## cron 没触发
 
