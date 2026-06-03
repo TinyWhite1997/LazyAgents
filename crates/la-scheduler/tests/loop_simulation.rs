@@ -6,11 +6,13 @@
 //! timeline" — the architecture-spec verification scenario — finishes in
 //! milliseconds.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use chrono_tz::America::Los_Angeles;
 use chrono_tz::Tz;
+use cron::Schedule;
 use tokio::time::{advance, timeout, Duration as StdDuration};
 
 use la_scheduler::{
@@ -321,19 +323,32 @@ fn dst_spring_forward_skips_missing_local_hour() {
 }
 
 #[test]
-fn dst_fall_back_fires_ambiguous_hour_in_both_offsets() {
+fn dst_fall_back_take_first_suppresses_second_offset() {
     // 2026-11-01: LA clocks fall back at 02:00 → 01:00 PST. A cron at
     // "30 1 * * *" matches the wall-clock pattern "01:30 local" twice — once
-    // at 01:30 PDT (08:30 UTC) and again at 01:30 PST (09:30 UTC). This is
-    // the cron crate's documented behaviour and matches the IANA semantics
-    // most users expect: the wall clock literally shows 01:30 on two
-    // separate instants, so the cron fires on both. Verifying it here pins
-    // the semantics so a future cron-crate upgrade can't silently regress.
+    // at 01:30 PDT (08:30 UTC) and again at 01:30 PST (09:30 UTC). The raw
+    // cron crate still exposes both IANA instants; LazyAgents layers the
+    // ADR-0001 take-first policy on top so daemon actions do not double-run.
     let tz: Tz = Los_Angeles;
     let spec = CronSpec::parse("30 1 * * *", "America/Los_Angeles").unwrap();
 
     let now_local = tz.with_ymd_and_hms(2026, 11, 1, 0, 0, 0).unwrap();
     let now_utc = now_local.with_timezone(&Utc);
+    let raw_schedule = Schedule::from_str("0 30 1 * * *").unwrap();
+    let raw_fires: Vec<_> = raw_schedule
+        .after(&now_local)
+        .take(2)
+        .map(|f| f.with_timezone(&Utc))
+        .collect();
+    assert_eq!(
+        raw_fires,
+        vec![
+            Utc.with_ymd_and_hms(2026, 11, 1, 8, 30, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 1, 9, 30, 0).unwrap(),
+        ],
+        "raw cron iterator should still reveal both IANA fall-back instants",
+    );
+
     let fires = spec.fires_between(now_utc, now_utc + Duration::hours(6), 8);
     // Filter to fires that fall on calendar day Nov 1 in the LA tz.
     let day_fires: Vec<_> = fires
@@ -346,12 +361,14 @@ fn dst_fall_back_fires_ambiguous_hour_in_both_offsets() {
         .collect();
     assert_eq!(
         day_fires.len(),
-        2,
-        "fall-back day's ambiguous 01:30 fires once per offset, got {fires:#?}",
+        1,
+        "fall-back day's ambiguous 01:30 fires once under take-first, got {fires:#?}",
     );
-    // Both fires must be exactly one hour apart in UTC: PDT at 08:30Z then
-    // PST at 09:30Z.
-    assert_eq!(day_fires[1] - day_fires[0], Duration::hours(1));
+    assert_eq!(
+        day_fires[0],
+        Utc.with_ymd_and_hms(2026, 11, 1, 8, 30, 0).unwrap(),
+        "take-first keeps the earlier PDT occurrence",
+    );
 }
 
 #[tokio::test(start_paused = true, flavor = "current_thread")]

@@ -1,4 +1,4 @@
-//! Cron expression parsing with IANA timezone.
+//! Cron expression parsing with IANA timezone and LazyAgents DST policy.
 //!
 //! Wraps the `cron` crate to give us:
 //! - 5-field (`m h dom mon dow`) input is auto-rewritten to the 6-field form
@@ -7,9 +7,11 @@
 //! - 7-field (`s m h dom mon dow year`) input is rejected — the architecture
 //!   doc only specs 5 and 6, and accepting more silently invites surprises.
 //! - Timezone resolution against `chrono-tz`, so DST transitions follow IANA
-//!   rules rather than fixed offsets (§5.1).
+//!   rules rather than fixed offsets (§5.1), with the LazyAgents take-first
+//!   bias for fall-back overlapping hours documented in
+//!   `docs/adr/0001-cron-dst-fallback-take-first.md`.
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, LocalResult, TimeZone, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
 use std::str::FromStr;
@@ -55,6 +57,10 @@ impl CronSpec {
     }
 
     /// First fire time strictly after `after` (UTC).
+    ///
+    /// During a DST fall-back overlap, when the same local wall time occurs in
+    /// two offsets, LazyAgents returns only the first occurrence and suppresses
+    /// the second.
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
         // Convert the cutoff into the spec's IANA tz so DST is honoured, then
         // ask cron for the next fire and convert back to UTC for storage /
@@ -62,13 +68,17 @@ impl CronSpec {
         let after_tz = after.with_timezone(&self.tz);
         self.schedule
             .after(&after_tz)
-            .next()
+            .find(|dt| !self.is_fall_back_second_occurrence(dt))
             .map(|dt| dt.with_timezone(&Utc))
     }
 
     /// All fire times in the half-open interval `(start, end]`, in chronological
     /// order. Used by the catch-up path to enumerate missed fires after a
     /// daemon restart or clock jump.
+    ///
+    /// During a DST fall-back overlap, when the same local wall time occurs in
+    /// two offsets, LazyAgents includes only the first occurrence. This keeps
+    /// daemon catch-up aligned with the live `next_after` cadence.
     ///
     /// Stops collecting after `limit` entries — callers downstream still need
     /// to apply [`crate::catchup::MAX_CATCHUP`], but a per-iterator cap keeps
@@ -87,6 +97,9 @@ impl CronSpec {
             if fire > end_tz {
                 break;
             }
+            if self.is_fall_back_second_occurrence(&fire) {
+                continue;
+            }
             out.push(fire.with_timezone(&Utc));
             if out.len() >= limit {
                 break;
@@ -97,13 +110,27 @@ impl CronSpec {
 
     /// Preview the next `n` fire times after `after`. Powers `crons.dry_run`
     /// in the IPC surface (§5.6).
+    ///
+    /// During a DST fall-back overlap, when the same local wall time occurs in
+    /// two offsets, preview output shows only the first occurrence so dry-run
+    /// results match persisted scheduler behavior.
     pub fn preview(&self, after: DateTime<Utc>, n: usize) -> Vec<DateTime<Utc>> {
         let after_tz = after.with_timezone(&self.tz);
         self.schedule
             .after(&after_tz)
+            .filter(|dt| !self.is_fall_back_second_occurrence(dt))
             .take(n)
             .map(|dt| dt.with_timezone(&Utc))
             .collect()
+    }
+
+    fn is_fall_back_second_occurrence(&self, fire: &DateTime<Tz>) -> bool {
+        match self.tz.from_local_datetime(&fire.naive_local()) {
+            LocalResult::Ambiguous(_, latest) => {
+                fire.with_timezone(&Utc) == latest.with_timezone(&Utc)
+            }
+            LocalResult::Single(_) | LocalResult::None => false,
+        }
     }
 }
 
@@ -217,5 +244,36 @@ mod tests {
         let end = start + chrono::Duration::days(7);
         let fires = spec.fires_between(start, end, 5);
         assert_eq!(fires.len(), 5);
+    }
+
+    #[test]
+    fn next_after_skips_second_fall_back_occurrence() {
+        let spec = CronSpec::parse("30 1 * * *", "America/Los_Angeles").unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 11, 1, 7, 0, 0).unwrap();
+        let first = Utc.with_ymd_and_hms(2026, 11, 1, 8, 30, 0).unwrap();
+        let second = Utc.with_ymd_and_hms(2026, 11, 1, 9, 30, 0).unwrap();
+        let next_day = Utc.with_ymd_and_hms(2026, 11, 2, 9, 30, 0).unwrap();
+
+        assert_eq!(spec.next_after(start), Some(first));
+        assert_eq!(spec.next_after(first), Some(next_day));
+        assert_eq!(
+            spec.next_after(first + chrono::Duration::minutes(1)),
+            Some(next_day)
+        );
+        assert_ne!(spec.next_after(first), Some(second));
+    }
+
+    #[test]
+    fn fires_between_and_preview_take_first_across_fall_back_hour() {
+        let spec = CronSpec::parse("*/30 1 * * *", "America/Los_Angeles").unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 11, 1, 7, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 11, 1, 10, 0, 0).unwrap();
+        let expected = vec![
+            Utc.with_ymd_and_hms(2026, 11, 1, 8, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 1, 8, 30, 0).unwrap(),
+        ];
+
+        assert_eq!(spec.fires_between(start, end, 8), expected);
+        assert_eq!(spec.preview(start, 2), expected);
     }
 }
