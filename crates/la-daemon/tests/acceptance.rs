@@ -438,37 +438,140 @@ done
     // but if the shell hasn't installed its `read` yet, the `IFS= read`
     // can swallow it as part of the same line as the next write, or
     // (under burst) miss the carriage return entirely. Send a known
-    // nonce first and wait for its echo: once we see `echo:SYNCFENCE-N`
+    // nonce and wait for its echo: once we see `echo:SYNCFENCE-N`
     // the loop is demonstrably iterating and the next write is safe.
+    //
+    // A SINGLE fence write is itself flake-prone — it can land in the
+    // same pre-`read` window. Re-send the probe inside a deadline and
+    // drive both the write Response and the session.output notifications
+    // through one recv loop so notifications don't get dropped by the
+    // synchronous `call()` helper. We also track pending probe acks
+    // explicitly so subsequent `call()`s (which hard-panic on id
+    // mismatch) don't trip over a stray late Response.
     let fence = format!("SYNCFENCE-{}", session_id);
     let fence_probe = format!("{fence}\r");
-    let _: SessionsWriteResult = call(
-        &mut conn,
-        100,
-        "sessions.write",
-        &SessionsWriteParams::try_from_bytes(session_id.clone(), fence_probe.as_bytes()).unwrap(),
-    )
-    .await;
     let fence_needle = format!("echo:{fence}");
-    let fenced =
-        drain_output_until(&mut conn, fence_needle.as_bytes(), Duration::from_secs(5)).await;
+    let probe_id_start: i64 = 100;
+    let mut probe_id: i64 = probe_id_start;
+    let mut sent_probes: i64 = 0;
+    let mut acked_probes: i64 = 0;
+    let mut seen_fence = Vec::<u8>::new();
+    let mut next_probe_at = tokio::time::Instant::now();
+    let fence_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < fence_deadline
+        && !contains(&seen_fence, fence_needle.as_bytes())
+    {
+        if tokio::time::Instant::now() >= next_probe_at {
+            send_request(
+                &mut conn,
+                probe_id,
+                "sessions.write",
+                &SessionsWriteParams::try_from_bytes(session_id.clone(), fence_probe.as_bytes())
+                    .unwrap(),
+            )
+            .await;
+            probe_id += 1;
+            sent_probes += 1;
+            next_probe_at = tokio::time::Instant::now() + Duration::from_millis(200);
+        }
+        let msg = match tokio::time::timeout(Duration::from_millis(150), conn.recv()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => continue,
+        };
+        match msg {
+            Message::Notification(n) if n.method == "session.output" => {
+                if let Some(params) = n.params.as_ref() {
+                    let p: SessionOutputParams =
+                        serde_json::from_value(params.clone()).expect("decode output");
+                    seen_fence.extend_from_slice(&p.data_bytes().expect("base64"));
+                }
+            }
+            Message::Response(r) => {
+                if let RequestId::Num(n) = r.id {
+                    if n >= probe_id_start {
+                        acked_probes += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     assert!(
-        contains(&fenced, fence_needle.as_bytes()),
-        "readiness fence echo never observed; got {:?}",
-        String::from_utf8_lossy(&fenced)
+        contains(&seen_fence, fence_needle.as_bytes()),
+        "readiness fence echo never observed within deadline; got {:?}",
+        String::from_utf8_lossy(&seen_fence)
     );
 
-    let _: SessionsWriteResult = call(
+    // Drain any remaining in-flight probe Responses and shell echoes so
+    // subsequent call()s — whose recv_response_for hard-panics on id
+    // mismatch — don't trip over a late SYNCFENCE ack. Bounded by 3 s
+    // so we can't hang if a Response is lost.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while acked_probes < sent_probes && tokio::time::Instant::now() < drain_deadline {
+        match tokio::time::timeout(Duration::from_millis(150), conn.recv()).await {
+            Ok(Ok(Some(Message::Response(r)))) => {
+                if let RequestId::Num(n) = r.id {
+                    if n >= probe_id_start {
+                        acked_probes += 1;
+                    }
+                }
+            }
+            Ok(Ok(Some(_))) => {}
+            _ => continue,
+        }
+    }
+    assert_eq!(
+        acked_probes, sent_probes,
+        "did not drain every fence-probe Response before continuing"
+    );
+
+    // Send hello-m1 and drive Response + Notification through one recv
+    // loop, so we cannot lose `echo:hello-m1` to the response-only
+    // waiter inside the `call()` helper.
+    let hello_id: i64 = 999;
+    send_request(
         &mut conn,
-        3,
+        hello_id,
         "sessions.write",
         &SessionsWriteParams::try_from_bytes(session_id.clone(), b"hello-m1\r").unwrap(),
     )
     .await;
-    let echoed = drain_output_until(&mut conn, b"echo:hello-m1", Duration::from_secs(5)).await;
+    let mut echoed = Vec::<u8>::new();
+    let mut got_write_ack = false;
+    let echo_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < echo_deadline
+        && !(got_write_ack && contains(&echoed, b"echo:hello-m1"))
+    {
+        let msg = match tokio::time::timeout(Duration::from_millis(200), conn.recv()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => continue,
+        };
+        match msg {
+            Message::Notification(n) if n.method == "session.output" => {
+                if let Some(params) = n.params.as_ref() {
+                    let p: SessionOutputParams =
+                        serde_json::from_value(params.clone()).expect("decode output");
+                    echoed.extend_from_slice(&p.data_bytes().expect("base64"));
+                }
+            }
+            Message::Response(r) if r.id == RequestId::Num(hello_id) => {
+                if let la_proto::jsonrpc::ResponseOutcome::Error(e) = r.outcome {
+                    panic!("sessions.write hello-m1 errored: {e:?}");
+                }
+                got_write_ack = true;
+            }
+            _ => {}
+        }
+    }
     assert!(
         contains(&echoed, b"echo:hello-m1"),
         "missing echoed write; got {:?}",
+        String::from_utf8_lossy(&echoed)
+    );
+    assert!(
+        got_write_ack,
+        "hello-m1 echoed but the write Response never arrived — subsequent \
+         call()s would mis-match ids; echoed bytes = {:?}",
         String::from_utf8_lossy(&echoed)
     );
 
