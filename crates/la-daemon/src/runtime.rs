@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use crate::dispatcher::{serve_connection, AdapterRegistry, ConnectionContext};
 use crate::health::{spawn_loop, HealthRegistry, ProbeLoopConfig, DEFAULT_PROBE_INTERVAL};
 use crate::paths::{ensure_runtime_dir, SocketDiscovery, SocketLocation};
+use crate::scheduler::{SchedulerConfig, SchedulerServices};
 use crate::signals::DEFAULT_SHUTDOWN_DEADLINE;
 
 /// WEK-27 TTL for archived worktree sweep: rows whose `archived_at`
@@ -94,6 +95,10 @@ pub struct DaemonConfig {
     /// to prove the day-counter path fires without sleeping.
     pub runs_archive_initial_delay: Option<Duration>,
     pub runs_archive_interval: Duration,
+    /// WEK-57 / M3.9 scheduler tunables. Production uses defaults; tests
+    /// shrink `global.global_max_concurrent_runs` to provoke the
+    /// concurrency rail.
+    pub scheduler: SchedulerConfig,
 }
 
 impl Default for DaemonConfig {
@@ -111,6 +116,7 @@ impl Default for DaemonConfig {
             runs_archive_retention_days: RUNS_ARCHIVE_RETENTION_DAYS,
             runs_archive_initial_delay: None,
             runs_archive_interval: RUNS_ARCHIVE_INTERVAL,
+            scheduler: SchedulerConfig::default(),
         }
     }
 }
@@ -133,6 +139,7 @@ pub struct Daemon {
     /// query.
     worktree_sweep_loop: Option<JoinHandle<()>>,
     runs_archive_loop: Option<JoinHandle<()>>,
+    scheduler: Option<Arc<SchedulerServices>>,
 }
 
 impl Daemon {
@@ -153,6 +160,7 @@ impl Daemon {
             runs_archive_retention_days,
             runs_archive_initial_delay,
             runs_archive_interval,
+            scheduler: scheduler_config,
         } = config;
 
         let socket = socket_discovery.resolve();
@@ -239,10 +247,31 @@ impl Daemon {
         let shutdown = Arc::new(Notify::new());
         let registry = AdapterRegistry::from_map(adapters);
         let health_registry = HealthRegistry::new();
+
+        // WEK-57 / M3.9: bring up the scheduler stack BEFORE the dispatcher
+        // so the connection context can route `crons.* / runs.*` through
+        // the same `SchedulerServices` the executor uses.
+        let scheduler_services = SchedulerServices::start(
+            manager.storage().clone(),
+            manager.clone(),
+            registry.clone(),
+            scheduler_config,
+            shutdown.clone(),
+        )
+        .await
+        .map_err(|err| match err {
+            crate::scheduler::SchedulerStartError::Storage(e) => DaemonError::Storage(e),
+            crate::scheduler::SchedulerStartError::CronSeed(s) => {
+                DaemonError::Io(std::io::Error::other(format!("cron seed: {s}")))
+            }
+        })?;
+        let scheduler_arc = Arc::new(scheduler_services);
+
         let ctx = ConnectionContext {
             manager: manager.clone(),
             adapters: registry.clone(),
             health: health_registry.clone(),
+            scheduler: scheduler_arc.clone(),
             server_version,
             shutdown: shutdown.clone(),
         };
@@ -292,6 +321,7 @@ impl Daemon {
             health_loop,
             worktree_sweep_loop: sweep_loop,
             runs_archive_loop,
+            scheduler: Some(scheduler_arc),
         })
     }
 
@@ -329,6 +359,7 @@ impl Daemon {
             health_loop,
             worktree_sweep_loop,
             runs_archive_loop,
+            scheduler,
         } = self;
 
         tracing::info!(socket = %socket.socket_path.display(), "lad listening");
@@ -474,6 +505,23 @@ impl Daemon {
         // down at the top of the shutdown sequence (before the §6.4
         // 10 s countdown started) so they don't eat into the SIGKILL
         // budget. Nothing more to do here besides closing storage.
+
+        // WEK-57 / M3.9: drain the scheduler stack. The scheduler owns
+        // its own executor shutdown signal (distinct from the daemon-wide
+        // `Notify` fired above) so the executor is still running here,
+        // ready to consume any fires the heap loop produces. `shutdown`
+        // closes the heap loop first, awaits it, then signals the
+        // executor — guaranteeing no scheduled fire is dropped between
+        // the connection-drain phase and now.
+        //
+        // The timeout is sized to fit comfortably inside the §6.4 10 s
+        // ceiling even after the SIGKILL phase above; in practice the
+        // scheduler shuts down in well under 100 ms because the heap
+        // loop's main `select!` is awaiting either `cmd_rx.recv()` or a
+        // `sleep_until` deadline and both yield instantly.
+        if let Some(s) = scheduler {
+            let _ = tokio::time::timeout(Duration::from_secs(2), s.shutdown()).await;
+        }
 
         manager.storage().close().await;
         // Drop the listener to remove the socket file; the la-ipc Listener
