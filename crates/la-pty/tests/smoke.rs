@@ -11,15 +11,15 @@ use tokio::time::timeout;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn echo_cmd(text: &str) -> CommandBuilder {
+fn short_output_cmd(text: &str) -> (CommandBuilder, Vec<u8>) {
     if cfg!(windows) {
-        let mut cmd = CommandBuilder::new("cmd.exe");
-        cmd.args(["/C", "echo", text]);
-        cmd
+        let mut cmd = CommandBuilder::new("where.exe");
+        cmd.arg("cmd.exe");
+        (cmd, b"cmd.exe".to_vec())
     } else {
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.args(["-c", &format!("echo {}", text)]);
-        cmd
+        let mut cmd = CommandBuilder::new("printf");
+        cmd.arg(text);
+        (cmd, text.as_bytes().to_vec())
     }
 }
 
@@ -56,10 +56,11 @@ async fn read_until(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_echo_reads_output_and_sees_eof() {
-    let mut child = spawn(echo_cmd("hi-la-pty"), PtySize::default()).expect("spawn");
+    let (cmd, needle) = short_output_cmd("hi-la-pty");
+    let mut child = spawn(cmd, PtySize::default()).expect("spawn");
     assert!(child.pid().is_some(), "child should report a pid");
 
-    let saw = read_until(&mut child.reader, b"hi-la-pty").await;
+    let saw = read_until(&mut child.reader, &needle).await;
     assert!(saw.is_some(), "expected to see echo output; got {:?}", saw);
 
     if !cfg!(windows) {
@@ -126,14 +127,14 @@ async fn resize_does_not_error() {
 async fn signal_interrupt_terminates_child() {
     // Long-running process so it doesn't exit on its own.
     let cmd = if cfg!(windows) {
-        let mut c = CommandBuilder::new("cmd.exe");
+        let mut c = CommandBuilder::new("ping.exe");
         // ping with delay; will run for ~30s without -t.
-        c.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+        c.args(["-n", "30", "127.0.0.1"]);
         c
     } else {
-        let mut c = CommandBuilder::new("sh");
-        c.args(["-c", "sleep 30"]);
-        c
+        let mut cmd = CommandBuilder::new("sleep");
+        cmd.arg("30");
+        cmd
     };
     let child = spawn(cmd, PtySize::default()).expect("spawn");
 
@@ -161,13 +162,13 @@ async fn signal_interrupt_terminates_child() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signal_kill_terminates_child() {
     let cmd = if cfg!(windows) {
-        let mut c = CommandBuilder::new("cmd.exe");
-        c.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+        let mut c = CommandBuilder::new("ping.exe");
+        c.args(["-n", "30", "127.0.0.1"]);
         c
     } else {
-        let mut c = CommandBuilder::new("sh");
-        c.args(["-c", "sleep 30"]);
-        c
+        let mut cmd = CommandBuilder::new("sleep");
+        cmd.arg("30");
+        cmd
     };
     let child = spawn(cmd, PtySize::default()).expect("spawn");
 
@@ -178,4 +179,36 @@ async fn signal_kill_terminates_child() {
         .await
         .expect("child should exit after kill")
         .expect("wait");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_shell_command_string_wrapping() {
+    assert_shell_wrapper_rejected("/bin/sh", &["-c", "echo unsafe"]);
+    assert_shell_wrapper_rejected("bash", &["-lc", "echo unsafe"]);
+    assert_shell_wrapper_rejected("sh", &["-ec", "echo unsafe"]);
+    assert_shell_wrapper_rejected("zsh", &["-fc", "echo unsafe"]);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_wrapper_guard_stops_option_parsing_at_double_dash() {
+    let mut cmd = CommandBuilder::new("/bin/sh");
+    cmd.args(["--", "-c"]);
+    let child = spawn(cmd, PtySize::default()).expect("-- should stop shell option parsing");
+    let _status = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("child wait should not hang")
+        .expect("wait");
+}
+
+#[cfg(unix)]
+fn assert_shell_wrapper_rejected(program: &str, args: &[&str]) {
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args(args);
+    let err = match spawn(cmd, PtySize::default()) {
+        Ok(_) => panic!("shell wrapper should be rejected: {program} {args:?}"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, la_pty::PtyError::ShellWrapping(_)));
 }

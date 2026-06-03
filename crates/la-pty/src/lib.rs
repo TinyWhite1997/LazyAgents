@@ -98,6 +98,8 @@ pub enum PtyError {
     WriterClosed,
     #[error("child has no pid")]
     NoPid,
+    #[error("shell wrapping is not allowed: {0}")]
+    ShellWrapping(String),
     #[error("join error: {0}")]
     Join(String),
 }
@@ -236,6 +238,7 @@ impl ChildWaiter {
 /// when the consumer drops `reader` or stops draining, the OS-side write
 /// to the PTY will eventually block, exerting flow control on the child.
 pub fn spawn(cmd: CommandBuilder, size: PtySize) -> Result<PtyChild, PtyError> {
+    reject_shell_wrapper(&cmd)?;
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(size.into())
@@ -307,4 +310,62 @@ pub fn spawn(cmd: CommandBuilder, size: PtySize) -> Result<PtyChild, PtyError> {
         master,
         child,
     })
+}
+
+fn reject_shell_wrapper(cmd: &CommandBuilder) -> Result<(), PtyError> {
+    let argv = cmd.get_argv();
+    if argv.len() < 2 {
+        return Ok(());
+    }
+
+    let program = argv[0].to_string_lossy();
+    let program_name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&program)
+        .to_ascii_lowercase();
+    let args = &argv[1..];
+    let has_exec_string_arg = if is_posix_shell(&program_name) {
+        posix_shell_has_command_string_arg(args)
+    } else if matches!(program_name.as_str(), "cmd" | "cmd.exe") {
+        args.iter()
+            .any(|arg| arg.to_string_lossy().eq_ignore_ascii_case("/c"))
+    } else if matches!(
+        program_name.as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    ) {
+        args.iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg.eq_ignore_ascii_case("-command") || arg.eq_ignore_ascii_case("-c")
+        })
+    } else {
+        false
+    };
+    if has_exec_string_arg {
+        return Err(PtyError::ShellWrapping(format!(
+            "{} with command-string argument",
+            argv[0].to_string_lossy()
+        )));
+    }
+    Ok(())
+}
+
+fn is_posix_shell(program_name: &str) -> bool {
+    matches!(
+        program_name,
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish" | "csh" | "tcsh"
+    )
+}
+
+fn posix_shell_has_command_string_arg(args: &[std::ffi::OsString]) -> bool {
+    for arg in args {
+        let arg = arg.to_string_lossy();
+        if arg == "--" {
+            return false;
+        }
+        if arg.starts_with('-') && arg.len() > 1 && arg[1..].contains('c') {
+            return true;
+        }
+    }
+    false
 }

@@ -196,4 +196,17 @@ mod tests {
         );
         assert_eq!(loc.runtime_dir, std::path::PathBuf::from("/tmp"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_runtime_dir_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("lazyagents");
+        ensure_runtime_dir(&runtime).unwrap();
+
+        let mode = std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
 }

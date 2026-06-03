@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -78,9 +78,25 @@ impl AgentAdapter for FakeBackend {
     }
 
     fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, AdapterError> {
+        let script_dir = std::env::temp_dir().join("lazyagents-m2-smoke-scripts");
+        std::fs::create_dir_all(&script_dir).map_err(AdapterError::SpawnFailed)?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let script_path = script_dir.join(format!("{}-{nonce}.sh", std::process::id()));
+        std::fs::write(&script_path, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 60\n")
+            .map_err(AdapterError::SpawnFailed)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+                .map_err(AdapterError::SpawnFailed)?;
+        }
         Ok(SpawnSpec {
-            program: PathBuf::from("/bin/sh"),
-            args: vec!["-c".into(), "trap 'exit 0' TERM; sleep 60".into()],
+            program: script_path,
+            args: Vec::new(),
             env: req.env.clone(),
             cwd: req.cwd.clone(),
             pty: req.pty,

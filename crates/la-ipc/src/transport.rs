@@ -6,11 +6,12 @@
 //! `tokio::net::windows::named_pipe`. The two platforms share the
 //! [`StreamPair`] alias so callers can be transport-agnostic above this layer.
 //!
-//! Security note: callers are expected to set `umask(0o077)` before binding
-//! (Unix) or use a restrictive ACL (Windows). This crate does NOT chmod
-//! the socket file itself, because production daemons hand the listener up
-//! to systemd / launchd / a SecurityDescriptor builder; the M0 test surface
-//! just needs the bytes to flow.
+//! Security note: Unix listeners bind under a temporary `umask(0o077)`, then
+//! chmod the socket file to 0600 and verify accepted peers with platform peer
+//! credentials (`SO_PEERCRED` on Linux/Android, `getpeereid` on BSD-family
+//! targets). Windows listeners reject remote clients; the current v1
+//! validation target is Linux, so Windows SID ACL hardening remains behind the
+//! platform gate.
 //!
 //! The `Endpoint` enum exists so the same code path can describe both a UDS
 //! path and a Named Pipe name without conditional compilation in callers.
@@ -44,6 +45,9 @@ impl Endpoint {
 #[cfg(unix)]
 mod imp {
     use super::*;
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt as _;
     use tokio::net::{UnixListener, UnixStream};
 
     /// Listener handle.
@@ -87,7 +91,8 @@ mod imp {
                     let _ = tokio::fs::remove_file(&path).await;
                 }
             }
-            let inner = UnixListener::bind(&path)?;
+            let inner = bind_with_restrictive_umask(&path)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
             // Capture the inode of the file we just created so Drop can
             // verify it before unlinking.
             let bound_inode = std::fs::symlink_metadata(&path).ok().map(|m| {
@@ -104,6 +109,7 @@ mod imp {
         /// Accept one connection.
         pub async fn accept(&self) -> Result<StreamPair, IpcError> {
             let (stream, _addr) = self.inner.accept().await?;
+            verify_peer_uid(&stream)?;
             Ok(stream)
         }
 
@@ -146,12 +152,90 @@ mod imp {
         Ok(s)
     }
 
+    fn bind_with_restrictive_umask(path: &Path) -> io::Result<UnixListener> {
+        // SAFETY: umask is process-global, so keep the critical section to the
+        // single bind syscall and always restore the previous value.
+        let old = unsafe { libc::umask(0o077) };
+        let result = UnixListener::bind(path);
+        unsafe {
+            libc::umask(old);
+        }
+        result
+    }
+
+    fn verify_peer_uid(stream: &UnixStream) -> io::Result<()> {
+        let peer_uid = peer_uid(stream)?;
+        let expected = unsafe { libc::geteuid() };
+        if peer_uid != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("peer uid {peer_uid} does not match daemon uid {expected}"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+        let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                cred.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let cred = unsafe { cred.assume_init() };
+        Ok(cred.uid)
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(uid)
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    fn peer_uid(_stream: &UnixStream) -> io::Result<libc::uid_t> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix peer credential validation is not implemented on this target",
+        ))
+    }
+
     /// Convenience: socket-file mode-checking for tests. Returns the file
     /// permissions bits (Unix only).
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn socket_mode(path: &Path) -> std::io::Result<u32> {
-        use std::os::unix::fs::PermissionsExt as _;
         let meta = std::fs::metadata(path)?;
         Ok(meta.permissions().mode())
     }

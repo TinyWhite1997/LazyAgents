@@ -58,9 +58,20 @@ impl AgentAdapter for IdleShell {
     fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, AdapterError> {
         // `sleep` keeps the PTY alive long enough for our RPC calls to
         // land; the test cleans up by dropping the daemon at end of run.
+        let script_dir = std::env::temp_dir().join("lazyagents-wek28-test-scripts");
+        std::fs::create_dir_all(&script_dir).map_err(AdapterError::SpawnFailed)?;
+        let script_path = script_dir.join(format!("{}.sh", la_storage::new_id()));
+        std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n").map_err(AdapterError::SpawnFailed)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+                .map_err(AdapterError::SpawnFailed)?;
+        }
         Ok(SpawnSpec {
-            program: PathBuf::from("/bin/sh"),
-            args: vec!["-c".into(), "sleep 60".into()],
+            program: script_path,
+            args: Vec::new(),
             env: req.env.clone(),
             cwd: req.cwd.clone(),
             pty: req.pty,

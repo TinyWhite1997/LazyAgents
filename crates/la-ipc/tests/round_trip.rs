@@ -361,3 +361,89 @@ async fn split_halves_allow_concurrent_send_and_recv() {
     assert_eq!(count, 100);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn uds_listener_uses_owner_only_socket_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new().expect("tempdir");
+    let sock = dir.path().join("secure.sock");
+    let listener = Listener::bind(&Endpoint::uds(&sock)).await.unwrap();
+
+    let mode = std::fs::metadata(listener.path())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[tokio::test]
+async fn uds_accept_allows_same_uid_peer_after_so_peercred_check() {
+    let dir = TempDir::new().expect("tempdir");
+    let sock = dir.path().join("peer.sock");
+    let listener = Listener::bind(&Endpoint::uds(&sock)).await.unwrap();
+
+    let client = tokio::spawn({
+        let sock = sock.clone();
+        async move { connect(&Endpoint::uds(sock)).await.unwrap() }
+    });
+
+    let server = listener.accept().await.unwrap();
+    drop(server);
+    drop(client.await.unwrap());
+}
+
+#[tokio::test]
+#[ignore = "manual QA: requires root plus setpriv/python3 to create a cross-UID peer"]
+async fn uds_accept_rejects_cross_uid_peer_after_peercred_check() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if unsafe { libc::geteuid() } != 0 {
+        panic!("manual cross-UID peercred QA must run as root");
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let sock = dir.path().join("peer-negative.sock");
+    let listener = Listener::bind(&Endpoint::uds(&sock)).await.unwrap();
+
+    // Deliberately relax path permissions after bind so the test reaches the
+    // peer-credential gate instead of being stopped by filesystem mode bits.
+    let mut dir_perm = std::fs::metadata(dir.path()).unwrap().permissions();
+    dir_perm.set_mode(0o711);
+    std::fs::set_permissions(dir.path(), dir_perm).unwrap();
+    let mut sock_perm = std::fs::metadata(&sock).unwrap().permissions();
+    sock_perm.set_mode(0o666);
+    std::fs::set_permissions(&sock, sock_perm).unwrap();
+
+    let script = format!(
+        "import socket; s=socket.socket(socket.AF_UNIX); s.connect({:?}); s.close()",
+        sock.to_string_lossy()
+    );
+    let mut child = tokio::process::Command::new("setpriv")
+        .args([
+            "--reuid",
+            "65534",
+            "--regid",
+            "65534",
+            "--clear-groups",
+            "python3",
+            "-c",
+            &script,
+        ])
+        .spawn()
+        .expect("spawn cross-UID client");
+
+    let err = listener
+        .accept()
+        .await
+        .expect_err("cross-UID peer rejected");
+    match err {
+        la_ipc::IpcError::Io(err) => {
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        other => panic!("expected permission-denied IO error, got {other:?}"),
+    }
+    let status = child.wait().await.expect("cross-UID client exits");
+    assert!(status.success(), "cross-UID client failed: {status}");
+}
