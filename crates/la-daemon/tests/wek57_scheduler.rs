@@ -556,7 +556,19 @@ async fn invalid_cron_expr_returns_cron_invalid_expr() {
 async fn graceful_shutdown_drains_pending_fires_into_runs_table() {
     // Boot a daemon, seed a cron, fire run_now → confirm `runs` row
     // exists, then shutdown and verify the row survives.
-    let td = bootstrap(Arc::new(EchoAdapter), SchedulerConfig::default()).await;
+    //
+    // `cpu_load_throttle: None` so a noisy CI/agent host cannot defer the
+    // single `run_now` admission via the loadavg gate and turn this into
+    // a flake (we only care that an admitted run survives shutdown, not
+    // how the loadavg gate behaves).
+    let scheduler_cfg = SchedulerConfig {
+        global: GlobalQuota {
+            cpu_load_throttle: None,
+            ..GlobalQuota::default()
+        },
+        ..SchedulerConfig::default()
+    };
+    let td = bootstrap(Arc::new(EchoAdapter), scheduler_cfg).await;
     let state_dir = td._tempdir.path().join("state");
     let project_id = seed_project_row(state_dir.as_path(), "/tmp").await;
     let mut conn = client(&td.socket).await;

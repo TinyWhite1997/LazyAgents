@@ -1,10 +1,10 @@
 //! Typed parameters and results for the daemon ↔ client RPC surface.
 //!
-//! M1.1 extends the earlier M0.2 minimum set (`initialize`, `sessions.create`,
+//! M1.1 extended the earlier M0.2 minimum set (`initialize`, `sessions.create`,
 //! `sessions.attach`, `sessions.write`, plus the `session.output`
 //! notification) to cover the full `sessions.*` / `events.subscribe` table
-//! in architecture §3. Cron and run history (`crons.*`, `runs.*`) are
-//! still out of scope until M3 and are NOT defined here.
+//! in architecture §3. M3 added cron and run history (`crons.*`, `runs.*`);
+//! both surfaces are defined here and enumerated in [`METHOD_NAMES`].
 //!
 //! Each method type implements [`Method`], which centralizes the method-name
 //! string so the dispatcher and the schema-export binary stay in lock-step
