@@ -33,6 +33,7 @@ nix = { workspace = true, features = ["signal", "process", "fs"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "process"] }
+chrono-tz = { workspace = true }
 
 [[bin]]
 name = "lad"

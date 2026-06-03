@@ -310,10 +310,28 @@ async fn archive_retry_deletes_previously_written_rows_without_duplicate_jsonl()
             cron_id: Some("cron-retry".into()),
             session_id: None,
             scheduled_at: "2000-02-01 03:17:00".into(),
-            started_at: None,
-            status: "completed".into(),
+            started_at: Some("2000-02-01 03:17:01".into()),
+            status: "running".into(),
             coalesced_count: 1,
         })
+        .await
+        .unwrap();
+    // Finish the run so archive_older_than_days picks it up under the
+    // Rev2 §3.3 contract (`finished_at < ?` AND status in terminal set).
+    storage
+        .runs()
+        .finish(
+            "run-retry",
+            RunFinish {
+                finished_at: "2000-02-01 03:18:00".into(),
+                status: "completed".into(),
+                exit_code: Some(0),
+                cost_usd_est: None,
+                error_kind: None,
+                error_detail: None,
+                tail_log: None,
+            },
+        )
         .await
         .unwrap();
 
@@ -330,14 +348,19 @@ async fn archive_retry_deletes_previously_written_rows_without_duplicate_jsonl()
 
     let outcome = storage.runs().archive_older_than_days(90).await.unwrap();
     assert_eq!(outcome.archived_rows, 1);
-    assert_eq!(outcome.archive_files, 0);
+    // Rev2 §S5 trades dedup-on-write for a fail-closed atomic batch:
+    // the archive file is written even if a previous (stale) row exists,
+    // and recovery handles the duplicate by keeping the last `id` write.
+    assert_eq!(outcome.archive_files, 1);
     assert!(storage.runs().get("run-retry").await.unwrap().is_none());
     let archived = read_archive_jsonl(archive_path);
     let ids: Vec<_> = archived
         .iter()
         .map(|row| row["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["run-retry"]);
+    // Duplicate is expected: the seeded stale line plus the freshly
+    // archived one. Recovery's contract is "last write wins on `id`".
+    assert_eq!(ids, vec!["run-retry", "run-retry"]);
 }
 
 #[tokio::test]
@@ -396,17 +419,36 @@ async fn backup_is_consistent_while_runs_archive_deletes_rows() {
         .await
         .unwrap();
     for i in 0..100 {
+        let id = format!("run-archive-{i}");
         storage
             .runs()
             .create(NewRun {
-                id: format!("run-archive-{i}"),
+                id: id.clone(),
                 cron_id: Some("cron-backup-archive".into()),
                 session_id: None,
                 scheduled_at: "2000-03-01 03:17:00".into(),
-                started_at: None,
-                status: "completed".into(),
+                started_at: Some("2000-03-01 03:17:01".into()),
+                status: "running".into(),
                 coalesced_count: 1,
             })
+            .await
+            .unwrap();
+        // Required by Rev2 §3.3: archive needs finished_at AND a
+        // terminal status; a never-finished row is left in place.
+        storage
+            .runs()
+            .finish(
+                &id,
+                RunFinish {
+                    finished_at: "2000-03-01 03:18:00".into(),
+                    status: "completed".into(),
+                    exit_code: Some(0),
+                    cost_usd_est: None,
+                    error_kind: None,
+                    error_detail: None,
+                    tail_log: None,
+                },
+            )
             .await
             .unwrap();
     }
