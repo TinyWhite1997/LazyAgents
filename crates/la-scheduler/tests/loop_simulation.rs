@@ -784,12 +784,7 @@ async fn backoff_defers_next_fire_past_backoff_window() {
     // the next heap fire must land at 12:04:00 not 12:01:00.
     let existed = ch
         .handle
-        .update_backoff_state(
-            "minutely",
-            Some(FailureBackoff::default()),
-            Some(wall),
-            3,
-        )
+        .update_backoff_state("minutely", Some(FailureBackoff::default()), Some(wall), 3)
         .await
         .unwrap();
     assert!(existed, "update_backoff_state must find the entry");
@@ -859,12 +854,7 @@ async fn clear_backoff_state_resumes_natural_cadence_immediately() {
 
     // Seed: 6 failures → 1920s window (capped well below 1h).
     ch.handle
-        .update_backoff_state(
-            "minutely",
-            Some(FailureBackoff::default()),
-            Some(wall),
-            6,
-        )
+        .update_backoff_state("minutely", Some(FailureBackoff::default()), Some(wall), 6)
         .await
         .unwrap();
     advance(StdDuration::from_millis(1)).await;
@@ -939,12 +929,7 @@ async fn upsert_preserves_existing_backoff_state() {
         .unwrap();
     // 3 consecutive failures → 240s window.
     ch.handle
-        .update_backoff_state(
-            "edited",
-            Some(FailureBackoff::default()),
-            Some(wall),
-            3,
-        )
+        .update_backoff_state("edited", Some(FailureBackoff::default()), Some(wall), 3)
         .await
         .unwrap();
     advance(StdDuration::from_millis(1)).await;
@@ -956,13 +941,7 @@ async fn upsert_preserves_existing_backoff_state() {
     // stay active across the upsert, so the floor still applies.
     let spec_v2 = CronSpec::parse("*/5 * * * *", "UTC").unwrap();
     ch.handle
-        .upsert(
-            "edited",
-            spec_v2,
-            CatchupMode::Skip,
-            Duration::zero(),
-            None,
-        )
+        .upsert("edited", spec_v2, CatchupMode::Skip, Duration::zero(), None)
         .await
         .unwrap();
     advance(StdDuration::from_millis(1)).await;
@@ -979,13 +958,7 @@ async fn upsert_preserves_existing_backoff_state() {
     // Re-upsert a high-frequency cron — now the backoff floor wins.
     let spec_v3 = CronSpec::parse("* * * * *", "UTC").unwrap();
     ch.handle
-        .upsert(
-            "edited",
-            spec_v3,
-            CatchupMode::Skip,
-            Duration::zero(),
-            None,
-        )
+        .upsert("edited", spec_v3, CatchupMode::Skip, Duration::zero(), None)
         .await
         .unwrap();
     advance(StdDuration::from_millis(1)).await;
@@ -1048,12 +1021,7 @@ async fn high_frequency_cron_in_long_backoff_does_not_spam_fires() {
 
     // 7 failures at default expo(1m,2,1h) caps at 1h = 3600s.
     ch.handle
-        .update_backoff_state(
-            "noisy",
-            Some(FailureBackoff::default()),
-            Some(wall),
-            7,
-        )
+        .update_backoff_state("noisy", Some(FailureBackoff::default()), Some(wall), 7)
         .await
         .unwrap();
     advance(StdDuration::from_millis(1)).await;

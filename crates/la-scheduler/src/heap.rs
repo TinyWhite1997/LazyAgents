@@ -201,11 +201,7 @@ impl EntryTable {
         // edit (changing the cron expression / catchup mode) should not
         // silently clear the executor-reported failure state, which only
         // the executor itself is authoritative over.
-        let preserved_backoff = self
-            .entries
-            .get(&id)
-            .map(|e| e.backoff)
-            .unwrap_or_default();
+        let preserved_backoff = self.entries.get(&id).map(|e| e.backoff).unwrap_or_default();
         let version = self.entries.get(&id).map(|e| e.version + 1).unwrap_or(1);
         let entry = Entry {
             id: id.clone(),
