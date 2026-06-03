@@ -169,6 +169,17 @@ fn translate_crons_key(code: KeyCode, mods: KeyModifiers, focus: Focus) -> Optio
     // decides (CronEditorEnter inserts a newline on multi-line fields,
     // saves on single-line). Explicit "save now" stays on Ctrl+S so the
     // multi-line fields are still typable.
+    //
+    // WEK-42 / M4.3 scope decision: the editor is a free-typing context,
+    // so the global `T` / `H` / `C` UI-pref keys are INTENTIONALLY
+    // captured as field input here. Reviewer flagged the asymmetry; the
+    // alternative (chording Ctrl+T/H/C to escape) collides with terminal
+    // conventions (Ctrl+H = backspace, Ctrl+C already = Quit). The
+    // user-visible workflow is: Esc → list → press T/H/C → continue
+    // editing. This matches how every other editor handles modeful
+    // prefs (vim's `:set`, less's `-/`). Pinned by
+    // `crons_editor_swallows_t_h_c_intentionally` in key_hints tests so
+    // the next reviewer doesn't have to spot it again.
     Some(match code {
         KeyCode::Esc => AppMsg::CronCancelDraft,
         KeyCode::Tab => AppMsg::CronFieldNext,
@@ -208,6 +219,19 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
         if mods.contains(KeyModifiers::CONTROL) {
             return Some(AppMsg::Quit);
         }
+    }
+    // WEK-42 / M4.3 review feedback: T/H/C are advertised as "globals" in
+    // the `?` overlay, so they must work inside modals too — otherwise
+    // a user who opens FullHints to read the binding can't actually try
+    // it. Capital letters are unambiguous (no modal handler takes them
+    // as confirm/cancel) so route them up to the global pref handlers
+    // before the per-modal switch claims the keystroke.
+    if let KeyCode::Char(c @ ('T' | 'H' | 'C')) = code {
+        return Some(match c {
+            'T' => AppMsg::CycleTheme,
+            'H' => AppMsg::CycleKeyHints,
+            _ => AppMsg::ToggleCompact,
+        });
     }
     Some(match modal {
         Modal::ConfirmDelete { .. } => match code {

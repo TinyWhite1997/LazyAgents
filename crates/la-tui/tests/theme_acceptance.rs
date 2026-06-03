@@ -87,6 +87,71 @@ fn toggle_compact_flips_pref() {
     assert!(!a.ui_prefs.compact);
 }
 
+/// WEK-42 / M4.3 review feedback: T/H/C are documented as globals, so
+/// they must work while a modal is open (otherwise the user opens
+/// FullHints to read the binding and can't actually fire it). Pre-fix
+/// the modal short-circuit silently dropped capital-letter keystrokes.
+#[test]
+fn t_h_c_work_inside_a_modal() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use la_tui::app::{Focus, Tab};
+    use la_tui::input::{translate, HitBoxes};
+
+    let modal = la_tui::app::Modal::FullHints;
+    let hit = HitBoxes {
+        tabs: Vec::new(),
+        sidebar: ratatui::layout::Rect::default(),
+        sidebar_scroll_offset: 0,
+        tab_bar_row: 0,
+        tab: Tab::Sessions,
+        focus: Focus::Sidebar,
+    };
+    for (ch, expected) in [
+        ('T', AppMsg::CycleTheme),
+        ('H', AppMsg::CycleKeyHints),
+        ('C', AppMsg::ToggleCompact),
+    ] {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        let msg = translate(ev, Some(&modal), &hit)
+            .unwrap_or_else(|| panic!("'{ch}' must route even with modal open"));
+        assert_eq!(msg, expected, "'{ch}' inside modal");
+    }
+}
+
+/// WEK-42 / M4.3 scope decision: the Crons editor pane is a free-typing
+/// context so T/H/C are CAPTURED as field input there (chord-free
+/// alternatives like Ctrl+H would collide with terminal backspace, and
+/// the user can always Esc → list to use the global pref keys). Pin
+/// this so the next reviewer sees the intentional asymmetry.
+#[test]
+fn crons_editor_captures_t_h_c_as_field_input() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use la_tui::app::{Focus, Tab};
+    use la_tui::input::{translate, HitBoxes};
+
+    let hit = HitBoxes {
+        tabs: Vec::new(),
+        sidebar: ratatui::layout::Rect::default(),
+        sidebar_scroll_offset: 0,
+        tab_bar_row: 0,
+        tab: Tab::Crons,
+        focus: Focus::Main,
+    };
+    for ch in ['T', 'H', 'C'] {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        let msg = translate(ev, None, &hit).expect("editor must translate every char");
+        // Should resolve to a CronFieldEdit, NOT to a UI-pref AppMsg.
+        let is_pref = matches!(
+            msg,
+            AppMsg::CycleTheme | AppMsg::CycleKeyHints | AppMsg::ToggleCompact
+        );
+        assert!(
+            !is_pref,
+            "'{ch}' inside crons editor must feed the buffer, not the global pref handler"
+        );
+    }
+}
+
 #[test]
 fn compact_mode_collapses_status_and_hint_into_one_row() {
     let default = render_with_prefs(UiPrefs::default());
@@ -306,5 +371,128 @@ fn ui_pref_changes_round_trip_through_config_toml() {
     assert!(
         raw.contains("log_level"),
         "[daemon].log_level must survive the TUI save: {raw}"
+    );
+}
+
+/// WEK-42 / M4.3 reviewer feedback: the original PR only used `Palette`
+/// for the hint bar; switching theme did not change any other render
+/// surface. Pin the inverse: render the exact same App twice with two
+/// different themes and assert that real cells in the status bar,
+/// tabs, and sidebar actually carry the theme's `Accent::*` colours.
+/// This is a render-level check (not a Palette-internal one), so it
+/// would catch a future regression where someone re-hardcodes a
+/// `Color::Cyan` somewhere.
+#[test]
+fn dark_and_light_themes_actually_diverge_on_real_cells() {
+    use ratatui::style::Color;
+
+    fn render(theme: Theme) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = App::new(MockSessionSource::fixture()).with_ui_prefs(
+            UiPrefs {
+                theme,
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        app.handle(AppMsg::SidebarDown);
+        terminal
+            .draw(|f| {
+                let _ = draw(f, &app);
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    let dark = render(Theme::Dark);
+    let light = render(Theme::Light);
+    let dark_pal = la_tui::theme::Palette::for_theme(Theme::Dark);
+    let light_pal = la_tui::theme::Palette::for_theme(Theme::Light);
+
+    /// Find the first cell whose symbol matches `needle` **within** the
+    /// inclusive y range `y0..=y1`. Bounded so the search doesn't pick
+    /// up an identical glyph from a different panel (the `○` for the
+    /// status-bar offline dot collides with `RunState::Idle`'s glyph
+    /// in the sidebar).
+    fn find_fg_in(
+        buf: &ratatui::buffer::Buffer,
+        needle: &str,
+        y0: u16,
+        y1: u16,
+    ) -> Option<Color> {
+        let area = buf.area();
+        for y in y0..=y1.min(area.height.saturating_sub(1)) {
+            for x in 0..area.width {
+                if buf[(x, y)].symbol() == needle {
+                    return buf[(x, y)].style().fg;
+                }
+            }
+        }
+        None
+    }
+
+    // The status bar lives in the last 2-3 rows. Scope status-cell
+    // sampling to that band.
+    let status_y0 = dark.area.height.saturating_sub(3);
+    let status_y1 = dark.area.height.saturating_sub(1);
+
+    // 1) Status bar: the offline ○ daemon dot must carry `Accent::Error`
+    //    in each theme. Pre-M4.3 it was a hardcoded `Color::Red`, so
+    //    Dark and Light would have rendered the same colour and this
+    //    test would have failed even though Palette differed.
+    let dark_dot =
+        find_fg_in(&dark, "○", status_y0, status_y1).expect("dark offline dot in status band");
+    let light_dot =
+        find_fg_in(&light, "○", status_y0, status_y1).expect("light offline dot in status band");
+    assert_eq!(
+        dark_dot,
+        dark_pal.color(la_tui::theme::Accent::Error),
+        "dark status dot must use Dark Palette Error"
+    );
+    assert_eq!(
+        light_dot,
+        light_pal.color(la_tui::theme::Accent::Error),
+        "light status dot must use Light Palette Error"
+    );
+    assert_ne!(
+        dark_dot, light_dot,
+        "Dark vs Light Error must differ — otherwise the theme cycle is a visual no-op"
+    );
+
+    // 2) Active tab chip background: pre-M4.3 was hardcoded Cyan; now
+    //    must be `Accent::Primary` per palette. The tab bar is row 0.
+    fn find_bg_in(
+        buf: &ratatui::buffer::Buffer,
+        needle: &str,
+        y0: u16,
+        y1: u16,
+    ) -> Option<Color> {
+        let area = buf.area();
+        for y in y0..=y1.min(area.height.saturating_sub(1)) {
+            for x in 0..area.width {
+                if buf[(x, y)].symbol() == needle {
+                    return buf[(x, y)].style().bg;
+                }
+            }
+        }
+        None
+    }
+    // The "S" of "[ Sessions ]" sits inside the active chip on row 0.
+    let dark_chip = find_bg_in(&dark, "S", 0, 0).expect("dark chip bg");
+    let light_chip = find_bg_in(&light, "S", 0, 0).expect("light chip bg");
+    assert_eq!(
+        dark_chip,
+        dark_pal.color(la_tui::theme::Accent::Primary),
+        "dark tab chip bg must use Dark Palette Primary"
+    );
+    assert_eq!(
+        light_chip,
+        light_pal.color(la_tui::theme::Accent::Primary),
+        "light tab chip bg must use Light Palette Primary"
+    );
+    assert_ne!(
+        dark_chip, light_chip,
+        "Dark vs Light Primary must differ on real tab cells"
     );
 }

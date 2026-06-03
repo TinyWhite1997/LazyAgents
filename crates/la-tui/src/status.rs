@@ -26,10 +26,12 @@
 
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+
+use crate::theme::{Accent, Palette, Theme};
 
 /// Most-recent cron firing pulse, used to flash a brief "↻ cron-id" badge
 /// on the bar.
@@ -83,7 +85,18 @@ impl Status {
 }
 
 pub fn render_status(frame: &mut Frame<'_>, area: Rect, status: &Status) {
-    render_status_at(frame, area, status, Utc::now())
+    render_status_themed(frame, area, status, &Palette::for_theme(Theme::Auto))
+}
+
+/// Like [`render_status`] but with a caller-supplied palette so the
+/// runner can pass the active theme through (WEK-42 / M4.3).
+pub fn render_status_themed(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    status: &Status,
+    palette: &Palette,
+) {
+    render_status_at(frame, area, status, Utc::now(), palette)
 }
 
 /// WEK-42 / M4.3: compact-mode entry point.
@@ -94,8 +107,13 @@ pub fn render_status(frame: &mut Frame<'_>, area: Rect, status: &Status) {
 /// shrinks the area to one line for compact mode. The compact variant
 /// drops the border entirely so the single row carries the spans
 /// themselves.
-pub fn render_status_compact(frame: &mut Frame<'_>, area: Rect, status: &Status) {
-    render_status_compact_at(frame, area, status, Utc::now())
+pub fn render_status_compact(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    status: &Status,
+    palette: &Palette,
+) {
+    render_status_compact_at(frame, area, status, Utc::now(), palette)
 }
 
 pub fn render_status_compact_at(
@@ -103,35 +121,48 @@ pub fn render_status_compact_at(
     area: Rect,
     status: &Status,
     now: DateTime<Utc>,
+    palette: &Palette,
 ) {
-    let spans = status_spans(status, now);
+    let spans = status_spans(status, now, palette);
     let para = Paragraph::new(Line::from(spans));
     frame.render_widget(para, area);
 }
 
 /// Like [`render_status`] but with a caller-supplied `now`. Lets tests
 /// pin the pulse-decay deterministically.
-pub fn render_status_at(frame: &mut Frame<'_>, area: Rect, status: &Status, now: DateTime<Utc>) {
-    let spans = status_spans(status, now);
+pub fn render_status_at(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    status: &Status,
+    now: DateTime<Utc>,
+    palette: &Palette,
+) {
+    let spans = status_spans(status, now, palette);
     let para = Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::TOP));
     frame.render_widget(para, area);
 }
 
 /// Shared span builder used by the two- and one-row renderers.
-fn status_spans<'a>(status: &Status, now: DateTime<Utc>) -> Vec<Span<'a>> {
+fn status_spans<'a>(status: &Status, now: DateTime<Utc>, palette: &Palette) -> Vec<Span<'a>> {
     let mut left: Vec<Span<'_>> = Vec::with_capacity(16);
 
-    // ● daemon  (green) / ○ daemon  (red).
-    left.push(daemon_badge(status.daemon_online));
+    // ● daemon  (Accent::Ok) / ○ daemon  (Accent::Error).
+    left.push(daemon_badge(status.daemon_online, palette));
     push_sep(&mut left);
-    left.push(Span::raw(format!("{} running", status.running)));
+    left.push(Span::styled(
+        format!("{} running", status.running),
+        Style::default().fg(palette.color(Accent::Body)),
+    ));
 
     // next 02:00 — Crons-derived. Absent ⇒ skip the cell rather than
     // padding so a workspace with no crons doesn't bury the actually-
     // visible fields in placeholders.
     if let Some(cron) = &status.next_cron_label {
         push_sep(&mut left);
-        left.push(Span::raw(cron.clone()));
+        left.push(Span::styled(
+            cron.clone(),
+            Style::default().fg(palette.color(Accent::Body)),
+        ));
     }
 
     // ↻ cron-id pulse — visible for PULSE_TTL after `cron.fired`.
@@ -141,17 +172,20 @@ fn status_spans<'a>(status: &Status, now: DateTime<Utc>) -> Vec<Span<'a>> {
             left.push(Span::styled(
                 format!("↻ {}", pulse.cron_id),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette.color(Accent::Primary))
                     .add_modifier(Modifier::BOLD),
             ));
         }
     }
 
-    // Cost ($—/day until a daemon RPC populates it).
+    // Cost ($—/day until a daemon RPC populates it). Routed through
+    // Accent::Warn so the Light palette swaps the dark-mode yellow for
+    // a WCAG-AA brown — the original `Color::Yellow` on a white canvas
+    // fails AA at ~1.7:1 (reviewer's WCAG concern).
     push_sep(&mut left);
     left.push(Span::styled(
         cost_label(status.today_cost_label.as_deref()),
-        Style::default().fg(Color::Yellow),
+        Style::default().fg(palette.color(Accent::Warn)),
     ));
 
     // Right context — usually `branch +N` from the focused session.
@@ -159,7 +193,7 @@ fn status_spans<'a>(status: &Status, now: DateTime<Utc>) -> Vec<Span<'a>> {
         push_sep(&mut left);
         left.push(Span::styled(
             status.right_context.clone(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette.color(Accent::Muted)),
         ));
     }
 
@@ -167,7 +201,7 @@ fn status_spans<'a>(status: &Status, now: DateTime<Utc>) -> Vec<Span<'a>> {
     // dynamic span list — the field is the user's main attention
     // grabber and benefits from a stable position.
     push_sep(&mut left);
-    left.push(errors_badge(status.errors_last_5m));
+    left.push(errors_badge(status.errors_last_5m, palette));
     left
 }
 
@@ -175,18 +209,20 @@ fn push_sep<'a>(spans: &mut Vec<Span<'a>>) {
     spans.push(Span::raw("  ·  "));
 }
 
-fn daemon_badge<'a>(online: bool) -> Span<'a> {
+fn daemon_badge<'a>(online: bool, palette: &Palette) -> Span<'a> {
     if online {
         Span::styled(
             "● daemon",
             Style::default()
-                .fg(Color::Green)
+                .fg(palette.color(Accent::Ok))
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
             "○ daemon",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette.color(Accent::Error))
+                .add_modifier(Modifier::BOLD),
         )
     }
 }
@@ -198,18 +234,20 @@ fn cost_label(today: Option<&str>) -> String {
     }
 }
 
-fn errors_badge<'a>(n: u32) -> Span<'a> {
+fn errors_badge<'a>(n: u32, palette: &Palette) -> Span<'a> {
     if n == 0 {
         Span::styled(
             "OK",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(palette.color(Accent::Muted))
                 .add_modifier(Modifier::DIM),
         )
     } else {
         Span::styled(
             format!("⚠ {n} errors  [f]"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette.color(Accent::Error))
+                .add_modifier(Modifier::BOLD),
         )
     }
 }
@@ -223,10 +261,11 @@ mod tests {
     fn render_to_text(status: &Status, now: DateTime<Utc>) -> String {
         let backend = TestBackend::new(120, 2);
         let mut terminal = Terminal::new(backend).expect("test terminal");
+        let palette = Palette::for_theme(Theme::Auto);
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, 120, 2);
-                render_status_at(f, area, status, now);
+                render_status_at(f, area, status, now, &palette);
             })
             .expect("draw");
         let buf = terminal.backend().buffer().clone();

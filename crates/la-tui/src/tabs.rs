@@ -5,16 +5,22 @@
 //! / `2` cycle; mouse click selects directly.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::Tab;
+use crate::theme::{Accent, Palette};
 
 /// Render the tab bar across `area`. Returns the absolute column ranges
 /// each tab occupies so the mouse hit-tester ([`tab_at_column`]) can map a
 /// click x-coord to the right tab.
+///
+/// `palette` carries the active theme (WEK-42 / M4.3). The active tab
+/// chip uses `Accent::Primary` (bg) + `Accent::OnAccent` (fg) so the
+/// contrast pair survives a `T`-keyed Dark↔Light switch; inactive tabs
+/// fall back to `Accent::Muted` so they remain readable on either canvas.
 ///
 /// Note: ratatui has a built-in `Tabs` widget, but we want explicit hit
 /// boxes for mouse routing and a custom "[ active ]" visual; rolling our
@@ -23,6 +29,7 @@ pub fn render_tabs(
     frame: &mut Frame<'_>,
     area: Rect,
     active: Tab,
+    palette: &Palette,
 ) -> Vec<(Tab, std::ops::Range<u16>)> {
     let mut spans: Vec<Span<'_>> = Vec::new();
     let mut ranges: Vec<(Tab, std::ops::Range<u16>)> = Vec::new();
@@ -31,11 +38,11 @@ pub fn render_tabs(
         let label = format!(" [ {} ] ", tab.label());
         let style = if tab == active {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(palette.color(Accent::OnAccent))
+                .bg(palette.color(Accent::Primary))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(palette.color(Accent::Muted))
         };
         let width = label.chars().count() as u16;
         ranges.push((tab, cursor..(cursor + width)));
@@ -59,6 +66,7 @@ pub fn tab_at_column(column: u16, ranges: &[(Tab, std::ops::Range<u16>)]) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Theme;
 
     #[test]
     fn hit_test_picks_right_tab() {
@@ -67,5 +75,18 @@ mod tests {
         assert_eq!(tab_at_column(2, &ranges), Some(Tab::Sessions));
         assert_eq!(tab_at_column(14, &ranges), Some(Tab::Crons));
         assert_eq!(tab_at_column(99, &ranges), None);
+    }
+
+    /// Dark vs Light: the active tab chip bg must come from each
+    /// palette's `Accent::Primary`, not a hardcoded `Color::Cyan`.
+    #[test]
+    fn active_tab_bg_tracks_palette() {
+        let dark = Palette::for_theme(Theme::Dark);
+        let light = Palette::for_theme(Theme::Light);
+        assert_ne!(
+            dark.color(Accent::Primary),
+            light.color(Accent::Primary),
+            "Dark vs Light primary must differ — otherwise theme cycle is a no-op"
+        );
     }
 }
