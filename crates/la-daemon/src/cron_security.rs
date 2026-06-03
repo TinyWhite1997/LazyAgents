@@ -12,50 +12,46 @@ pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 /// Fields that change what unattended cron execution will do or spend.
 ///
-/// `failure_backoff` is intentionally excluded: it changes retry cadence after
-/// failures, not the command, prompt, schedule, or budget of a successful run.
+/// Pinned by Rev2 §B4: exactly these eight fields gate the confirmation token
+/// flow. Anything else (project_id, max_concurrent_runs, max_runtime_s,
+/// pause_on_consecutive_failures, failure_backoff, …) is a non-sensitive edit
+/// and must NOT require reconfirmation. The list is asserted against the brief
+/// by `sensitive_fields_match_brief_rev2_b4` — adding or dropping a variant
+/// here without updating that test (and the brief) breaks the build on
+/// purpose.
 pub const SENSITIVE_CRON_FIELDS: &[CronSensitiveField] = &[
-    CronSensitiveField::ProjectId,
+    CronSensitiveField::Prompt,
     CronSensitiveField::BackendId,
     CronSensitiveField::SpawnArgs,
-    CronSensitiveField::Prompt,
     CronSensitiveField::CronExpr,
     CronSensitiveField::Timezone,
-    CronSensitiveField::MaxConcurrentRuns,
+    CronSensitiveField::CatchupMode,
     CronSensitiveField::MaxRunsPerDay,
-    CronSensitiveField::MaxRuntimeSeconds,
     CronSensitiveField::CostBudgetUsdPerDay,
-    CronSensitiveField::PauseOnConsecutiveFailures,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CronSensitiveField {
-    ProjectId,
+    Prompt,
     BackendId,
     SpawnArgs,
-    Prompt,
     CronExpr,
     Timezone,
-    MaxConcurrentRuns,
+    CatchupMode,
     MaxRunsPerDay,
-    MaxRuntimeSeconds,
     CostBudgetUsdPerDay,
-    PauseOnConsecutiveFailures,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CronSecuritySnapshot {
-    pub project_id: String,
     pub backend_id: String,
     pub spawn_args: serde_json::Value,
     pub prompt: String,
     pub cron_expr: String,
     pub tz: String,
-    pub max_concurrent_runs: i64,
+    pub catchup_mode: String,
     pub max_runs_per_day: i64,
-    pub max_runtime_s: i64,
     pub cost_budget_usd_per_day: Option<f64>,
-    pub pause_on_consecutive_failures: i64,
 }
 
 impl CronSecuritySnapshot {
@@ -71,8 +67,8 @@ impl CronSecuritySnapshot {
 
     pub fn changed_sensitive_fields(&self, next: &Self) -> Vec<CronSensitiveField> {
         let mut changed = Vec::new();
-        if self.project_id != next.project_id {
-            changed.push(CronSensitiveField::ProjectId);
+        if self.prompt != next.prompt {
+            changed.push(CronSensitiveField::Prompt);
         }
         if self.backend_id != next.backend_id {
             changed.push(CronSensitiveField::BackendId);
@@ -80,29 +76,20 @@ impl CronSecuritySnapshot {
         if self.spawn_args != next.spawn_args {
             changed.push(CronSensitiveField::SpawnArgs);
         }
-        if self.prompt != next.prompt {
-            changed.push(CronSensitiveField::Prompt);
-        }
         if self.cron_expr != next.cron_expr {
             changed.push(CronSensitiveField::CronExpr);
         }
         if self.tz != next.tz {
             changed.push(CronSensitiveField::Timezone);
         }
-        if self.max_concurrent_runs != next.max_concurrent_runs {
-            changed.push(CronSensitiveField::MaxConcurrentRuns);
+        if self.catchup_mode != next.catchup_mode {
+            changed.push(CronSensitiveField::CatchupMode);
         }
         if self.max_runs_per_day != next.max_runs_per_day {
             changed.push(CronSensitiveField::MaxRunsPerDay);
         }
-        if self.max_runtime_s != next.max_runtime_s {
-            changed.push(CronSensitiveField::MaxRuntimeSeconds);
-        }
         if self.cost_budget_usd_per_day != next.cost_budget_usd_per_day {
             changed.push(CronSensitiveField::CostBudgetUsdPerDay);
-        }
-        if self.pause_on_consecutive_failures != next.pause_on_consecutive_failures {
-            changed.push(CronSensitiveField::PauseOnConsecutiveFailures);
         }
         changed
     }
@@ -310,17 +297,14 @@ mod tests {
 
     fn snapshot(prompt: &str) -> CronSecuritySnapshot {
         CronSecuritySnapshot {
-            project_id: "project".into(),
             backend_id: "claude".into(),
             spawn_args: serde_json::json!(["--model", "sonnet"]),
             prompt: prompt.into(),
             cron_expr: "17 3 * * *".into(),
             tz: "UTC".into(),
-            max_concurrent_runs: 1,
+            catchup_mode: "coalesce".into(),
             max_runs_per_day: 24,
-            max_runtime_s: 1800,
             cost_budget_usd_per_day: Some(1.5),
-            pause_on_consecutive_failures: 5,
         }
     }
 
@@ -355,6 +339,41 @@ mod tests {
     #[test]
     fn failure_backoff_is_not_a_sensitive_field() {
         assert!(!format!("{:?}", SENSITIVE_CRON_FIELDS).contains("FailureBackoff"));
+    }
+
+    #[test]
+    fn sensitive_fields_match_brief_rev2_b4() {
+        use std::collections::HashSet;
+
+        // Rev2 §B4 enumerates exactly these eight sensitive fields. The set is
+        // pinned here so any future addition or removal in
+        // `SENSITIVE_CRON_FIELDS` must be made deliberately, alongside the
+        // brief itself. Order is intentionally not asserted.
+        let expected: HashSet<CronSensitiveField> = [
+            CronSensitiveField::Prompt,
+            CronSensitiveField::BackendId,
+            CronSensitiveField::SpawnArgs,
+            CronSensitiveField::CronExpr,
+            CronSensitiveField::Timezone,
+            CronSensitiveField::CatchupMode,
+            CronSensitiveField::MaxRunsPerDay,
+            CronSensitiveField::CostBudgetUsdPerDay,
+        ]
+        .into_iter()
+        .collect();
+        let actual: HashSet<CronSensitiveField> =
+            SENSITIVE_CRON_FIELDS.iter().copied().collect();
+
+        assert_eq!(
+            actual, expected,
+            "SENSITIVE_CRON_FIELDS must equal Rev2 §B4 exactly; \
+             update both the brief and this test when changing the set"
+        );
+        assert_eq!(
+            SENSITIVE_CRON_FIELDS.len(),
+            8,
+            "Rev2 §B4 pins exactly eight sensitive fields"
+        );
     }
 
     #[test]
