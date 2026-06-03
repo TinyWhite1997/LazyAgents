@@ -321,14 +321,12 @@ fn dst_spring_forward_skips_missing_local_hour() {
 }
 
 #[test]
-fn dst_fall_back_fires_ambiguous_hour_in_both_offsets() {
+fn dst_fall_back_takes_first_ambiguous_hour_only() {
     // 2026-11-01: LA clocks fall back at 02:00 → 01:00 PST. A cron at
-    // "30 1 * * *" matches the wall-clock pattern "01:30 local" twice — once
-    // at 01:30 PDT (08:30 UTC) and again at 01:30 PST (09:30 UTC). This is
-    // the cron crate's documented behaviour and matches the IANA semantics
-    // most users expect: the wall clock literally shows 01:30 on two
-    // separate instants, so the cron fires on both. Verifying it here pins
-    // the semantics so a future cron-crate upgrade can't silently regress.
+    // "30 1 * * *" maps to 01:30 PDT (08:30 UTC) and 01:30 PST (09:30 UTC).
+    // ADR-0002 keeps IANA timezone resolution but applies LazyAgents'
+    // take-first policy so unattended cron runs do not duplicate side effects
+    // or spend in the repeated wall-clock hour.
     let tz: Tz = Los_Angeles;
     let spec = CronSpec::parse("30 1 * * *", "America/Los_Angeles").unwrap();
 
@@ -345,13 +343,10 @@ fn dst_fall_back_fires_ambiguous_hour_in_both_offsets() {
         })
         .collect();
     assert_eq!(
-        day_fires.len(),
-        2,
-        "fall-back day's ambiguous 01:30 fires once per offset, got {fires:#?}",
+        day_fires,
+        vec![Utc.with_ymd_and_hms(2026, 11, 1, 8, 30, 0).unwrap()],
+        "fall-back day's ambiguous 01:30 should keep only the first occurrence, got {fires:#?}",
     );
-    // Both fires must be exactly one hour apart in UTC: PDT at 08:30Z then
-    // PST at 09:30Z.
-    assert_eq!(day_fires[1] - day_fires[0], Duration::hours(1));
 }
 
 #[tokio::test(start_paused = true, flavor = "current_thread")]
