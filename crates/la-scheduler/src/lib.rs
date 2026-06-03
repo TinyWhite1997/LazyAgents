@@ -77,11 +77,14 @@ pub mod heap;
 pub mod quota;
 mod scheduler;
 
-pub use catchup::{apply_catchup, CatchupMode, CatchupOutcome, ResolvedFire, MAX_CATCHUP};
+pub use catchup::{
+    apply_catchup, apply_catchup_with_total, CatchupMode, CatchupOutcome, CatchupTruncated,
+    ResolvedFire, MAX_CATCHUP,
+};
 #[cfg(any(test, feature = "test-util"))]
 pub use clock::FakeClock;
 pub use clock::{system_clock, Clock, SharedClock, SystemClock};
-pub use cron_spec::CronSpec;
+pub use cron_spec::{CountedMissed, CronSpec};
 pub use error::Error;
 pub use event::{FireEvent, SchedulerEvent};
 pub use heap::{next_eligible_fire, BackoffState, CronId, Entry, EntryTable, HeapEntry};

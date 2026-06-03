@@ -22,7 +22,8 @@
 //!
 //! All three funnel through [`Scheduler::process_missed_fires`] so the same
 //! `apply_catchup` resolver decides skip/coalesce/replay and the same
-//! `catchup_degraded` flag fires when `MAX_CATCHUP` is breached.
+//! `catchup_truncated` flag (plus matching `SchedulerEvent::CatchupTruncated`
+//! diagnostic) fires when `MAX_CATCHUP` is breached.
 
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep_until, Duration as StdDuration, Instant};
 use tracing::{debug, info, warn};
 
-use crate::catchup::{apply_catchup, CatchupMode, MAX_CATCHUP};
+use crate::catchup::{apply_catchup_with_total, CatchupMode, MAX_CATCHUP};
 use crate::clock::{wall_to_instant, Clock, SharedClock};
 use crate::command::Command;
 use crate::cron_spec::CronSpec;
@@ -44,10 +45,16 @@ use crate::quota::backoff::FailureBackoff;
 const SKEW_TICK: StdDuration = StdDuration::from_secs(60);
 /// Skew threshold that triggers a full re-heap (§5.2: "> 30 s").
 const SKEW_THRESHOLD_SECS: i64 = 30;
-/// Hard ceiling on per-recovery catch-up enumeration, matching
-/// [`crate::catchup::MAX_CATCHUP`]. We pass `MAX_CATCHUP + 1` to
-/// `fires_between` so the resolver can *see* the overflow case.
-const MISSED_FIRES_PROBE_CAP: usize = MAX_CATCHUP + 1;
+/// Safety ceiling on the *counting* loop inside
+/// [`crate::cron_spec::CronSpec::count_missed`]. We need an honest backlog
+/// count so the `scheduler.catchup_truncated` metric can report
+/// `missed/dropped` correctly (WEK-58 review blocker), but a pathological
+/// expression (`* * * * * *` against a year-long gap) could enumerate
+/// hundreds of millions of fires. `MAX_CATCHUP * 100 = 10_000` is a wide
+/// enough window for "honest" backlogs while still bounding work to a few
+/// ms even on the worst spec; when this cap is hit, `CatchupTruncated.saturated`
+/// flips and the daemon logs that the count is a lower bound.
+const MISSED_FIRES_COUNT_CAP: usize = MAX_CATCHUP * 100;
 
 /// Cap on the buffered fire event channel. 256 is comfortable for the
 /// "thousands of crons / day" volume the architecture targets without
@@ -546,7 +553,7 @@ impl Scheduler {
                 scheduled_at: top.fire_at,
                 fired_at: now,
                 coalesced_count: 1,
-                catchup_degraded: false,
+                catchup_truncated: false,
             };
             if self.fire_tx.send(event).await.is_err() {
                 warn!("fire channel closed; dropping further events");
@@ -681,24 +688,64 @@ impl Scheduler {
     /// `(inputs.last_fired_at, inputs.end]`, runs the resolver, and pushes
     /// one `FireEvent` per resolved emission onto the fire channel.
     ///
+    /// When the resolver crosses [`crate::catchup::MAX_CATCHUP`] it also
+    /// fans a [`SchedulerEvent::CatchupTruncated`] onto the diagnostic
+    /// channel so the daemon / UI can warn that older fires were dropped
+    /// (§S1 / WEK-58).
+    ///
     /// Returns `Err(Error::Invariant)` if the fire channel has been closed
     /// by the consumer — the loop treats that as a fatal exit signal.
     async fn process_missed_fires(&self, inputs: MissedFireInputs<'_>) -> Result<(), Error> {
-        let missed =
-            inputs
-                .spec
-                .fires_between(inputs.last_fired_at, inputs.end, MISSED_FIRES_PROBE_CAP);
-        if missed.is_empty() {
+        // Count the real backlog so `scheduler.catchup_truncated` can report
+        // honest `missed/dropped` — `fires_between(.., MAX_CATCHUP+1)` would
+        // cap the visible count at 101 and forever under-report (WEK-58
+        // review blocker). We only materialise `MAX_CATCHUP` timestamps for
+        // execution; the counter walks up to `MISSED_FIRES_COUNT_CAP` before
+        // saturating.
+        let counted = inputs.spec.count_missed(
+            inputs.last_fired_at,
+            inputs.end,
+            MAX_CATCHUP,
+            MISSED_FIRES_COUNT_CAP,
+        );
+        if counted.total == 0 {
             return Ok(());
         }
-        let outcome = apply_catchup(&missed, inputs.mode, inputs.min_replay_interval)?;
+        let outcome = apply_catchup_with_total(
+            &counted.earliest,
+            counted.total,
+            counted.saturated,
+            inputs.mode,
+            inputs.min_replay_interval,
+        )?;
+        let truncated_flag = outcome.truncated.is_some();
+        if let Some(t) = &outcome.truncated {
+            tracing::warn!(
+                cron_id = %inputs.id,
+                missed = t.missed,
+                executed = t.executed,
+                dropped = t.dropped,
+                saturated = t.saturated,
+                "scheduler.catchup_truncated"
+            );
+            // Best-effort diagnostic; never block the fire path on the
+            // metric channel. `try_send` keeps over-cap bursts from
+            // back-pressuring against a slow subscriber.
+            let _ = self.diag_tx.try_send(SchedulerEvent::CatchupTruncated {
+                cron_id: inputs.id.to_string(),
+                missed: t.missed,
+                executed: t.executed,
+                dropped: t.dropped,
+                saturated: t.saturated,
+            });
+        }
         for fire in outcome.fires {
             let event = FireEvent {
                 cron_id: inputs.id.to_string(),
                 scheduled_at: fire.scheduled_at,
                 fired_at: inputs.fired_at,
                 coalesced_count: fire.coalesced_count,
-                catchup_degraded: outcome.degraded_to_skip,
+                catchup_truncated: truncated_flag,
             };
             if self.fire_tx.send(event).await.is_err() {
                 return Err(Error::Invariant("fire channel closed"));
