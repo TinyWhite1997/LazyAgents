@@ -65,7 +65,7 @@ Then re-create the session. See [Adapters → When the adapter says "unauthentic
 
 ### `command not found` on spawn
 
-The adapter expects the backend CLI to be on `$PATH`. Either install it, or pass an absolute `program_override` to `sessions.create`. A persistent per-adapter config key is on the roadmap.
+The adapter expects the backend CLI to be on `$PATH`. Install it (or symlink it onto `$PATH` ahead of any other binary by the same name). v1 has no `config.toml` knob to point an adapter at a non-default path; a persistent per-adapter config key is on the roadmap.
 
 ### Worktree creation fails before the session starts
 

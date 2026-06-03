@@ -65,7 +65,7 @@ sqlite3 "$XDG_DATA_HOME/lazyagents/lad.sqlite" 'SELECT * FROM _sqlx_migrations;'
 
 ### spawn 时 `command not found`
 
-adapter 期望后端 CLI 在 `$PATH`。装上，或者在 `sessions.create` 中传绝对的 `program_override`。持久化的每后端配置项在 roadmap 上。
+adapter 期望后端 CLI 在 `$PATH`。装上（或在 `$PATH` 上把它软链到同名二进制之前）。v1 没有 `config.toml` 旋钮把 adapter 指到非默认路径；持久化的每后端配置项在 roadmap 上。
 
 ### 会话开始前 worktree 创建失败
 

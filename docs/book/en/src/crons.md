@@ -37,7 +37,7 @@ The full rationale is in [ADR-0002](https://github.com/TinyWhite1997/LazyAgents/
 {"jsonrpc":"2.0","id":1,"method":"crons.upsert","params":{
   "name":      "nightly-refactor",
   "project_id":"<your project id>",
-  "backend_id":"claude",
+  "backend":    "claude",
   "spawn_args": [],
   "prompt":    "Run the nightly refactor checklist.",
   "cron_expr": "0 2 * * *",

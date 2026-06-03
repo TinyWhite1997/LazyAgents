@@ -12,13 +12,13 @@ Adapters are pure code: they don't own PTYs, don't write to SQLite, and don't to
 
 ## Adapters shipped in v1
 
-| Adapter id | Wraps | Default executable | Per-spawn path override |
-|---|---|---|---|
-| `claude` | Anthropic Claude Code | `claude` | `SpawnRequest::program_override` |
-| `codex` | OpenAI Codex CLI | `codex` | `SpawnRequest::program_override` |
-| `opencode` | sst.dev OpenCode | `opencode` | `SpawnRequest::program_override` |
+| Adapter id | Wraps | Default executable |
+|---|---|---|
+| `claude` | Anthropic Claude Code | `claude` |
+| `codex` | OpenAI Codex CLI | `codex` |
+| `opencode` | sst.dev OpenCode | `opencode` |
 
-The default executable is looked up on `$PATH`. If you need to point an adapter at a non-default path, pass an absolute path in the per-spawn `program_override` field of `sessions.create` (or via the test-only `--test-shell-adapter` flag on a debug build of `lad`). v1 does not yet read a persistent `adapters.*.command` config from `config.toml` — that's a follow-up.
+The default executable is looked up on `$PATH`. v1 has no wire-level or `config.toml` knob to point an adapter at a non-default binary — the adapter's `SpawnRequest::program_override` field exists in the Rust API (and is exercised by the test-only `--test-shell-adapter` flag on a debug build of `lad`), but `sessions.create`'s wire schema does not yet plumb it through, and the daemon does not read an `adapters.*.command` config. If you need to redirect to a beta build or wrapper script today, symlink it onto `$PATH` ahead of the real binary. Persistent per-adapter config is a follow-up.
 
 ## Authentication: LazyAgents never logs you in
 
@@ -93,9 +93,11 @@ The walk is bounded to the file-type globs above; it does not chase symlinks out
 {"jsonrpc":"2.0","id":1,"method":"adapters.discover","params":{"backend":"claude"}}
 {"jsonrpc":"2.0","id":2,"method":"sessions.import","params":{
   "backend":      "claude",
-  "external_id":  "<the external_id from the discover result>"
+  "external_ids": ["<external_id-from-discover>"]
 }}
 ```
+
+`external_ids` is a list — pass one or many. Omitting it imports every session the adapter currently discovers; unknown ids are silently dropped so a stale snapshot never wedges the call.
 
 The import handler creates a fresh LazyAgents row with `origin = "import"`:
 
