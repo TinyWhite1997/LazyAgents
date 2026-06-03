@@ -84,6 +84,12 @@ struct TestDaemon {
     socket: PathBuf,
     handle: la_daemon::DaemonHandle,
     join: tokio::task::JoinHandle<()>,
+    /// Snapshot of the running daemon's event bus. Tests that want to
+    /// inject a `BusEvent` (e.g. the WEK-36 cron-delivery acceptance,
+    /// which publishes a `CronFired` and checks the wire path) hold
+    /// this on the side so they don't have to poke the daemon's
+    /// internals through unsafe extraction.
+    bus: Option<la_core::EventBus>,
     _tempdir: TempDir,
 }
 
@@ -124,6 +130,7 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
         socket,
         handle,
         join,
+        bus: None,
         _tempdir: tempdir,
     }
 }
@@ -1183,6 +1190,7 @@ async fn bootstrap_daemon_with_adapters(
         ..DaemonConfig::default()
     };
     let daemon = Daemon::bind(config).await.expect("bind daemon");
+    let bus = daemon.manager.bus();
     let (handle, join) = daemon.spawn();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
@@ -1196,6 +1204,7 @@ async fn bootstrap_daemon_with_adapters(
         socket,
         handle,
         join,
+        bus: Some(bus),
         _tempdir: tempdir,
     }
 }
@@ -1535,4 +1544,83 @@ async fn events_subscribe_immediately_pushes_cached_daemon_health_snapshot() {
     handle.shutdown();
     let _ = timeout(Duration::from_secs(15), join).await;
     outcome.expect("subscribe-snapshot test deadline exceeded");
+}
+
+/// WEK-36 review fix: subscribing to `cron.fired` must actually take
+/// (echoed back in the effective topic set) AND must actually deliver
+/// any `BusEvent::CronFired` the daemon publishes. Pre-fix the
+/// dispatcher silently dropped the topic on subscribe AND lacked a
+/// delivery branch, so the TUI's status-bar pulse only ever worked in
+/// stub tests.
+#[tokio::test]
+async fn cron_fired_subscribes_and_delivers_over_ipc() {
+    use la_core::BusEvent;
+    use la_proto::methods::{EventTopic, EventsSubscribeParams, EventsSubscribeResult};
+    use la_proto::notifications::CronFiredParams;
+
+    let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+    adapters.insert(
+        "codex".to_string(),
+        Arc::new(ProbeOnlyAdapter {
+            id: "codex",
+            probe_result: la_adapter::ProbeResult::Available {
+                version: "0.0".into(),
+            },
+        }),
+    );
+    let daemon = bootstrap_daemon_with_adapters(adapters).await;
+    let bus = daemon.bus.clone().expect("test daemon exposes its bus");
+    let mut conn = client(&daemon.socket).await;
+
+    let sub = EventsSubscribeParams {
+        topics: vec![EventTopic::CronFired],
+    };
+    send_request(&mut conn, 1, "events.subscribe", &sub).await;
+    let ack: EventsSubscribeResult =
+        serde_json::from_value(recv_response_for(&mut conn, 1).await).expect("decode sub");
+    assert!(
+        ack.topics.contains(&EventTopic::CronFired),
+        "daemon dropped CronFired from the effective topic set: {:?}",
+        ack.topics
+    );
+
+    // Publish a fake cron firing on the bus. The dispatcher's writer
+    // task should serialize it as `cron.fired` and push it down this
+    // connection. We retry a few times because the broadcast bus only
+    // delivers to subscribers active at publish time and the writer
+    // task may still be spinning up the first tick after subscribe.
+    let payload = CronFiredParams {
+        cron_id: "nightly-review".into(),
+        run_id: "r-1".into(),
+        fired_at: "2026-06-03T02:00:00Z".into(),
+        status: "spawning".into(),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got: Option<CronFiredParams> = None;
+    let mut last_publish = tokio::time::Instant::now();
+    bus.publish(BusEvent::CronFired(payload.clone()));
+    while tokio::time::Instant::now() < deadline && got.is_none() {
+        match tokio::time::timeout(Duration::from_millis(250), conn.recv()).await {
+            Ok(Ok(Some(Message::Notification(n)))) if n.method == "cron.fired" => {
+                let p: CronFiredParams = serde_json::from_value(n.params.expect("cron params"))
+                    .expect("decode cron.fired");
+                got = Some(p);
+            }
+            _ => {
+                // Republish every 200ms in case the writer task hadn't
+                // subscribed yet on the first attempt.
+                if last_publish.elapsed() >= Duration::from_millis(200) {
+                    bus.publish(BusEvent::CronFired(payload.clone()));
+                    last_publish = tokio::time::Instant::now();
+                }
+            }
+        }
+    }
+
+    let received = got.expect("never received a cron.fired notification over IPC");
+    assert_eq!(received.cron_id, "nightly-review");
+    assert_eq!(received.run_id, "r-1");
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }

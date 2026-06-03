@@ -142,7 +142,17 @@ pub fn spawn_with_config(socket: &Path, cfg: ReconnectConfig) -> Receiver<NotifE
 async fn reconnect_loop(socket: PathBuf, tx: Sender<NotifEvent>, cfg: ReconnectConfig) {
     let mut backoff = cfg.initial_backoff;
     loop {
-        match run_once(&socket, &tx).await {
+        // `run_once` flips `connected` to true the instant the subscribe
+        // request is acknowledged, regardless of what happens next. We
+        // use that to decide whether to reset the backoff: a connection
+        // that successfully established and then later dropped should
+        // start the next retry at `initial_backoff`, not at the ceiling
+        // we may have reached during the previous outage (review fix
+        // for WEK-36 — without this, a user who starts `la` before the
+        // daemon and then starts the daemon later would carry a 10 s
+        // backoff through every subsequent daemon restart).
+        let mut connected = false;
+        match run_once(&socket, &tx, &mut connected).await {
             Ok(()) => {
                 // `run_once` only returns Ok(()) when the receiver was
                 // dropped — runner shutdown, no need to reconnect.
@@ -157,6 +167,9 @@ async fn reconnect_loop(socket: PathBuf, tx: Sender<NotifEvent>, cfg: ReconnectC
                 if tx.send(NotifEvent::DaemonOffline).is_err() {
                     return;
                 }
+                if connected {
+                    backoff = cfg.initial_backoff;
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(cfg.max_backoff);
             }
@@ -164,7 +177,11 @@ async fn reconnect_loop(socket: PathBuf, tx: Sender<NotifEvent>, cfg: ReconnectC
     }
 }
 
-async fn run_once(socket: &Path, tx: &Sender<NotifEvent>) -> Result<(), String> {
+async fn run_once(
+    socket: &Path,
+    tx: &Sender<NotifEvent>,
+    connected: &mut bool,
+) -> Result<(), String> {
     let endpoint = endpoint_for(socket);
     let stream = tokio::time::timeout(Duration::from_secs(2), connect(&endpoint))
         .await
@@ -193,6 +210,10 @@ async fn run_once(socket: &Path, tx: &Sender<NotifEvent>) -> Result<(), String> 
     conn.send(&Message::Request(req))
         .await
         .map_err(|e| format!("send subscribe: {e}"))?;
+    // Handshake + subscribe both succeeded — the loop should treat any
+    // future disconnect as "back to first retry" rather than continuing
+    // to grow the backoff from whatever value the previous outage left.
+    *connected = true;
 
     loop {
         let msg = match conn.recv().await {

@@ -299,3 +299,102 @@ async fn pump_reconnects_after_daemon_drop_and_redelivers_health() {
     let _ = std::fs::remove_file(&socket);
     drop(dir);
 }
+
+/// Review fix for WEK-36: after a connection successfully establishes
+/// (handshake + `events.subscribe` ack), the next disconnect must reset
+/// the reconnect backoff to `initial_backoff` instead of carrying over
+/// whatever value the previous outage left. The scenario:
+///
+///   1. No listener bound → pump fails to connect ≥3 times → backoff
+///      grows toward `max_backoff` (300 ms in this test).
+///   2. Listener appears → pump establishes the connection, gets one
+///      `health` push, then the stub drops the connection.
+///   3. The pump should reconnect to the second stub session well under
+///      `max_backoff` — the test asserts the second `Health` lands
+///      within ~150 ms of the first `DaemonOffline`, which is only
+///      possible if the backoff was reset to ~20 ms after the first
+///      successful subscribe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_backoff_resets_after_a_successful_connect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("lad-3.sock");
+
+    // Start the pump BEFORE the listener exists so it burns several
+    // reconnect attempts. With initial=20ms / max=300ms, four failed
+    // attempts push backoff to ~160ms; six pushes it to the 300ms
+    // ceiling. Without the reset fix the second reconnect would still
+    // wait that long.
+    let cfg = ReconnectConfig {
+        initial_backoff: Duration::from_millis(20),
+        max_backoff: Duration::from_millis(300),
+    };
+    let rx = spawn_with_config(&socket, cfg);
+
+    // Let the pump fail several times so the backoff is well above
+    // initial. 1s ≫ (20 + 40 + 80 + 160 + 300 + 300) ≈ 900ms worth of
+    // sleeps, so backoff is definitely at the 300ms ceiling.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let listener = Listener::bind(&Endpoint::uds(&socket))
+        .await
+        .expect("bind stub");
+    let server = tokio::spawn(async move {
+        // First successful connection: push one health, then close.
+        run_stub_once(&listener, vec![health_push()], false).await;
+        // Second connection: pump must reconnect after the first close.
+        // With backoff reset, the gap should be ~initial_backoff (20ms)
+        // not ~max_backoff (300ms).
+        run_stub_once(&listener, vec![health_push()], false).await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let timing = tokio::task::spawn_blocking(move || {
+        let mut first_offline_at: Option<Instant> = None;
+        let mut second_health_at: Option<Instant> = None;
+        let mut health_count = 0usize;
+        loop {
+            if let (Some(off), Some(h2)) = (first_offline_at, second_health_at) {
+                return Some(h2.duration_since(off));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(NotifEvent::Health(_)) => {
+                    health_count += 1;
+                    if health_count == 2 && second_health_at.is_none() {
+                        second_health_at = Some(Instant::now());
+                    }
+                }
+                Ok(NotifEvent::DaemonOffline) => {
+                    // We care about the FIRST offline that follows a
+                    // successful Health push, not the early failures
+                    // before the listener existed.
+                    if health_count >= 1 && first_offline_at.is_none() {
+                        first_offline_at = Some(Instant::now());
+                    }
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    })
+    .await
+    .expect("blocking join");
+
+    let gap = timing.expect("never saw both first DaemonOffline and second Health");
+    // Allow generous slack for CI jitter — 150ms is still half of
+    // max_backoff and well above the ~20ms initial. If the reset
+    // regressed we'd expect ~300ms here and the assert would fire.
+    assert!(
+        gap < Duration::from_millis(200),
+        "second reconnect took {gap:?}; expected ≪ max_backoff (300ms). \
+         backoff likely did not reset after the first successful connect."
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    let _ = std::fs::remove_file(&socket);
+    drop(dir);
+}

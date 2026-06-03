@@ -46,7 +46,7 @@ use la_proto::methods::{
     WorktreeStatusParams, WorktreeStatusResult, WorktreeUnstage,
 };
 use la_proto::notifications::{
-    DaemonHealth, NotificationMethod, SessionGap, SessionOutput, SessionStateNotice,
+    CronFired, DaemonHealth, NotificationMethod, SessionGap, SessionOutput, SessionStateNotice,
     WorktreeChanged, WorktreeChangedParams, WorktreeCommitCreated, WorktreeCommitCreatedParams,
 };
 use la_proto::PROTOCOL_VERSION;
@@ -241,6 +241,7 @@ struct TopicSet {
     daemon_health: bool,
     worktree_changed: bool,
     worktree_commit: bool,
+    cron_fired: bool,
 }
 
 struct AttachmentSlot {
@@ -371,6 +372,7 @@ async fn deliver_bus_event(state: &ConnState, event: BusEvent) {
         BusEvent::WorktreeCommitCreated(p) if topics.worktree_commit => {
             Notification::new(WorktreeCommitCreated::NAME, &p)
         }
+        BusEvent::CronFired(p) if topics.cron_fired => Notification::new(CronFired::NAME, &p),
         _ => return,
     };
     match notification {
@@ -545,8 +547,14 @@ async fn handle_events_subscribe(
                     // clients don't think they have a global subscription.
                 }
                 EventTopic::CronFired => {
-                    // Cron isn't implemented until M3; quietly omit from the
-                    // effective set (architecture §3 documented behaviour).
+                    // Scheduler integration lands later in M3, but the
+                    // wire path is plumbed today so the TUI status bar
+                    // (`↻ cron-id` pulse — WEK-36) shows pulses the
+                    // moment the scheduler starts publishing to
+                    // `BusEvent::CronFired`. Echo the topic back so the
+                    // client knows the subscribe took.
+                    topics.cron_fired = true;
+                    effective.push(*t);
                 }
             }
         }

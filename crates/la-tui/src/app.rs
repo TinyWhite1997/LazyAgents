@@ -305,6 +305,16 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
         // Per-message toast slate: every dispatch starts clean so a
         // surviving toast from a previous frame can't leak forward.
         self.last_toast = None;
+        // Background system notifications must update the status bar even
+        // when a modal is open, otherwise daemon health / cron pulses /
+        // disconnect events arriving during a modal session are dropped
+        // forever (review fix for WEK-36: the modal short-circuit was
+        // silently swallowing them, breaking the "<1s latency" and
+        // "auto-recover" acceptance).
+        let msg = match self.try_apply_system_notification(msg) {
+            None => return AppOutcome::Continue,
+            Some(other) => other,
+        };
         // Modal short-circuits — while a modal is open, only its keys are
         // valid (PRD §5.6 上下文驱动).
         if let Some(modal) = self.modal.clone() {
@@ -366,24 +376,6 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             AppMsg::ToggleFullHints => {
                 self.modal = Some(Modal::FullHints);
             }
-            AppMsg::StatusUpdate(s) => self.status = s,
-            AppMsg::HealthUpdate(h) => {
-                self.status.daemon_online = true;
-                self.status.running = h.running as usize;
-                self.status.errors_last_5m = h.errors_last_5m;
-            }
-            AppMsg::DaemonOffline => {
-                self.status.daemon_online = false;
-            }
-            AppMsg::CronFiredEvent(p) => {
-                let fired_at = chrono::DateTime::parse_from_rfc3339(&p.fired_at)
-                    .map(|t| t.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now());
-                self.status.last_cron_pulse = Some(CronPulse {
-                    cron_id: p.cron_id,
-                    fired_at,
-                });
-            }
             AppMsg::OpenErrors => {
                 let rows = self
                     .backends
@@ -399,14 +391,18 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 self.modal = Some(Modal::Errors { rows });
             }
             AppMsg::RefreshSessions => self.refresh_sessions(),
-            AppMsg::BackendsUpdate(b) => {
-                // Sort by id so the rendered order is stable across
-                // pulses (the daemon already sorts, but a paranoid TUI
-                // can't hurt).
-                let mut sorted = b;
-                sorted.sort_by(|a, b| a.id.cmp(&b.id));
-                self.backends = sorted;
-            }
+            // System notifications (StatusUpdate / HealthUpdate /
+            // DaemonOffline / CronFiredEvent / BackendsUpdate) are
+            // handled before the modal short-circuit by
+            // `try_apply_system_notification`; reaching them here is
+            // unreachable but we keep no-op arms instead of a panic so a
+            // future refactor that re-enters this match by a different
+            // path doesn't crash the TUI.
+            AppMsg::StatusUpdate(_)
+            | AppMsg::HealthUpdate(_)
+            | AppMsg::DaemonOffline
+            | AppMsg::CronFiredEvent(_)
+            | AppMsg::BackendsUpdate(_) => {}
 
             // --- Crons tab dispatch ---------------------------------
             AppMsg::CronListDown => {
@@ -458,6 +454,48 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             }
         }
         AppOutcome::Continue
+    }
+
+    /// Apply a background system notification — daemon health, cron
+    /// pulse, disconnect, or a fresh status snapshot. These messages are
+    /// **not** user input; they originate from the IPC pump and must
+    /// land on the status bar regardless of whether a modal is open.
+    ///
+    /// Returns `None` when the message was a system notification and has
+    /// been applied; returns `Some(msg)` (handing the value back) when
+    /// the message is a user-input variant that the caller should route
+    /// through the normal modal/keybinding dispatch.
+    fn try_apply_system_notification(&mut self, msg: AppMsg) -> Option<AppMsg> {
+        match msg {
+            AppMsg::StatusUpdate(s) => self.status = s,
+            AppMsg::HealthUpdate(h) => {
+                self.status.daemon_online = true;
+                self.status.running = h.running as usize;
+                self.status.errors_last_5m = h.errors_last_5m;
+            }
+            AppMsg::DaemonOffline => {
+                self.status.daemon_online = false;
+            }
+            AppMsg::CronFiredEvent(p) => {
+                let fired_at = chrono::DateTime::parse_from_rfc3339(&p.fired_at)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                self.status.last_cron_pulse = Some(CronPulse {
+                    cron_id: p.cron_id,
+                    fired_at,
+                });
+            }
+            AppMsg::BackendsUpdate(b) => {
+                // Sort by id so the rendered order is stable across
+                // pulses (the daemon already sorts, but a paranoid TUI
+                // can't hurt).
+                let mut sorted = b;
+                sorted.sort_by(|a, b| a.id.cmp(&b.id));
+                self.backends = sorted;
+            }
+            other => return Some(other),
+        }
+        None
     }
 
     fn handle_in_modal(&mut self, modal: Modal, msg: AppMsg) -> AppOutcome {
@@ -993,6 +1031,68 @@ mod tests {
         // Closing via Esc/Cancel clears it.
         a.handle(AppMsg::Cancel);
         assert!(a.modal.is_none());
+    }
+
+    #[test]
+    fn system_notifications_apply_while_modal_is_open() {
+        // Review fix for WEK-36: any modal short-circuit in `handle`
+        // must not swallow daemon health / cron / disconnect events.
+        // Open a modal, then push the full set of system notifications
+        // and assert each one landed on the status bar (modal still open,
+        // bar still updated).
+        use la_proto::notifications::BackendHealthStatus;
+
+        let mut a = app();
+        // Open a modal that has nothing to do with health (FullHints is
+        // the cheapest one — no setup, no source mutation).
+        a.handle(AppMsg::ToggleFullHints);
+        assert!(matches!(a.modal, Some(Modal::FullHints)));
+
+        a.handle(AppMsg::HealthUpdate(HealthSnapshot {
+            running: 3,
+            queue_depth: 0,
+            errors_last_5m: 2,
+        }));
+        assert!(matches!(a.modal, Some(Modal::FullHints)), "modal stays");
+        assert!(a.status.daemon_online);
+        assert_eq!(a.status.running, 3);
+        assert_eq!(a.status.errors_last_5m, 2);
+
+        a.handle(AppMsg::BackendsUpdate(vec![BackendBadge {
+            id: "claude".into(),
+            display_name: "Claude".into(),
+            status: BackendHealthStatus::NotInstalled,
+            reason: Some("missing".into()),
+            docs_url: None,
+            version: None,
+        }]));
+        assert!(matches!(a.modal, Some(Modal::FullHints)));
+        assert_eq!(a.backends.len(), 1);
+        assert_eq!(a.backends[0].id, "claude");
+
+        a.handle(AppMsg::CronFiredEvent(CronFiredParams {
+            cron_id: "nightly".into(),
+            run_id: "r1".into(),
+            fired_at: "2026-06-03T01:00:00Z".into(),
+            status: "spawning".into(),
+        }));
+        assert!(matches!(a.modal, Some(Modal::FullHints)));
+        let pulse = a.status.last_cron_pulse.as_ref().expect("pulse landed");
+        assert_eq!(pulse.cron_id, "nightly");
+
+        a.handle(AppMsg::DaemonOffline);
+        assert!(matches!(a.modal, Some(Modal::FullHints)));
+        assert!(!a.status.daemon_online);
+
+        a.handle(AppMsg::StatusUpdate(Status {
+            daemon_online: true,
+            running: 7,
+            right_context: "branch-x".into(),
+            ..Status::default()
+        }));
+        assert!(matches!(a.modal, Some(Modal::FullHints)));
+        assert_eq!(a.status.running, 7);
+        assert_eq!(a.status.right_context, "branch-x");
     }
 
     #[test]
