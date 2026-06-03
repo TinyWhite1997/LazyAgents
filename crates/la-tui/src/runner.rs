@@ -20,7 +20,7 @@ use crossterm::terminal::{
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -29,12 +29,13 @@ use ratatui::Terminal;
 use crate::app::{App, AppMsg, AppOutcome, Focus, Modal, Tab};
 use crate::crons::{human_label, CronSource, CronsState, EditField};
 use crate::input::{translate, HitBoxes};
-use crate::key_hints::{format_hint_bar, HintRegistry};
+use crate::key_hints::{format_hint_bar, Hint, HintRegistry, Importance};
 use crate::notif_sub::NotifEvent;
-use crate::sidebar::{render_backends, render_sidebar, Selection};
+use crate::sidebar::{render_sidebar_themed, Selection};
 use crate::source::SessionSource;
-use crate::status::render_status;
+use crate::status::{render_status_compact, render_status_themed};
 use crate::tabs::render_tabs;
+use crate::theme::{Accent, KeyHintsMode, Palette};
 
 /// Back-compat re-export — pre-WEK-36 callers spelled this as
 /// `crate::health_sub::HealthEvent`. New code should use [`NotifEvent`].
@@ -206,23 +207,53 @@ fn derive_next_cron_label(
 pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S, C>) -> HitBoxes {
     let size = frame.area();
 
-    // Vertical stack: tab bar (3 rows incl. border) · main row (rest) · status (2) · hints (1).
+    // WEK-42 / M4.3: bottom row layout depends on `[ui]`.
+    //
+    // | compact | key_hints | rows                                  |
+    // |---------|-----------|---------------------------------------|
+    // |  false  | Rich      | status (2) + hint (1) — pre-M4.3      |
+    // |  false  | Compact   | status (2) + hint (1) — same height,  |
+    // |         |           |   bar truncates to Primary only       |
+    // |  false  | Hidden    | status (2) — hint row dropped         |
+    // |  true   | Rich      | status+hint merged into 1 row         |
+    // |  true   | Compact   | status+hint merged into 1 row         |
+    // |  true   | Hidden    | status (1) — hint dropped, no border  |
+    //
+    // The merged variant repaints with `render_status_with_layout`
+    // (status spans only) and appends a single hint span trail. This
+    // reclaims one full vertical line, which on small terminals is
+    // what makes the conversation pane usable.
+    let palette = Palette::for_theme(app.ui_prefs.theme);
+    let key_hints_mode = app.ui_prefs.key_hints;
+    let compact = app.ui_prefs.compact;
+    let show_hints_row =
+        matches!(key_hints_mode, KeyHintsMode::Rich | KeyHintsMode::Compact) && !compact;
+
+    let status_height: u16 = if compact { 1 } else { 2 };
+    let hint_height: u16 = if show_hints_row { 1 } else { 0 };
+
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
+    constraints.push(Constraint::Length(2)); // tab bar
+    constraints.push(Constraint::Min(5)); // main
+    constraints.push(Constraint::Length(status_height));
+    if hint_height > 0 {
+        constraints.push(Constraint::Length(hint_height));
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // tab bar
-            Constraint::Min(5),    // main area
-            Constraint::Length(2), // status bar
-            Constraint::Length(1), // hint bar
-        ])
+        .constraints(constraints)
         .split(size);
 
     let tabs_area = chunks[0];
     let main_area = chunks[1];
     let status_area = chunks[2];
-    let hint_area = chunks[3];
+    let hint_area = if hint_height > 0 {
+        Some(chunks[3])
+    } else {
+        None
+    };
 
-    let tab_ranges = render_tabs(frame, tabs_area, app.tab);
+    let tab_ranges = render_tabs(frame, tabs_area, app.tab, &palette);
 
     // Main area: sidebar (left) + content placeholder (right).
     let main_split = Layout::default()
@@ -241,6 +272,9 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
             // of unhealthy backends doesn't crowd the session list.
             let backends_rows = if app.backends.is_empty() {
                 3
+            } else if compact {
+                // Compact: every backend is one row, no reason / docs.
+                (app.backends.len() + 2).clamp(4, 8)
             } else {
                 let raw: usize = app
                     .backends
@@ -254,36 +288,90 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(backends_rows as u16), Constraint::Min(3)])
                 .split(sidebar_area);
-            render_backends(frame, sidebar_split[0], &app.backends);
-            render_sidebar(
+            crate::sidebar::render_backends_with_style(
+                frame,
+                sidebar_split[0],
+                &app.backends,
+                compact,
+                &palette,
+            );
+            render_sidebar_themed(
                 frame,
                 sidebar_split[1],
                 &app.sidebar,
                 app.focus == Focus::Sidebar,
+                &palette,
             );
-            render_content_placeholder(frame, content_area, &app.sidebar.selection());
+            render_content_placeholder(frame, content_area, &app.sidebar.selection(), &palette);
         }
         Tab::Crons => {
-            render_crons(frame, sidebar_area, content_area, &app.crons, app.focus);
+            render_crons(
+                frame,
+                sidebar_area,
+                content_area,
+                &app.crons,
+                app.focus,
+                &palette,
+            );
         }
     }
 
-    render_status(frame, status_area, &app.status);
-
-    let hints = HintRegistry::for_context(
+    // Hints catalogue for the current context. Computed once and shared
+    // between the inline-into-status path (compact mode) and the
+    // standalone hint row.
+    let hints_full = HintRegistry::for_context(
         app.tab,
         app.focus,
         &app.sidebar.selection(),
         app.modal.clone(),
     );
-    let hint_text = format_hint_bar(&hints, hint_area.width as usize);
-    let hint_para = Paragraph::new(Line::from(Span::styled(
-        hint_text,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::DIM),
-    )));
-    frame.render_widget(hint_para, hint_area);
+    let hints_for_bar: Vec<Hint> = if matches!(key_hints_mode, KeyHintsMode::Compact) {
+        // Compact: keep just the primary action (top of the catalogue)
+        // and meta keys, so users still see `q quit` / `? all keys`.
+        hints_full
+            .iter()
+            .filter(|h| h.importance == Importance::Primary || h.importance == Importance::Meta)
+            .cloned()
+            .collect()
+    } else {
+        hints_full.clone()
+    };
+
+    if compact {
+        // One merged row: status spans + ` ▏ ` + hint bar, both styled
+        // off the palette so theme changes propagate consistently.
+        render_status_compact(frame, status_area, &app.status, &palette);
+        if matches!(key_hints_mode, KeyHintsMode::Rich | KeyHintsMode::Compact) {
+            let hint_text = format_hint_bar(&hints_for_bar, (status_area.width / 2) as usize);
+            let inline = Paragraph::new(Line::from(vec![
+                Span::raw("  ▏ "),
+                Span::styled(
+                    hint_text,
+                    Style::default()
+                        .fg(palette.color(Accent::Muted))
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]))
+            .alignment(ratatui::layout::Alignment::Right);
+            // Overlay on the same row as the status bar. ratatui paints
+            // status first; the right-aligned paragraph repaints the
+            // right half. The status renderer left-aligns its content
+            // so the overlap is empty space.
+            frame.render_widget(inline, status_area);
+        }
+    } else {
+        render_status_themed(frame, status_area, &app.status, &palette);
+        if let Some(area) = hint_area {
+            let hint_text = format_hint_bar(&hints_for_bar, area.width as usize);
+            let hint_para = Paragraph::new(Line::from(Span::styled(
+                hint_text,
+                Style::default()
+                    .fg(palette.color(Accent::Muted))
+                    .add_modifier(Modifier::DIM),
+            )));
+            frame.render_widget(hint_para, area);
+        }
+    }
 
     if let Some(modal) = &app.modal {
         render_modal(
@@ -293,6 +381,7 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
             &app.sidebar.selection(),
             app.tab,
             app.focus,
+            &palette,
         );
     }
 
@@ -313,7 +402,12 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
     }
 }
 
-fn render_content_placeholder(frame: &mut Frame<'_>, area: Rect, selection: &Selection) {
+fn render_content_placeholder(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    selection: &Selection,
+    palette: &Palette,
+) {
     let body = match selection {
         Selection::Empty => {
             // The daemon (M1.7) is the only authority that can create the
@@ -332,7 +426,13 @@ Once a project exists, press `n` here to start a session inside it."
         ),
     };
     let para = Paragraph::new(body)
-        .block(Block::default().borders(Borders::ALL).title("Detail"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Detail")
+                .border_style(Style::default().fg(palette.color(Accent::Muted))),
+        )
+        .style(Style::default().fg(palette.color(Accent::Body)))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
@@ -343,29 +443,41 @@ fn render_crons(
     editor_area: Rect,
     state: &CronsState,
     focus: Focus,
+    palette: &Palette,
 ) {
-    render_crons_list(frame, list_area, state, focus == Focus::Sidebar);
-    render_crons_editor(frame, editor_area, state, focus == Focus::Main);
+    render_crons_list(frame, list_area, state, focus == Focus::Sidebar, palette);
+    render_crons_editor(frame, editor_area, state, focus == Focus::Main, palette);
 }
 
-fn render_crons_list(frame: &mut Frame<'_>, area: Rect, state: &CronsState, focused: bool) {
+fn render_crons_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &CronsState,
+    focused: bool,
+    palette: &Palette,
+) {
     let crons = state.crons();
     let cursor = state.cursor().unwrap_or(0);
+
+    let ok = palette.color(Accent::Ok);
+    let muted = palette.color(Accent::Muted);
+    let primary = palette.color(Accent::Primary);
+    let warn = palette.color(Accent::Warn);
 
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(crons.len());
     if crons.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no crons — press `n` to add one)",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().fg(muted).add_modifier(Modifier::DIM),
         )));
     } else {
         for (i, c) in crons.iter().enumerate() {
             let selected = i == cursor;
             let glyph = if c.enabled { "✓" } else { "○" };
             let glyph_style = if c.enabled {
-                Style::default().fg(Color::Green)
+                Style::default().fg(ok)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(muted)
             };
             // ● badge for "dirty" rows so the user knows a save is
             // pending. The list reflects committed state; the editor
@@ -373,19 +485,17 @@ fn render_crons_list(frame: &mut Frame<'_>, area: Rect, state: &CronsState, focu
             let dirty_badge = if c.dirty { " ●" } else { "" };
             let row_style = if selected {
                 Style::default()
-                    .bg(Color::DarkGray)
+                    .fg(palette.color(Accent::OnAccent))
+                    .bg(primary)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(palette.color(Accent::Body))
             };
             lines.push(Line::from(vec![
                 Span::styled(format!(" {glyph} "), glyph_style),
                 Span::styled(format!("{:<18}", truncate(&c.name, 18)), row_style),
-                Span::styled(
-                    format!(" {}", c.cron_expr),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(dirty_badge, Style::default().fg(Color::Yellow)),
+                Span::styled(format!(" {}", c.cron_expr), Style::default().fg(primary)),
+                Span::styled(dirty_badge, Style::default().fg(warn)),
             ]));
         }
     }
@@ -395,21 +505,34 @@ fn render_crons_list(frame: &mut Frame<'_>, area: Rect, state: &CronsState, focu
         .borders(Borders::ALL)
         .title(title)
         .border_style(if focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(primary)
         } else {
-            Style::default()
+            Style::default().fg(muted)
         });
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_crons_editor(frame: &mut Frame<'_>, area: Rect, state: &CronsState, focused: bool) {
+fn render_crons_editor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &CronsState,
+    focused: bool,
+    palette: &Palette,
+) {
+    let primary = palette.color(Accent::Primary);
+    let muted = palette.color(Accent::Muted);
+    let warn = palette.color(Accent::Warn);
+    let err = palette.color(Accent::Error);
+    let ok = palette.color(Accent::Ok);
+    let body = palette.color(Accent::Body);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Editor")
         .border_style(if focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(primary)
         } else {
-            Style::default()
+            Style::default().fg(muted)
         });
     let inner = area.inner(Margin {
         vertical: 1,
@@ -421,6 +544,7 @@ fn render_crons_editor(frame: &mut Frame<'_>, area: Rect, state: &CronsState, fo
         let para = Paragraph::new(
             "No cron selected.\n\nPress `n` to start a new one, or `j`/`k` to pick a row.",
         )
+        .style(Style::default().fg(body))
         .wrap(Wrap { trim: false });
         frame.render_widget(para, inner);
         return;
@@ -429,31 +553,29 @@ fn render_crons_editor(frame: &mut Frame<'_>, area: Rect, state: &CronsState, fo
     let preview = state.preview();
     // Inline "下次：…" hint, red-flagged if the expression is invalid.
     let (preview_line, preview_style) = match preview.error.as_deref() {
-        Some(err) => (format!("✗ {err}"), Style::default().fg(Color::Red)),
+        Some(e) => (format!("✗ {e}"), Style::default().fg(err)),
         None => match preview.next {
             Some(next) => (
                 human_label(next, state.now(), &cron.tz),
-                Style::default().fg(Color::Green),
+                Style::default().fg(ok),
             ),
-            None => ("下次：—".to_string(), Style::default().fg(Color::Yellow)),
+            None => ("下次：—".to_string(), Style::default().fg(warn)),
         },
     };
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     // Header row: name + dirty badge + enable state.
-    let header_style = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
+    let header_style = Style::default().fg(body).add_modifier(Modifier::BOLD);
     let dirty_badge = if cron.dirty { "  ● unsaved" } else { "" };
     let enabled_badge = if cron.enabled {
-        Span::styled("  [enabled]", Style::default().fg(Color::Green))
+        Span::styled("  [enabled]", Style::default().fg(ok))
     } else {
-        Span::styled("  [disabled]", Style::default().fg(Color::DarkGray))
+        Span::styled("  [disabled]", Style::default().fg(muted))
     };
     lines.push(Line::from(vec![
         Span::styled(cron.name.clone(), header_style),
         enabled_badge,
-        Span::styled(dirty_badge, Style::default().fg(Color::Yellow)),
+        Span::styled(dirty_badge, Style::default().fg(warn)),
     ]));
     lines.push(Line::from(Span::styled(preview_line, preview_style)));
     lines.push(Line::from(""));
@@ -463,36 +585,30 @@ fn render_crons_editor(frame: &mut Frame<'_>, area: Rect, state: &CronsState, fo
         let active = f == cur_field && focused;
         let marker = if active { "▶ " } else { "  " };
         let label_style = if active {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(primary).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().add_modifier(Modifier::DIM)
+            Style::default().fg(muted).add_modifier(Modifier::DIM)
         };
         lines.push(Line::from(vec![Span::styled(
             format!("{marker}{}", f.label()),
             label_style,
         )]));
-        let body = field_body(f, cron);
+        let body_text = field_body(f, cron);
         let body_style = if f == EditField::CronExpr && preview.error.is_some() {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::default().fg(err).add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            Style::default().fg(body)
         };
-        // Multiline fields (spawn args, prompt) render as separate lines
-        // all indented four columns past the marker so they don't shift
-        // the form when the field is short — uniform indent across lines
-        // matches what a single-line field renders.
-        for ln in body.lines() {
+        for ln in body_text.lines() {
             lines.push(Line::from(vec![Span::styled(
                 format!("    {ln}"),
                 body_style,
             )]));
         }
-        if body.is_empty() {
+        if body_text.is_empty() {
             lines.push(Line::from(Span::styled(
                 "    (empty)",
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().fg(muted).add_modifier(Modifier::DIM),
             )));
         }
     }
@@ -533,20 +649,27 @@ fn render_modal(
     selection: &Selection,
     tab: Tab,
     focus: Focus,
+    palette: &Palette,
 ) {
+    let primary = palette.color(Accent::Primary);
+    let warn = palette.color(Accent::Warn);
+    let err = palette.color(Accent::Error);
+    let muted = palette.color(Accent::Muted);
+    let body = palette.color(Accent::Body);
     match modal {
         Modal::ConfirmDelete { session_id } => {
             let area = centered(full, 60, 7);
             frame.render_widget(Clear, area);
-            let body = format!(
+            let body_text = format!(
                 "Delete session {session_id}?\n\nThis cannot be undone.\n\n[y] confirm   [n / Esc] cancel"
             );
-            let para = Paragraph::new(body)
+            let para = Paragraph::new(body_text)
+                .style(Style::default().fg(body))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title("Confirm delete")
-                        .border_style(Style::default().fg(Color::Red)),
+                        .border_style(Style::default().fg(err)),
                 )
                 .wrap(Wrap { trim: false });
             frame.render_widget(para, area);
@@ -557,7 +680,7 @@ fn render_modal(
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title("Key bindings — current context")
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_style(Style::default().fg(primary));
             let inner = area.inner(Margin {
                 vertical: 1,
                 horizontal: 2,
@@ -569,33 +692,32 @@ fn render_modal(
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{:<10}", h.key),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(warn).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" "),
-                    Span::raw(h.label),
+                    Span::styled(h.label, Style::default().fg(body)),
                 ]));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Press Esc or ? to close.",
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().fg(muted).add_modifier(Modifier::DIM),
             )));
             frame.render_widget(Paragraph::new(lines), inner);
         }
         Modal::NewSession { project_id } => {
             let area = centered(full, 60, 9);
             frame.render_widget(Clear, area);
-            let body = format!(
+            let body_text = format!(
                 "New session in project {project_id}\n\nBackend chooser lands with the daemon (M1.7).\nFor now this modal acknowledges the key binding so the\nUI path is reviewable.\n\n[⏎] close   [Esc] cancel"
             );
-            let para = Paragraph::new(body)
+            let para = Paragraph::new(body_text)
+                .style(Style::default().fg(body))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title("New session")
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(primary)),
                 )
                 .wrap(Wrap { trim: false });
             frame.render_widget(para, area);
@@ -608,15 +730,16 @@ fn render_modal(
         } => {
             let area = centered(full, 70, 10);
             frame.render_widget(Clear, area);
-            let body = format!(
+            let body_text = format!(
                 "Enable cron \"{cron_name}\"?\n\nDaily cost budget: {budget_label}\n{next_label}\n\nEnabled crons run unattended and spend on real backends.\n\n[y] enable   [n / Esc] cancel"
             );
-            let para = Paragraph::new(body)
+            let para = Paragraph::new(body_text)
+                .style(Style::default().fg(body))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title("Confirm enable cron")
-                        .border_style(Style::default().fg(Color::Yellow)),
+                        .border_style(Style::default().fg(warn)),
                 )
                 .wrap(Wrap { trim: false });
             frame.render_widget(para, area);
@@ -624,15 +747,16 @@ fn render_modal(
         Modal::ConfirmDeleteCron { cron_name, .. } => {
             let area = centered(full, 60, 7);
             frame.render_widget(Clear, area);
-            let body = format!(
+            let body_text = format!(
                 "Delete cron \"{cron_name}\"?\n\nThis cannot be undone — the daemon will stop scheduling it.\n\n[y] confirm   [n / Esc] cancel"
             );
-            let para = Paragraph::new(body)
+            let para = Paragraph::new(body_text)
+                .style(Style::default().fg(body))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title("Confirm delete cron")
-                        .border_style(Style::default().fg(Color::Red)),
+                        .border_style(Style::default().fg(err)),
                 )
                 .wrap(Wrap { trim: false });
             frame.render_widget(para, area);
@@ -642,22 +766,25 @@ fn render_modal(
             frame.render_widget(Clear, area);
             let header = Line::from(vec![Span::styled(
                 format!("Next {} fires for {cron_id}", fires.len()),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default().fg(body).add_modifier(Modifier::BOLD),
             )]);
             let mut lines: Vec<Line<'_>> = vec![header, Line::from("")];
             for (i, f) in fires.iter().enumerate() {
-                lines.push(Line::from(format!("  {:>2}. {f}", i + 1)));
+                lines.push(Line::from(Span::styled(
+                    format!("  {:>2}. {f}", i + 1),
+                    Style::default().fg(body),
+                )));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Esc / ⏎ to close.",
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().fg(muted).add_modifier(Modifier::DIM),
             )));
             let para = Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title("Dry-run")
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(primary)),
             );
             frame.render_widget(para, area);
         }
@@ -671,28 +798,28 @@ fn render_modal(
             if rows.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "No active errors. Backends are all healthy.",
-                    Style::default().add_modifier(Modifier::DIM),
+                    Style::default().fg(muted).add_modifier(Modifier::DIM),
                 )));
             } else {
                 for r in rows {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{:<14}", r.id),
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            Style::default().fg(err).add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(" "),
-                        Span::styled(r.status_label.clone(), Style::default().fg(Color::Yellow)),
+                        Span::styled(r.status_label.clone(), Style::default().fg(warn)),
                     ]));
                     if let Some(reason) = &r.reason {
                         lines.push(Line::from(Span::styled(
                             format!("    {reason}"),
-                            Style::default().add_modifier(Modifier::DIM),
+                            Style::default().fg(muted).add_modifier(Modifier::DIM),
                         )));
                     }
                     if let Some(docs) = &r.docs_url {
                         lines.push(Line::from(Span::styled(
                             format!("    → {docs}"),
-                            Style::default().fg(Color::Cyan),
+                            Style::default().fg(primary),
                         )));
                     }
                 }
@@ -700,14 +827,14 @@ fn render_modal(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Esc / ⏎ / f to close.",
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().fg(muted).add_modifier(Modifier::DIM),
             )));
             let para = Paragraph::new(lines)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title("Errors")
-                        .border_style(Style::default().fg(Color::Red)),
+                        .border_style(Style::default().fg(err)),
                 )
                 .wrap(Wrap { trim: false });
             frame.render_widget(para, area);

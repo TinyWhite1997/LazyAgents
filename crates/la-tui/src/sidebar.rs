@@ -27,6 +27,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::model::{BackendBadge, ProjectGroup, RunState};
+use crate::theme::{Accent, Palette, Theme};
 
 /// What the cursor is pointing at.
 ///
@@ -345,10 +346,29 @@ impl Default for SidebarState {
 /// The widget itself is stateless; cursor highlighting is driven through
 /// ratatui's [`ListState`] derived from [`SidebarState::cursor`].
 pub fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &SidebarState, focused: bool) {
+    render_sidebar_themed(
+        frame,
+        area,
+        state,
+        focused,
+        &Palette::for_theme(Theme::Auto),
+    )
+}
+
+/// WEK-42 / M4.3: theme-aware variant. The runner calls this with the
+/// active palette so the focus border, highlight chip, and per-row
+/// glyph colours all flow from `Accent::*` instead of hardcoded ANSI.
+pub fn render_sidebar_themed(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &SidebarState,
+    focused: bool,
+    palette: &Palette,
+) {
     let block_style = if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(palette.color(Accent::Primary))
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(palette.color(Accent::Muted))
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -358,7 +378,7 @@ pub fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &SidebarState, f
     let lines: Vec<ListItem> = state
         .items
         .iter()
-        .map(|item| render_item(state, item))
+        .map(|item| render_item(state, item, palette))
         .collect();
 
     let mut list_state = ListState::default();
@@ -369,8 +389,8 @@ pub fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &SidebarState, f
     *list_state.offset_mut() = state.scroll_offset.get();
 
     let highlight_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
+        .fg(palette.color(Accent::OnAccent))
+        .bg(palette.color(Accent::Primary))
         .add_modifier(Modifier::BOLD);
 
     let list = List::new(lines)
@@ -394,15 +414,32 @@ pub fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &SidebarState, f
 /// the chosen backend is unavailable (the dispatcher refuses the
 /// `sessions.create` with the right business code).
 pub fn render_backends(frame: &mut Frame<'_>, area: Rect, badges: &[BackendBadge]) {
+    render_backends_with_style(frame, area, badges, false, &Palette::for_theme(Theme::Auto))
+}
+
+/// WEK-42 / M4.3: compact-mode entry point.
+///
+/// Architecture §11.1 acceptance for this issue: "侧栏单色后端徽标"
+/// (sidebar single-colour backend badge). When `compact` is true we
+/// collapse the per-state colour code into one muted glyph and drop the
+/// reason / docs sub-lines so a fleet of 10 backends fits in the same
+/// space as 2-3 verbose ones would in the default layout.
+pub fn render_backends_with_style(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    badges: &[BackendBadge],
+    compact: bool,
+    palette: &Palette,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Backends")
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(palette.color(Accent::Muted)));
     if badges.is_empty() {
         let body = Paragraph::new(Line::from(Span::styled(
             "no probe yet — waiting for daemon.health",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(palette.color(Accent::Muted))
                 .add_modifier(Modifier::DIM | Modifier::ITALIC),
         )))
         .block(block);
@@ -410,53 +447,93 @@ pub fn render_backends(frame: &mut Frame<'_>, area: Rect, badges: &[BackendBadge
         return;
     }
 
-    let lines: Vec<ListItem> = badges
-        .iter()
-        .flat_map(|b| backend_lines(b))
-        .map(ListItem::new)
-        .collect();
+    let lines: Vec<ListItem> = if compact {
+        badges
+            .iter()
+            .map(|b| ListItem::new(backend_compact_line(b, palette)))
+            .collect()
+    } else {
+        badges
+            .iter()
+            .flat_map(|b| backend_lines(b, palette))
+            .map(ListItem::new)
+            .collect()
+    };
     let list = List::new(lines).block(block);
     frame.render_widget(list, area);
+}
+
+/// Single-row, monochrome badge — `■ name (status)` or `■ name v1.2.3`.
+/// Status nuance is preserved in the status-label suffix; only the
+/// glyph colour collapses to one neutral tone.
+fn backend_compact_line(b: &BackendBadge, palette: &Palette) -> Line<'static> {
+    let glyph_color = palette.color(Accent::Muted);
+    let suffix = if b.status == BackendHealthStatus::Available {
+        match &b.version {
+            Some(v) => format!("  v{v}"),
+            None => String::new(),
+        }
+    } else {
+        format!("  ({})", b.status_label())
+    };
+    Line::from(vec![
+        Span::styled(b.glyph().to_string(), Style::default().fg(glyph_color)),
+        Span::raw(" "),
+        Span::styled(
+            b.display_name.clone(),
+            Style::default()
+                .fg(palette.color(Accent::Body))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            suffix,
+            Style::default()
+                .fg(palette.color(Accent::Muted))
+                .add_modifier(Modifier::DIM),
+        ),
+    ])
 }
 
 /// One or two `Line`s per backend: the primary status row + a wrapped
 /// hint row for non-Available states. Returned as a `Vec` so the caller
 /// can chain everything into a single `List` without juggling indices.
-fn backend_lines(b: &BackendBadge) -> Vec<Line<'static>> {
+fn backend_lines(b: &BackendBadge, palette: &Palette) -> Vec<Line<'static>> {
+    // Pull the four semantic colours up front so the per-arm matches stay
+    // readable.
+    let ok = palette.color(Accent::Ok);
+    let warn = palette.color(Accent::Warn);
+    let err = palette.color(Accent::Error);
+    let muted = palette.color(Accent::Muted);
+    let body = palette.color(Accent::Body);
+
     let (glyph_color, name_style) = match b.status {
-        BackendHealthStatus::Available => (
-            Color::Green,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
+        BackendHealthStatus::Available => {
+            (ok, Style::default().fg(body).add_modifier(Modifier::BOLD))
+        }
         BackendHealthStatus::NotInstalled => (
-            Color::DarkGray,
+            muted,
             // Grey + DIM is the canonical "灰态" rendering the PRD asks
             // for (PRD §5.3 + WEK-29 acceptance "未安装/未鉴权后端在侧栏
             // 显示灰态"). We intentionally do not mark these rows with
             // `Modifier::CROSSED_OUT` — that confused early reviewers
             // into thinking the backend had been removed by the user.
             Style::default()
-                .fg(Color::Gray)
+                .fg(muted)
                 .add_modifier(Modifier::DIM | Modifier::BOLD),
         ),
         BackendHealthStatus::Unauthenticated => (
-            Color::Yellow,
+            warn,
             Style::default()
-                .fg(Color::Gray)
+                .fg(muted)
                 .add_modifier(Modifier::DIM | Modifier::BOLD),
         ),
-        BackendHealthStatus::ProtocolDrift => (
-            Color::Red,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+        BackendHealthStatus::ProtocolDrift => {
+            (err, Style::default().fg(warn).add_modifier(Modifier::BOLD))
+        }
         BackendHealthStatus::Error => (
-            Color::Red,
+            err,
             Style::default()
-                .fg(Color::Gray)
+                .fg(muted)
                 .add_modifier(Modifier::DIM | Modifier::BOLD),
         ),
     };
@@ -476,9 +553,7 @@ fn backend_lines(b: &BackendBadge) -> Vec<Line<'static>> {
         Span::styled(b.display_name.clone(), name_style),
         Span::styled(
             suffix,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(muted).add_modifier(Modifier::DIM),
         ),
     ])];
 
@@ -488,7 +563,7 @@ fn backend_lines(b: &BackendBadge) -> Vec<Line<'static>> {
             Span::styled(
                 truncate(reason, 28),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(muted)
                     .add_modifier(Modifier::DIM | Modifier::ITALIC),
             ),
         ]));
@@ -496,6 +571,11 @@ fn backend_lines(b: &BackendBadge) -> Vec<Line<'static>> {
     if let Some(url) = b.docs_url.as_deref().filter(|_| b.is_unavailable()) {
         lines.push(Line::from(vec![
             Span::raw("   "),
+            // Docs URLs stay on `Color::Blue` because terminals usually
+            // render that as a clickable hyperlink (OSC 8 is opt-in).
+            // Substituting a palette-derived colour would weaken that
+            // affordance for the user. The underline modifier keeps the
+            // a11y signal intact.
             Span::styled(
                 truncate(url, 28),
                 Style::default()
@@ -517,7 +597,12 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn render_item<'a>(state: &'a SidebarState, item: &'a Item) -> ListItem<'a> {
+fn render_item<'a>(state: &'a SidebarState, item: &'a Item, palette: &Palette) -> ListItem<'a> {
+    let ok = palette.color(Accent::Ok);
+    let warn = palette.color(Accent::Warn);
+    let err = palette.color(Accent::Error);
+    let muted = palette.color(Accent::Muted);
+    let body = palette.color(Accent::Body);
     match item {
         Item::GroupHeader { group_index } => {
             let g = &state.groups[*group_index];
@@ -525,16 +610,16 @@ fn render_item<'a>(state: &'a SidebarState, item: &'a Item) -> ListItem<'a> {
             let count = format!(" ({})", g.sessions.len());
             let title_style = if g.is_archived {
                 Style::default()
-                    .fg(Color::Gray)
+                    .fg(muted)
                     .add_modifier(Modifier::DIM | Modifier::BOLD)
             } else {
-                Style::default().add_modifier(Modifier::BOLD)
+                Style::default().fg(body).add_modifier(Modifier::BOLD)
             };
             ListItem::new(Line::from(vec![
-                Span::raw(arrow),
+                Span::styled(arrow, Style::default().fg(body)),
                 Span::raw(" "),
                 Span::styled(g.display_name.clone(), title_style),
-                Span::styled(count, Style::default().fg(Color::DarkGray)),
+                Span::styled(count, Style::default().fg(muted)),
             ]))
         }
         Item::SessionRow {
@@ -542,20 +627,30 @@ fn render_item<'a>(state: &'a SidebarState, item: &'a Item) -> ListItem<'a> {
             session_index,
         } => {
             let row = &state.groups[*group_index].sessions[*session_index];
+            // Per-state glyph colour now sources from `Accent::*` so a
+            // Light theme uses the WCAG-tuned amber/red rather than the
+            // pre-M4.3 raw ANSI Yellow/Red.
             let glyph_color = match row.run_state {
-                RunState::Running => Color::Green,
-                RunState::Idle => Color::DarkGray,
-                RunState::Waiting => Color::Yellow,
-                RunState::Errored => Color::Red,
-                RunState::Exited => Color::DarkGray,
+                RunState::Running => ok,
+                RunState::Idle => muted,
+                RunState::Waiting => warn,
+                RunState::Errored => err,
+                RunState::Exited => muted,
             };
             ListItem::new(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(row.run_state.glyph(), Style::default().fg(glyph_color)),
                 Span::raw(" "),
-                Span::styled(row.backend.label(), Style::default().fg(Color::Magenta)),
+                // Backend label uses `Accent::Primary` — keeps the
+                // "this is which adapter" cue visually distinct while
+                // following theme. Magenta on the pre-M4.3 default had
+                // no semantic basis.
+                Span::styled(
+                    row.backend.label(),
+                    Style::default().fg(palette.color(Accent::Primary)),
+                ),
                 Span::raw("  "),
-                Span::raw(row.display_title()),
+                Span::styled(row.display_title(), Style::default().fg(body)),
             ]))
         }
     }

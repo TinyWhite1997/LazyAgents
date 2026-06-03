@@ -137,3 +137,8 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm"]
 crossterm = { version = "0.28", default-features = false, features = ["events", "event-stream", "windows"] }
 vte = "0.15"
 unicode-width = "0.2"
+# WEK-42 / M4.3: read/write the `[ui]` section of
+# `$XDG_CONFIG_HOME/lazyagents/config.toml` from la-tui without dragging
+# the full daemon-side config parser into the client. `preserve_order` so
+# a round-trip never reshuffles the daemon's sections.
+toml = { version = "0.8", default-features = false, features = ["parse", "display", "preserve_order"] }

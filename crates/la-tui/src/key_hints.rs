@@ -241,6 +241,13 @@ impl HintRegistry {
             // bar to be in error state. Low importance so it sits near
             // the meta keys, not crowding out the primary actions.
             Hint::new("f", "errors", Importance::Low),
+            // WEK-42 / M4.3: surface the UI-pref cycle keys in the `?`
+            // overlay so they're discoverable without a manual. Meta
+            // importance keeps them out of the truncated hint bar in
+            // the default Rich mode (the bar already has enough cargo).
+            Hint::new("T", "cycle theme", Importance::Meta),
+            Hint::new("H", "cycle hints mode", Importance::Meta),
+            Hint::new("C", "toggle compact", Importance::Meta),
             Hint::new("?", "all keys", Importance::Meta),
             Hint::new("q", "quit", Importance::Meta),
         ]
@@ -563,6 +570,12 @@ mod tests {
             "r" => Some(KeyCode::Char('r')),
             "R" => Some(KeyCode::Char('R')),
             "Space" => Some(KeyCode::Char(' ')),
+            // WEK-42 / M4.3 UI-pref cycles. Capitalised — the translator
+            // routes them through `KeyCode::Char('T'|'H'|'C')` in
+            // [`translate_globals`].
+            "T" => Some(KeyCode::Char('T')),
+            "H" => Some(KeyCode::Char('H')),
+            "C" => Some(KeyCode::Char('C')),
             _ => None,
         }
     }

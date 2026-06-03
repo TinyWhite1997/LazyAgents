@@ -137,7 +137,17 @@ fn real_main() -> io::Result<()> {
     let bootstrap = bootstrap_daemon(&location.socket_path);
 
     let source = MockSessionSource::fixture();
-    let mut app = App::new(source);
+    // WEK-42 / M4.3: load `[ui]` from $XDG_CONFIG_HOME/lazyagents/config.toml
+    // before instantiating App so the very first frame reflects the
+    // user's saved theme + key-hints mode. A missing or unreadable file
+    // yields `UiPrefs::default()`; mutations via `T`/`H`/`C` write back
+    // to the same path.
+    let ui_prefs_path = la_tui::ui_prefs::default_config_path();
+    let ui_prefs = ui_prefs_path
+        .as_deref()
+        .map(la_tui::ui_prefs::load)
+        .unwrap_or_default();
+    let mut app = App::new(source).with_ui_prefs(ui_prefs, ui_prefs_path);
     // Seed the status bar with what we already know after bootstrap:
     // daemon presence + a right-context note about the socket. Every
     // other field stays at `Status::default()` and is filled in by the
