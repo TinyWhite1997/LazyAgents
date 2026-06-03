@@ -543,9 +543,7 @@ done
     let mut echoed = Vec::<u8>::new();
     let mut next_hello_at = tokio::time::Instant::now();
     let echo_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < echo_deadline
-        && !contains(&echoed, b"echo:hello-m1")
-    {
+    while tokio::time::Instant::now() < echo_deadline && !contains(&echoed, b"echo:hello-m1") {
         if tokio::time::Instant::now() >= next_hello_at {
             send_request(
                 &mut conn,
