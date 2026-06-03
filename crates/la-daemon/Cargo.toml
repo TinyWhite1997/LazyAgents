@@ -24,6 +24,8 @@ la-core = { path = "../la-core" }
 la-storage = { path = "../la-storage" }
 la-adapter = { path = "../la-adapter" }
 la-pty = { path = "../la-pty" }
+la-scheduler = { path = "../la-scheduler" }
+chrono = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }

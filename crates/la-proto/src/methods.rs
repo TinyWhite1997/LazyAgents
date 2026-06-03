@@ -53,6 +53,15 @@ pub const METHOD_NAMES: &[&str] = &[
     WorktreeDiscard::NAME,
     WorktreeCommit::NAME,
     WorktreeOpenInEditor::NAME,
+    CronsList::NAME,
+    CronsGet::NAME,
+    CronsUpsert::NAME,
+    CronsDelete::NAME,
+    CronsSetEnabled::NAME,
+    CronsRunNow::NAME,
+    CronsDryRun::NAME,
+    RunsList::NAME,
+    RunsGet::NAME,
 ];
 
 /// Trait carried by every RPC method type for static method-name lookup.
@@ -1214,4 +1223,357 @@ impl Method for WorktreeOpenInEditor {
     const NAME: &'static str = "worktree.open_in_editor";
     type Params = WorktreeOpenInEditorParams;
     type Result = WorktreeOpenInEditorResult;
+}
+
+// ===========================================================================
+// Cron + runs surface (M3.9 / WEK-57).
+//
+// `crons.*` exposes the scheduler's cron table to the TUI Crons tab; mutations
+// are funneled through the daemon's single scheduler control channel so the
+// in-memory heap and the SQLite row stay synchronised. `runs.*` is read-only
+// run-history reporting backed by `RunsRepo::list` / `get`.
+// ===========================================================================
+
+/// Wire-shape mirror of `la_storage::Cron` (architecture §4.4). All
+/// timestamps are RFC3339 UTC strings — distinct from the SQLite lexical
+/// `YYYY-MM-DD HH:MM:SS` form used internally so TUI / external tooling
+/// don't have to know the storage detail.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "CronEntry")]
+pub struct CronEntry {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub project_id: String,
+    pub backend: String,
+    /// JSON object of spawn arguments forwarded to the adapter
+    /// (e.g. `{"args":["--model","sonnet"]}`).
+    pub spawn_args: serde_json::Value,
+    pub prompt: String,
+    pub cron_expr: String,
+    pub tz: String,
+    pub catchup_mode: String,
+    pub max_concurrent_runs: u32,
+    pub max_runs_per_day: u32,
+    pub max_runtime_s: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_budget_usd_per_day: Option<f64>,
+    pub failure_backoff: String,
+    pub pause_on_consecutive_failures: u32,
+    pub consecutive_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ---------- crons.list ----------
+
+pub enum CronsList {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronsListParams")]
+pub struct CronsListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "CronsListResult")]
+pub struct CronsListResult {
+    pub crons: Vec<CronEntry>,
+}
+
+impl Method for CronsList {
+    const NAME: &'static str = "crons.list";
+    type Params = CronsListParams;
+    type Result = CronsListResult;
+}
+
+// ---------- crons.get ----------
+
+pub enum CronsGet {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronsGetParams")]
+pub struct CronsGetParams {
+    pub cron_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "CronsGetResult")]
+pub struct CronsGetResult {
+    pub cron: CronEntry,
+}
+
+impl Method for CronsGet {
+    const NAME: &'static str = "crons.get";
+    type Params = CronsGetParams;
+    type Result = CronsGetResult;
+}
+
+// ---------- crons.upsert ----------
+
+/// Input shape for creating or updating a cron. `id` set ⇒ update;
+/// `id` omitted ⇒ daemon mints a fresh UUID v7. All optional knob fields
+/// fall back to the architecture §5.4 defaults if omitted.
+pub enum CronsUpsert {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "CronsUpsertParams")]
+pub struct CronsUpsertParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    pub project_id: String,
+    pub backend: String,
+    #[serde(default)]
+    pub spawn_args: serde_json::Value,
+    pub prompt: String,
+    pub cron_expr: String,
+    #[serde(default = "default_tz")]
+    pub tz: String,
+    #[serde(default = "default_catchup_mode")]
+    pub catchup_mode: String,
+    #[serde(default = "default_max_concurrent_runs")]
+    pub max_concurrent_runs: u32,
+    #[serde(default = "default_max_runs_per_day")]
+    pub max_runs_per_day: u32,
+    #[serde(default = "default_max_runtime_s")]
+    pub max_runtime_s: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_budget_usd_per_day: Option<f64>,
+    #[serde(default = "default_failure_backoff")]
+    pub failure_backoff: String,
+    #[serde(default = "default_pause_on_failures")]
+    pub pause_on_consecutive_failures: u32,
+}
+
+fn default_tz() -> String {
+    "UTC".to_string()
+}
+fn default_catchup_mode() -> String {
+    "coalesce".to_string()
+}
+fn default_max_concurrent_runs() -> u32 {
+    1
+}
+fn default_max_runs_per_day() -> u32 {
+    24
+}
+fn default_max_runtime_s() -> u32 {
+    1800
+}
+fn default_failure_backoff() -> String {
+    "expo(1m,2,1h)".to_string()
+}
+fn default_pause_on_failures() -> u32 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "CronsUpsertResult")]
+pub struct CronsUpsertResult {
+    pub cron: CronEntry,
+}
+
+impl Method for CronsUpsert {
+    const NAME: &'static str = "crons.upsert";
+    type Params = CronsUpsertParams;
+    type Result = CronsUpsertResult;
+}
+
+// ---------- crons.delete ----------
+
+pub enum CronsDelete {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronsDeleteParams")]
+pub struct CronsDeleteParams {
+    pub cron_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronsDeleteResult")]
+pub struct CronsDeleteResult {
+    pub deleted: bool,
+}
+
+impl Method for CronsDelete {
+    const NAME: &'static str = "crons.delete";
+    type Params = CronsDeleteParams;
+    type Result = CronsDeleteResult;
+}
+
+// ---------- crons.set_enabled ----------
+
+pub enum CronsSetEnabled {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronsSetEnabledParams")]
+pub struct CronsSetEnabledParams {
+    pub cron_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "CronsSetEnabledResult")]
+pub struct CronsSetEnabledResult {
+    pub cron: CronEntry,
+}
+
+impl Method for CronsSetEnabled {
+    const NAME: &'static str = "crons.set_enabled";
+    type Params = CronsSetEnabledParams;
+    type Result = CronsSetEnabledResult;
+}
+
+// ---------- crons.run_now ----------
+
+/// Fire a cron immediately, bypassing its `cron_expr` schedule but still
+/// going through the admission gate (quotas honoured).
+pub enum CronsRunNow {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronsRunNowParams")]
+pub struct CronsRunNowParams {
+    pub cron_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "CronsRunNowResult")]
+pub struct CronsRunNowResult {
+    /// `true` when the admission gate let the fire through and a `runs`
+    /// row was created. `false` ⇒ the gate refused; inspect `refused`.
+    pub admitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Populated when `admitted = false`; carries the machine-readable
+    /// reason tag from [`la_scheduler::AdmissionDecision::error_kind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+}
+
+impl Method for CronsRunNow {
+    const NAME: &'static str = "crons.run_now";
+    type Params = CronsRunNowParams;
+    type Result = CronsRunNowResult;
+}
+
+// ---------- crons.dry_run ----------
+
+/// Pure preview: parse `cron_expr` + `tz`, project the next N fire times.
+/// Does NOT touch storage or the heap.
+pub enum CronsDryRun {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronsDryRunParams")]
+pub struct CronsDryRunParams {
+    pub cron_expr: String,
+    #[serde(default = "default_tz")]
+    pub tz: String,
+    /// 1..=20; defaults to 5.
+    #[serde(default = "default_dry_run_count")]
+    pub count: u32,
+}
+
+fn default_dry_run_count() -> u32 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronsDryRunResult")]
+pub struct CronsDryRunResult {
+    /// Projected RFC3339-UTC fire times, earliest first.
+    pub fires: Vec<String>,
+}
+
+impl Method for CronsDryRun {
+    const NAME: &'static str = "crons.dry_run";
+    type Params = CronsDryRunParams;
+    type Result = CronsDryRunResult;
+}
+
+// ---------- runs.list ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "RunEntry")]
+pub struct RunEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub scheduled_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    pub coalesced_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_est: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+}
+
+pub enum RunsList {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "RunsListParams")]
+pub struct RunsListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_id: Option<String>,
+    /// RFC3339 UTC; daemon converts to SQLite-lexical for the query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// 1..=500; default 100.
+    #[serde(default = "default_runs_list_limit")]
+    pub limit: u32,
+}
+
+fn default_runs_list_limit() -> u32 {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "RunsListResult")]
+pub struct RunsListResult {
+    pub runs: Vec<RunEntry>,
+}
+
+impl Method for RunsList {
+    const NAME: &'static str = "runs.list";
+    type Params = RunsListParams;
+    type Result = RunsListResult;
+}
+
+// ---------- runs.get ----------
+
+pub enum RunsGet {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "RunsGetParams")]
+pub struct RunsGetParams {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[schemars(rename = "RunsGetResult")]
+pub struct RunsGetResult {
+    pub run: RunEntry,
+}
+
+impl Method for RunsGet {
+    const NAME: &'static str = "runs.get";
+    type Params = RunsGetParams;
+    type Result = RunsGetResult;
 }

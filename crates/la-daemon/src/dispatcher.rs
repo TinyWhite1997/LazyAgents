@@ -67,6 +67,10 @@ pub struct ConnectionContext {
     /// backend with the right `-33101` / `-33102` code before the call
     /// even reaches `la-core`.
     pub health: crate::health::HealthRegistry,
+    /// WEK-57 / M3.9: handle into the scheduler stack so `crons.* /
+    /// runs.*` mutations can route through the single scheduler control
+    /// channel + admission lock.
+    pub scheduler: Arc<crate::scheduler::SchedulerServices>,
     pub server_version: String,
     /// When `notified()`, every active connection should drop into a
     /// graceful close: stop reading new requests, finish what's in flight,
@@ -138,7 +142,10 @@ where
 
     let caps = ServerCapabilities {
         adapters: ctx.adapters.names(),
-        cron: false,
+        // WEK-57 / M3.9: scheduler is wired up. `crons.* / runs.*` route
+        // through the daemon's `SchedulerServices` and the executor's
+        // single admission gate.
+        cron: true,
         // WEK-27: signal that `sessions.create { worktree: true }` is
         // wired and honoured. `Daemon::bind` always constructs a
         // `WorktreeManager`, so this is unconditionally `true` from M2
@@ -492,6 +499,42 @@ async fn dispatch(
         WorktreeOpenInEditor::NAME => {
             let params: WorktreeOpenInEditorParams = decode_params(req)?;
             handle_worktree_open_in_editor(state, params).await
+        }
+        la_proto::methods::CronsList::NAME => {
+            let params: la_proto::methods::CronsListParams = decode_params(req)?;
+            handle_crons_list(state, params).await
+        }
+        la_proto::methods::CronsGet::NAME => {
+            let params: la_proto::methods::CronsGetParams = decode_params(req)?;
+            handle_crons_get(state, params).await
+        }
+        la_proto::methods::CronsUpsert::NAME => {
+            let params: la_proto::methods::CronsUpsertParams = decode_params(req)?;
+            handle_crons_upsert(state, ctx, params).await
+        }
+        la_proto::methods::CronsDelete::NAME => {
+            let params: la_proto::methods::CronsDeleteParams = decode_params(req)?;
+            handle_crons_delete(state, ctx, params).await
+        }
+        la_proto::methods::CronsSetEnabled::NAME => {
+            let params: la_proto::methods::CronsSetEnabledParams = decode_params(req)?;
+            handle_crons_set_enabled(state, ctx, params).await
+        }
+        la_proto::methods::CronsRunNow::NAME => {
+            let params: la_proto::methods::CronsRunNowParams = decode_params(req)?;
+            handle_crons_run_now(state, ctx, params).await
+        }
+        la_proto::methods::CronsDryRun::NAME => {
+            let params: la_proto::methods::CronsDryRunParams = decode_params(req)?;
+            handle_crons_dry_run(params)
+        }
+        la_proto::methods::RunsList::NAME => {
+            let params: la_proto::methods::RunsListParams = decode_params(req)?;
+            handle_runs_list(state, params).await
+        }
+        la_proto::methods::RunsGet::NAME => {
+            let params: la_proto::methods::RunsGetParams = decode_params(req)?;
+            handle_runs_get(state, params).await
         }
         "shutdown" => ok(la_proto::methods::ShutdownResult {}),
         other => Err(RpcError::method_not_found(other)),
@@ -1418,5 +1461,245 @@ fn core_to_proto_hunk(h: la_core::Hunk) -> la_proto::methods::Hunk {
         },
         header: h.header,
         lines,
+    }
+}
+
+// ===========================================================================
+// Cron + runs handlers (M3.9 / WEK-57).
+//
+// Mutations route through `crate::scheduler::SchedulerServices` so the
+// in-memory heap and the SQLite row move atomically. Reads go straight at
+// the repos. Errors map onto the `CRON_*` and `STORAGE_*` codes via
+// `cron_op_to_rpc`.
+// ===========================================================================
+
+use la_proto::methods::{
+    CronEntry, CronsDeleteParams, CronsDeleteResult, CronsDryRunParams, CronsDryRunResult,
+    CronsGetParams, CronsGetResult, CronsListParams, CronsListResult, CronsRunNowParams,
+    CronsRunNowResult, CronsSetEnabledParams, CronsSetEnabledResult, CronsUpsertParams,
+    CronsUpsertResult, RunEntry, RunsGetParams, RunsGetResult, RunsListParams, RunsListResult,
+};
+
+fn cron_op_to_rpc(err: crate::scheduler::CronOpError) -> RpcError {
+    use crate::scheduler::CronOpError as E;
+    match err {
+        E::NotFound(id) => RpcError::new(error_codes::CRON_NOT_FOUND, format!("cron {id} not found")),
+        E::InvalidExpr(reason) => RpcError::new(error_codes::CRON_INVALID_EXPR, reason),
+        E::InvalidTz(tz) => RpcError::new(error_codes::CRON_INVALID_TZ, format!("invalid timezone: {tz}")),
+        E::Storage(e) => storage_to_rpc(e),
+        E::Other(s) => RpcError::new(error_codes::INTERNAL_ERROR, s),
+    }
+}
+
+async fn handle_crons_list(
+    state: &ConnState,
+    params: CronsListParams,
+) -> Result<serde_json::Value, RpcError> {
+    let storage = state.manager.storage();
+    let all = storage.crons().list().await.map_err(storage_to_rpc)?;
+    let crons: Vec<CronEntry> = all
+        .into_iter()
+        .filter(|c| {
+            if let Some(p) = params.project_id.as_deref() {
+                if c.project_id != p {
+                    return false;
+                }
+            }
+            params.include_disabled || c.enabled != 0
+        })
+        .map(crate::scheduler::cron_to_wire)
+        .collect();
+    ok(CronsListResult { crons })
+}
+
+async fn handle_crons_get(
+    state: &ConnState,
+    params: CronsGetParams,
+) -> Result<serde_json::Value, RpcError> {
+    let storage = state.manager.storage();
+    let cron = storage
+        .crons()
+        .get(&params.cron_id)
+        .await
+        .map_err(storage_to_rpc)?
+        .ok_or_else(|| {
+            RpcError::new(
+                error_codes::CRON_NOT_FOUND,
+                format!("cron {} not found", params.cron_id),
+            )
+        })?;
+    ok(CronsGetResult {
+        cron: crate::scheduler::cron_to_wire(cron),
+    })
+}
+
+async fn handle_crons_upsert(
+    state: &ConnState,
+    ctx: &ConnectionContext,
+    params: CronsUpsertParams,
+) -> Result<serde_json::Value, RpcError> {
+    // Reject unknown backend up-front for a clean wire error.
+    if ctx.adapters.get(&params.backend).is_none() {
+        return Err(RpcError::new(
+            error_codes::ADAPTER_NOT_INSTALLED,
+            format!("backend {:?} not registered", params.backend),
+        ));
+    }
+    let id = params.id.unwrap_or_else(la_storage::new_id);
+    // Preserve existing counter / last_fired_at on update so a TUI tweak
+    // doesn't reset the cron's history.
+    let existing = state
+        .manager
+        .storage()
+        .crons()
+        .get(&id)
+        .await
+        .map_err(storage_to_rpc)?;
+    let consecutive_failures = existing.as_ref().map(|c| c.consecutive_failures).unwrap_or(0);
+    let last_fired_at = existing.as_ref().and_then(|c| c.last_fired_at.clone());
+
+    let upsert = la_storage::CronUpsert {
+        id,
+        name: params.name,
+        enabled: existing.as_ref().map(|c| c.enabled != 0).unwrap_or(false),
+        project_id: params.project_id,
+        backend_id: params.backend,
+        spawn_args: params.spawn_args,
+        prompt: params.prompt,
+        cron_expr: params.cron_expr,
+        tz: params.tz,
+        catchup_mode: params.catchup_mode,
+        max_concurrent_runs: params.max_concurrent_runs as i64,
+        max_runs_per_day: params.max_runs_per_day as i64,
+        max_runtime_s: params.max_runtime_s as i64,
+        cost_budget_usd_per_day: params.cost_budget_usd_per_day,
+        failure_backoff: params.failure_backoff,
+        pause_on_consecutive_failures: params.pause_on_consecutive_failures as i64,
+        consecutive_failures,
+        last_fired_at,
+        next_fire_at: None,
+    };
+    let cron = crate::scheduler::upsert_cron(&ctx.scheduler, state.manager.storage(), upsert)
+        .await
+        .map_err(cron_op_to_rpc)?;
+    ok(CronsUpsertResult {
+        cron: crate::scheduler::cron_to_wire(cron),
+    })
+}
+
+async fn handle_crons_delete(
+    state: &ConnState,
+    ctx: &ConnectionContext,
+    params: CronsDeleteParams,
+) -> Result<serde_json::Value, RpcError> {
+    let deleted = crate::scheduler::delete_cron(&ctx.scheduler, state.manager.storage(), &params.cron_id)
+        .await
+        .map_err(cron_op_to_rpc)?;
+    ok(CronsDeleteResult { deleted })
+}
+
+async fn handle_crons_set_enabled(
+    state: &ConnState,
+    ctx: &ConnectionContext,
+    params: CronsSetEnabledParams,
+) -> Result<serde_json::Value, RpcError> {
+    let cron = crate::scheduler::set_enabled(
+        &ctx.scheduler,
+        state.manager.storage(),
+        &params.cron_id,
+        params.enabled,
+    )
+    .await
+    .map_err(cron_op_to_rpc)?;
+    ok(CronsSetEnabledResult {
+        cron: crate::scheduler::cron_to_wire(cron),
+    })
+}
+
+async fn handle_crons_run_now(
+    state: &ConnState,
+    ctx: &ConnectionContext,
+    params: CronsRunNowParams,
+) -> Result<serde_json::Value, RpcError> {
+    let outcome = crate::scheduler::run_now(
+        &ctx.scheduler,
+        state.manager.storage(),
+        &ctx.adapters,
+        &state.manager,
+        &params.cron_id,
+    )
+    .await
+    .map_err(cron_op_to_rpc)?;
+    match outcome {
+        crate::scheduler::RunNowOutcome::Admitted { run_id } => ok(CronsRunNowResult {
+            admitted: true,
+            run_id: Some(run_id),
+            refused: None,
+        }),
+        crate::scheduler::RunNowOutcome::Refused { reason, .. } => ok(CronsRunNowResult {
+            admitted: false,
+            run_id: None,
+            refused: Some(reason),
+        }),
+    }
+}
+
+fn handle_crons_dry_run(params: CronsDryRunParams) -> Result<serde_json::Value, RpcError> {
+    let count = params.count.clamp(1, 20);
+    let fires = crate::scheduler::dry_run_fires(&params.cron_expr, &params.tz, count)
+        .map_err(cron_op_to_rpc)?;
+    let fires = fires.into_iter().map(|dt| dt.to_rfc3339()).collect();
+    ok(CronsDryRunResult { fires })
+}
+
+async fn handle_runs_list(
+    state: &ConnState,
+    params: RunsListParams,
+) -> Result<serde_json::Value, RpcError> {
+    let storage = state.manager.storage();
+    // RFC3339 → SQLite-lexical conversion. If the caller already provided
+    // SQLite-lexical we pass it through unchanged.
+    let since_lex = params.since.as_deref().map(rfc3339_to_sqlite_lexical);
+    let limit = params.limit.clamp(1, 500) as i64;
+    let filter = la_storage::RunsListFilter {
+        cron_id: params.cron_id.as_deref(),
+        since: since_lex.as_deref(),
+        limit,
+    };
+    let rows = storage.runs().list(filter).await.map_err(storage_to_rpc)?;
+    let runs: Vec<RunEntry> = rows.into_iter().map(crate::scheduler::run_to_wire).collect();
+    ok(RunsListResult { runs })
+}
+
+async fn handle_runs_get(
+    state: &ConnState,
+    params: RunsGetParams,
+) -> Result<serde_json::Value, RpcError> {
+    let storage = state.manager.storage();
+    let row = storage
+        .runs()
+        .get(&params.run_id)
+        .await
+        .map_err(storage_to_rpc)?
+        .ok_or_else(|| {
+            RpcError::new(
+                error_codes::SESSION_NOT_FOUND,
+                format!("run {} not found", params.run_id),
+            )
+        })?;
+    ok(RunsGetResult {
+        run: crate::scheduler::run_to_wire(row),
+    })
+}
+
+fn rfc3339_to_sqlite_lexical(s: &str) -> String {
+    // Try parsing as RFC3339; on failure assume the caller passed the
+    // SQLite lexical form already and pass it through.
+    match chrono::DateTime::parse_from_rfc3339(s) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+        Err(_) => s.to_string(),
     }
 }
