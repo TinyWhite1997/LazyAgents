@@ -413,9 +413,24 @@ impl AgentAdapter for DebugShellAdapter {
     }
 
     fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, la_adapter::AdapterError> {
+        let script_dir = std::env::temp_dir().join("lazyagents-lad-test-scripts");
+        std::fs::create_dir_all(&script_dir).map_err(la_adapter::AdapterError::SpawnFailed)?;
+        let script_path = script_dir.join(format!("{}.sh", la_storage::new_id()));
+        std::fs::write(&script_path, format!("#!/bin/sh\n{}\n", self.script))
+            .map_err(la_adapter::AdapterError::SpawnFailed)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perm = std::fs::metadata(&script_path)
+                .map_err(la_adapter::AdapterError::SpawnFailed)?
+                .permissions();
+            perm.set_mode(0o700);
+            std::fs::set_permissions(&script_path, perm)
+                .map_err(la_adapter::AdapterError::SpawnFailed)?;
+        }
         Ok(SpawnSpec {
-            program: "sh".into(),
-            args: vec!["-c".into(), self.script.clone().into()],
+            program: script_path,
+            args: vec![],
             env: req.env.clone(),
             cwd: req.cwd.clone(),
             pty: req.pty,

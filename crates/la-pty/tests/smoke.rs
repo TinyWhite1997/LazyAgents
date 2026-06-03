@@ -17,8 +17,8 @@ fn echo_cmd(text: &str) -> CommandBuilder {
         cmd.args(["/C", "echo", text]);
         cmd
     } else {
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.args(["-c", &format!("echo {}", text)]);
+        let mut cmd = CommandBuilder::new("printf");
+        cmd.arg(text);
         cmd
     }
 }
@@ -131,9 +131,9 @@ async fn signal_interrupt_terminates_child() {
         c.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
         c
     } else {
-        let mut c = CommandBuilder::new("sh");
-        c.args(["-c", "sleep 30"]);
-        c
+        let mut cmd = CommandBuilder::new("sleep");
+        cmd.arg("30");
+        cmd
     };
     let child = spawn(cmd, PtySize::default()).expect("spawn");
 
@@ -165,9 +165,9 @@ async fn signal_kill_terminates_child() {
         c.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
         c
     } else {
-        let mut c = CommandBuilder::new("sh");
-        c.args(["-c", "sleep 30"]);
-        c
+        let mut cmd = CommandBuilder::new("sleep");
+        cmd.arg("30");
+        cmd
     };
     let child = spawn(cmd, PtySize::default()).expect("spawn");
 
@@ -178,4 +178,16 @@ async fn signal_kill_terminates_child() {
         .await
         .expect("child should exit after kill")
         .expect("wait");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_shell_command_string_wrapping() {
+    let mut cmd = CommandBuilder::new("/bin/sh");
+    cmd.args(["-c", "echo unsafe"]);
+    let err = match spawn(cmd, PtySize::default()) {
+        Ok(_) => panic!("shell wrapper should be rejected"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, la_pty::PtyError::ShellWrapping(_)));
 }

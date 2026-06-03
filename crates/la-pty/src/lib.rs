@@ -98,6 +98,8 @@ pub enum PtyError {
     WriterClosed,
     #[error("child has no pid")]
     NoPid,
+    #[error("shell wrapping is not allowed: {0}")]
+    ShellWrapping(String),
     #[error("join error: {0}")]
     Join(String),
 }
@@ -236,6 +238,7 @@ impl ChildWaiter {
 /// when the consumer drops `reader` or stops draining, the OS-side write
 /// to the PTY will eventually block, exerting flow control on the child.
 pub fn spawn(cmd: CommandBuilder, size: PtySize) -> Result<PtyChild, PtyError> {
+    reject_shell_wrapper(&cmd)?;
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(size.into())
@@ -307,4 +310,46 @@ pub fn spawn(cmd: CommandBuilder, size: PtySize) -> Result<PtyChild, PtyError> {
         master,
         child,
     })
+}
+
+fn reject_shell_wrapper(cmd: &CommandBuilder) -> Result<(), PtyError> {
+    let argv = cmd.get_argv();
+    if argv.len() < 2 {
+        return Ok(());
+    }
+
+    let program = argv[0].to_string_lossy();
+    let program_name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&program)
+        .to_ascii_lowercase();
+    let uses_shell = matches!(
+        program_name.as_str(),
+        "sh" | "bash"
+            | "dash"
+            | "zsh"
+            | "ksh"
+            | "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "powershell.exe"
+            | "pwsh"
+            | "pwsh.exe"
+    );
+    if !uses_shell {
+        return Ok(());
+    }
+
+    let has_exec_string_arg = argv.iter().skip(1).any(|arg| {
+        let arg = arg.to_string_lossy();
+        matches!(arg.as_ref(), "-c" | "/c" | "/C" | "-Command" | "-command")
+    });
+    if has_exec_string_arg {
+        return Err(PtyError::ShellWrapping(format!(
+            "{} with command-string argument",
+            argv[0].to_string_lossy()
+        )));
+    }
+    Ok(())
 }
