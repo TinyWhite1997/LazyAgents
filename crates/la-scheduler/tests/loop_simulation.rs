@@ -296,27 +296,23 @@ fn seven_day_dst_windows_skip_spring_gap_and_collapse_fall_overlap() {
     );
 }
 
-/// §S1 / WEK-58: over-cap catch-up no longer "degrades to skip + emits the
-/// last fire". The resolver truncates the missed list to the **earliest** 100
-/// entries, then the per-entry policy runs over those 100. We check three
-/// things at once on the live loop:
+/// §S1 / WEK-58: over-cap catch-up runs the policy over the **earliest** 100
+/// missed fires and reports the **real** dropped count on the metric.
 ///
-/// 1. The earliest 100 missed fires (not the latest) drive the emissions.
-/// 2. `min_replay_interval` is still honoured on the truncated window —
-///    proving the throttle didn't get accidentally short-circuited by the
-///    over-cap branch.
-/// 3. A `SchedulerEvent::CatchupTruncated { cron_id, missed, executed,
-///    dropped }` is delivered on the diagnostic channel so the UI can warn.
+/// The pre-WEK-58 implementation degraded to skip + last-fire only; the first
+/// fix (PR #42 v1) still reported `missed=101, dropped=1` because the
+/// scheduler pre-truncated `fires_between` at the probe cap. This test pins
+/// the post-review behaviour: a 600-fire backlog yields `missed=600,
+/// dropped=500`, the throttle still bounds the live emission window, and
+/// every emission carries `catchup_truncated=true`.
 #[tokio::test(start_paused = true, flavor = "current_thread")]
 async fn over_max_catchup_executes_earliest_window_with_throttle() {
     let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
     let (_clock, mut ch) = start_at(wall);
 
-    // Every-second cron, last_fired_at = 10 min ago. The raw backlog is 600
-    // fires; the scheduler's per-probe cap is MAX_CATCHUP+1 = 101, so the
-    // resolver sees 101 missed fires and truncates to the earliest 100.
-    // With a 10s replay throttle, those 100 1-second-apart fires emit at
-    // t=0,10,20,...,90 (relative to the earliest missed fire) = 10 events.
+    // Every-second cron, last_fired_at = 10 min ago → 600 missed fires
+    // (well above the 100 cap). With a 10s replay throttle on the earliest
+    // 100, the live loop emits at t=0,10,...,90 = 10 events.
     let last = wall - Duration::minutes(10);
     let spec = CronSpec::parse("* * * * * *", "UTC").unwrap();
     ch.handle
@@ -360,25 +356,24 @@ async fn over_max_catchup_executes_earliest_window_with_throttle() {
         );
     }
 
-    // Earliest kept fire MUST be at-or-after `last` (the boundary the spec
-    // skips, since `fires_between` is exclusive on the lower bound), and
-    // strictly within the earliest 100-second window — i.e. far below `wall`.
+    // Earliest emission must come from the earliest 100s of the backlog —
+    // not anywhere near `wall`, which is what the pre-WEK-58 degrade-to-skip
+    // path produced.
     let earliest = fires.first().unwrap().scheduled_at;
     assert!(
         earliest > last && earliest < last + Duration::seconds(101),
         "earliest emission must come from the earliest 100s of the backlog, got {earliest}",
     );
-    // The last emission must also fall within the earliest 100s window (not
-    // anywhere near `wall`), confirming we kept the *earliest* fires and not
-    // the latest as the pre-WEK-58 degrade-to-skip path did.
     let latest = fires.last().unwrap().scheduled_at;
     assert!(
         latest < last + Duration::seconds(101),
         "latest emission must still fall within earliest-100 window, got {latest}",
     );
 
-    // Diagnostic: exactly one CatchupTruncated event with executed=100 and
-    // dropped=1 (probe cap saw 101, resolver kept 100).
+    // Diagnostic: missed/dropped report the **real** backlog (600), not the
+    // bounded enumeration prefix. This is the WEK-58 review blocker fix —
+    // pre-fix the test asserted missed=101, dropped=1, which masked the
+    // missing counting helper.
     let diag = timeout(StdDuration::from_millis(100), ch.diagnostics.recv())
         .await
         .expect("diag deadline")
@@ -389,11 +384,19 @@ async fn over_max_catchup_executes_earliest_window_with_throttle() {
             missed,
             executed,
             dropped,
+            saturated,
         } => {
             assert_eq!(cron_id, "flood");
-            assert_eq!(missed, 101, "scheduler probe cap surfaces 101 missed");
+            assert_eq!(
+                missed, 600,
+                "metric must report the real backlog, not the probe-cap prefix"
+            );
             assert_eq!(executed, 100);
-            assert_eq!(dropped, 1);
+            assert_eq!(dropped, 500);
+            assert!(
+                !saturated,
+                "600 < MISSED_FIRES_COUNT_CAP — saturated must be false"
+            );
         }
         other => panic!("expected SchedulerEvent::CatchupTruncated, got {other:?}"),
     }
@@ -405,15 +408,13 @@ async fn over_max_catchup_executes_earliest_window_with_throttle() {
 /// exactly at `MAX_CATCHUP` the diagnostic still fires (with `dropped=0`),
 /// and every emission carries `catchup_truncated=true`. Pins the symmetry
 /// with the resolver unit tests so a future refactor that flips the
-/// `n >= MAX_CATCHUP` boundary back to strictly-greater can't sneak through.
+/// `total >= MAX_CATCHUP` boundary back to strictly-greater can't sneak through.
 #[tokio::test(start_paused = true, flavor = "current_thread")]
 async fn over_max_catchup_boundary_at_exact_cap_still_truncates() {
     let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
     let (_clock, mut ch) = start_at(wall);
 
-    // 100 missed fires exactly: 1s cadence, last = 100s ago. The scheduler's
-    // probe cap (101) is not reached; the resolver sees 100, and the
-    // `n >= MAX_CATCHUP` guard fires with dropped=0.
+    // 100 missed fires exactly: 1s cadence, last = 100s ago.
     let last = wall - Duration::seconds(100);
     let spec = CronSpec::parse("* * * * * *", "UTC").unwrap();
     ch.handle
@@ -445,11 +446,133 @@ async fn over_max_catchup_boundary_at_exact_cap_still_truncates() {
             missed,
             executed,
             dropped,
+            saturated,
             ..
         } => {
             assert_eq!(missed, 100);
             assert_eq!(executed, 100);
             assert_eq!(dropped, 0);
+            assert!(!saturated);
+        }
+        other => panic!("expected CatchupTruncated, got {other:?}"),
+    }
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// Real-backlog regression test for the WEK-58 PR-#42 review blocker.
+///
+/// Pre-fix, `MISSED_FIRES_PROBE_CAP = MAX_CATCHUP + 1` capped `fires_between`
+/// at 101, so a 9_000-fire backlog reported `missed=101, dropped=1` instead
+/// of `missed=9_000, dropped=8_900`. This test forces a deeper backlog (150
+/// minutes of every-second fires = 9_000 missed) and pins the honest metric.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn over_max_catchup_metric_reports_real_backlog_not_probe_cap() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let (_clock, mut ch) = start_at(wall);
+
+    // 150 minutes @ 1/s = 9_000 missed — well over MAX_CATCHUP, well under
+    // MISSED_FIRES_COUNT_CAP (10_000) so saturated must be false.
+    let last = wall - Duration::minutes(150);
+    let spec = CronSpec::parse("* * * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "real-backlog",
+            spec,
+            CatchupMode::Coalesce,
+            Duration::zero(),
+            Some(last),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    // Coalesce → exactly one merged fire over the earliest 100.
+    let fires = drain_fires(&mut ch.fires).await;
+    assert_eq!(fires.len(), 1, "coalesce over-cap emits one merged fire");
+    assert_eq!(fires[0].coalesced_count, 100);
+    assert!(fires[0].catchup_truncated);
+
+    let diag = timeout(StdDuration::from_millis(100), ch.diagnostics.recv())
+        .await
+        .expect("diag deadline")
+        .expect("CatchupTruncated must fire");
+    match diag {
+        SchedulerEvent::CatchupTruncated {
+            missed,
+            executed,
+            dropped,
+            saturated,
+            ..
+        } => {
+            assert_eq!(
+                missed, 9_000,
+                "metric must reflect the real 9_000-fire backlog, not 101"
+            );
+            assert_eq!(executed, 100);
+            assert_eq!(dropped, 8_900);
+            assert!(
+                !saturated,
+                "9_000 stays under MISSED_FIRES_COUNT_CAP=10_000"
+            );
+        }
+        other => panic!("expected CatchupTruncated, got {other:?}"),
+    }
+
+    ch.handle.shutdown().await.unwrap();
+}
+
+/// Saturation regression: when the real backlog exceeds the scheduler's
+/// safety cap, the metric reports `saturated=true` and `missed >=
+/// MISSED_FIRES_COUNT_CAP` rather than silently truncating to the probe
+/// boundary. Drives a 30-hour gap of every-second fires (~108_000 missed)
+/// to ensure we cross the 10_000 cap.
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn over_max_catchup_saturates_when_backlog_exceeds_count_cap() {
+    let wall = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+    let (_clock, mut ch) = start_at(wall);
+
+    let last = wall - Duration::hours(30);
+    let spec = CronSpec::parse("* * * * * *", "UTC").unwrap();
+    ch.handle
+        .upsert(
+            "saturating",
+            spec,
+            CatchupMode::Coalesce,
+            Duration::zero(),
+            Some(last),
+        )
+        .await
+        .unwrap();
+    advance(StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    let fires = drain_fires(&mut ch.fires).await;
+    assert_eq!(fires.len(), 1);
+    assert!(fires[0].catchup_truncated);
+
+    let diag = timeout(StdDuration::from_millis(100), ch.diagnostics.recv())
+        .await
+        .expect("diag deadline")
+        .expect("CatchupTruncated must fire");
+    match diag {
+        SchedulerEvent::CatchupTruncated {
+            missed,
+            executed,
+            dropped,
+            saturated,
+            ..
+        } => {
+            assert!(
+                saturated,
+                "108_000-fire backlog must hit the 10_000 count cap"
+            );
+            assert_eq!(executed, 100);
+            // saturated values are a lower bound: counter stopped at the
+            // cap, so missed equals MISSED_FIRES_COUNT_CAP exactly.
+            assert_eq!(missed, 10_000, "missed is the saturating count");
+            assert_eq!(dropped, missed - executed);
         }
         other => panic!("expected CatchupTruncated, got {other:?}"),
     }

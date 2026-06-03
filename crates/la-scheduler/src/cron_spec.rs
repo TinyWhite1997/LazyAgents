@@ -108,6 +108,60 @@ impl CronSpec {
         out
     }
 
+    /// Walk missed fires in `(start, end]` and return the earliest `take`
+    /// timestamps **plus the true total** observed in the window.
+    ///
+    /// The catch-up path needs both: the earliest entries to execute, AND the
+    /// real backlog size to put on the `scheduler.catchup_truncated` metric
+    /// (WEK-58 review blocker). `fires_between(..., limit)` is no good for
+    /// the metric because it discards everything past `limit`.
+    ///
+    /// `count_cap` is a safety belt on the *counting* loop so a pathological
+    /// expression (`* * * * * *` for "every second" against a years-long
+    /// window) can't pin the thread. When the count reaches `count_cap` the
+    /// helper stops walking, returns `saturated = true`, and `total` reflects
+    /// only what was observed up to that point. Callers should pick a
+    /// `count_cap` comfortably larger than any backlog they expect to honestly
+    /// report — `MAX_CATCHUP * N` for some N that bounds enumeration cost.
+    ///
+    /// `take` is the prefix that should actually drive emission and must be
+    /// `<= count_cap`. Returns `earliest.len() == min(total, take)`.
+    pub fn count_missed(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        take: usize,
+        count_cap: usize,
+    ) -> CountedMissed {
+        debug_assert!(take <= count_cap, "take must not exceed count_cap");
+        let start_tz = start.with_timezone(&self.tz);
+        let end_tz = end.with_timezone(&self.tz);
+        let mut earliest = Vec::with_capacity(take.min(count_cap));
+        let mut total: usize = 0;
+        let mut saturated = false;
+        for fire in self.schedule.after(&start_tz) {
+            if fire > end_tz {
+                break;
+            }
+            if !is_first_local_occurrence(fire, self.tz) {
+                continue;
+            }
+            if earliest.len() < take {
+                earliest.push(fire.with_timezone(&Utc));
+            }
+            total += 1;
+            if total >= count_cap {
+                saturated = true;
+                break;
+            }
+        }
+        CountedMissed {
+            earliest,
+            total,
+            saturated,
+        }
+    }
+
     /// Preview the next `n` fire times after `after`. Powers `crons.dry_run`
     /// in the IPC surface (§5.6).
     ///
@@ -123,6 +177,19 @@ impl CronSpec {
             .map(|dt| dt.with_timezone(&Utc))
             .collect()
     }
+}
+
+/// Result of [`CronSpec::count_missed`]: the earliest fires the resolver
+/// should run plus the **real** count of missed fires observed in the window.
+///
+/// `saturated` is true when the count_cap safety belt fired before the spec
+/// stopped producing fires — `total` should then be interpreted as
+/// "at least this many" rather than exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountedMissed {
+    pub earliest: Vec<DateTime<Utc>>,
+    pub total: usize,
+    pub saturated: bool,
 }
 
 fn is_first_local_occurrence(dt: DateTime<Tz>, tz: Tz) -> bool {
@@ -242,6 +309,58 @@ mod tests {
         let end = start + chrono::Duration::days(7);
         let fires = spec.fires_between(start, end, 5);
         assert_eq!(fires.len(), 5);
+    }
+
+    #[test]
+    fn count_missed_reports_real_total_under_count_cap() {
+        // 600 missed @ 1s with take=100, count_cap=10_000: total must be the
+        // real 600, earliest must materialise exactly 100 fires, saturated
+        // must be false. This is the helper that fixes the WEK-58 PR-#42
+        // review blocker: pre-fix the scheduler used fires_between(..., 101)
+        // and silently capped the metric at 101.
+        let spec = CronSpec::parse("* * * * * *", "UTC").unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let end = start + chrono::Duration::seconds(600);
+        let counted = spec.count_missed(start, end, 100, 10_000);
+        assert_eq!(counted.total, 600);
+        assert_eq!(counted.earliest.len(), 100);
+        assert!(!counted.saturated);
+        // Earliest fire is at start+1s (half-open interval, exclusive of start)
+        // and `earliest` is chronologically sorted.
+        assert_eq!(
+            counted.earliest.first().copied(),
+            Some(start + chrono::Duration::seconds(1))
+        );
+        assert_eq!(
+            counted.earliest.last().copied(),
+            Some(start + chrono::Duration::seconds(100))
+        );
+    }
+
+    #[test]
+    fn count_missed_saturates_at_count_cap() {
+        // Pathological "every second" spec against a 30-hour window
+        // (~108_000 fires) hits a 10_000 count_cap; total reports the cap,
+        // saturated=true, earliest still holds the requested take.
+        let spec = CronSpec::parse("* * * * * *", "UTC").unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let end = start + chrono::Duration::hours(30);
+        let counted = spec.count_missed(start, end, 100, 10_000);
+        assert_eq!(counted.total, 10_000);
+        assert_eq!(counted.earliest.len(), 100);
+        assert!(counted.saturated);
+    }
+
+    #[test]
+    fn count_missed_small_backlog_returns_all() {
+        // total < take: earliest contains all of them, saturated=false.
+        let spec = CronSpec::parse("0 * * * *", "UTC").unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 1, 1, 13, 30, 0).unwrap();
+        let counted = spec.count_missed(start, end, 100, 10_000);
+        assert_eq!(counted.total, 3);
+        assert_eq!(counted.earliest.len(), 3);
+        assert!(!counted.saturated);
     }
 
     #[test]

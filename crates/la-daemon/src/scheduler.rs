@@ -881,16 +881,20 @@ fn spawn_diag_drain(mut diag: mpsc::Receiver<la_scheduler::SchedulerEvent>, shut
                         Some(la_scheduler::SchedulerEvent::ClockSkewDetected { skew_seconds, recomputed_entries }) => {
                             tracing::warn!(skew_seconds, recomputed_entries, "scheduler clock skew");
                         }
-                        Some(la_scheduler::SchedulerEvent::CatchupTruncated { cron_id, missed, executed, dropped }) => {
+                        Some(la_scheduler::SchedulerEvent::CatchupTruncated { cron_id, missed, executed, dropped, saturated }) => {
                             // §S1 / WEK-58. The flag also rides every emitted
                             // fire's `catchup_truncated` so the run row can
                             // be tagged; this log line is the daemon-level
-                            // audit trail.
+                            // audit trail. `saturated=true` means the count
+                            // is a lower bound (the scheduler's count_cap
+                            // was reached) — log it so a saturating value is
+                            // never read as exact.
                             tracing::warn!(
                                 %cron_id,
                                 missed,
                                 executed,
                                 dropped,
+                                saturated,
                                 "scheduler.catchup_truncated"
                             );
                         }

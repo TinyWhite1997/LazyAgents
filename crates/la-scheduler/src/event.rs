@@ -51,13 +51,19 @@ pub enum SchedulerEvent {
     /// [`dropped`]: SchedulerEvent::CatchupTruncated::dropped
     CatchupTruncated {
         cron_id: String,
-        /// Total number of missed fires the resolver was handed.
+        /// Real number of missed fires in the catch-up window (counted by
+        /// [`crate::cron_spec::CronSpec::count_missed`] before truncation).
+        /// `missed - executed == dropped`.
         missed: usize,
         /// Number of earliest missed fires kept for policy evaluation
-        /// (equals `MAX_CATCHUP` by construction).
+        /// (equals `MAX_CATCHUP` whenever the count exceeds the cap).
         executed: usize,
-        /// Number of fires dropped (`missed - executed`). May be zero when
-        /// `missed == MAX_CATCHUP`.
+        /// Number of fires dropped. May be zero when `missed == MAX_CATCHUP`.
         dropped: usize,
+        /// True when the upstream counter hit its safety cap before the
+        /// real backlog was exhausted; `missed`/`dropped` are then a lower
+        /// bound, not an exact count. The daemon log line surfaces this
+        /// separately so a saturating count never reads as exact.
+        saturated: bool,
     },
 }
