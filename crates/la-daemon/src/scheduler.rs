@@ -624,6 +624,7 @@ async fn admit_and_spawn_with_id(
 
     // 7. Publish a cron.fired pulse so subscribed TUIs (M3.6 status bar)
     //    can render the pulse animation.
+    metrics::counter!("lad_cron_runs_total", "status" => "running").increment(1);
     cfg.manager
         .bus()
         .publish(BusEvent::CronFired(CronFiredParams {

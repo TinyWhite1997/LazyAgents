@@ -594,14 +594,15 @@ async fn spawn_metrics_loop(
             }
         }
     }
-    let listener = tokio::net::UnixListener::bind(&metrics_path)?;
+    let endpoint = Endpoint::uds(&metrics_path);
+    let listener = Listener::bind(&endpoint).await?;
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown.notified() => break,
                 accept = listener.accept() => {
                     match accept {
-                        Ok((mut stream, _)) => {
+                        Ok(mut stream) => {
                             let body = la_observ::render_prometheus();
                             if let Err(err) = stream.write_all(body.as_bytes()).await {
                                 tracing::debug!(%err, "metrics scrape write failed");
@@ -616,7 +617,6 @@ async fn spawn_metrics_loop(
             }
         }
         drop(listener);
-        let _ = tokio::fs::remove_file(&metrics_path).await;
     });
     Ok(handle)
 }

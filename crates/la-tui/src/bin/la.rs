@@ -49,7 +49,7 @@ enum CliAction {
     RunTui,
     PrintVersion,
     CheckUpdate,
-    Doctor,
+    Doctor(Vec<String>),
     PrintHelp,
     /// `--flag-name` was unknown. Surface it as exit 2 so wrapper
     /// scripts (`la --check-updates` typo etc.) fail fast.
@@ -64,7 +64,7 @@ fn parse_cli() -> CliAction {
         None => CliAction::RunTui,
         Some("--version" | "-V") => CliAction::PrintVersion,
         Some("--check-update") => CliAction::CheckUpdate,
-        Some("doctor") => CliAction::Doctor,
+        Some("doctor") => CliAction::Doctor(args.collect()),
         Some("--help" | "-h") => CliAction::PrintHelp,
         Some(other) if other.starts_with('-') => CliAction::Unknown(other.to_string()),
         // Positional args are reserved for future subcommands (e.g.
@@ -84,7 +84,7 @@ fn print_help() {
     println!("  la                 launch the TUI (spawns `lad` if not running)");
     println!("  la --version       print version and exit");
     println!("  la --check-update  check GitHub for a newer release and exit");
-    println!("  la doctor          run the daemon health/dependency diagnostics");
+    println!("  la doctor [flags]  run the daemon health/dependency diagnostics");
     println!("  la --help          print this message");
     println!();
     println!("ENV:");
@@ -110,7 +110,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         CliAction::CheckUpdate => run_check_update(),
-        CliAction::Doctor => run_doctor(),
+        CliAction::Doctor(args) => run_doctor(args),
         CliAction::Unknown(flag) => {
             eprintln!("la: unknown flag `{flag}`. See `la --help`.");
             ExitCode::from(2)
@@ -118,14 +118,42 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_doctor() -> ExitCode {
-    match ProcessCommand::new("lad").arg("doctor").status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
-        Err(err) => {
-            eprintln!("la doctor: failed to run `lad doctor`: {err}");
-            ExitCode::from(1)
+fn run_doctor(args: Vec<String>) -> ExitCode {
+    match ProcessCommand::new("lad")
+        .arg("doctor")
+        .args(&args)
+        .status()
+    {
+        Ok(status) => return ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if let Some(sibling) = sibling_lad_path() {
+                match ProcessCommand::new(&sibling)
+                    .arg("doctor")
+                    .args(&args)
+                    .status()
+                {
+                    Ok(status) => return ExitCode::from(status.code().unwrap_or(1) as u8),
+                    Err(err) => {
+                        eprintln!(
+                            "la doctor: failed to run `{}` doctor: {err}",
+                            sibling.display()
+                        );
+                    }
+                }
+            } else {
+                eprintln!("la doctor: failed to locate sibling `lad` binary");
+            }
         }
+        Err(err) => eprintln!("la doctor: failed to run `lad doctor`: {err}"),
     }
+    ExitCode::from(1)
+}
+
+fn sibling_lad_path() -> Option<PathBuf> {
+    let mut path = std::env::current_exe().ok()?;
+    path.pop();
+    path.push(if cfg!(windows) { "lad.exe" } else { "lad" });
+    path.exists().then_some(path)
 }
 
 fn run_check_update() -> ExitCode {

@@ -390,7 +390,6 @@ async fn deliver_bus_event(state: &ConnState, event: BusEvent) {
             Notification::new(WorktreeCommitCreated::NAME, &p)
         }
         BusEvent::CronFired(p) if topics.cron_fired => {
-            metrics::counter!("lad_cron_runs_total", "status" => p.status.clone()).increment(1);
             tracing::info!(
                 trace_id = %la_observ::new_trace_id(),
                 cron_id = %p.cron_id,
