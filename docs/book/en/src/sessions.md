@@ -1,0 +1,171 @@
+# Sessions
+
+A **session** in LazyAgents is one PTY-backed run of a backend CLI (claude, codex, opencode, or a custom adapter). The daemon owns the PTY; the TUI is just a viewer. That separation is why your sessions survive terminal closes, SSH disconnects, and `la` restarts.
+
+## Lifecycle states
+
+Every session is in one of six states:
+
+| State | Meaning | Glyph in TUI |
+|---|---|---|
+| `starting` | PTY spawned, no output yet. Promoted to `running` automatically after 250 ms of silence or the first output byte. | `●` |
+| `running` | Receiving or sending output. | `●` |
+| `waiting` | More than 2 seconds since the last PTY byte; the backend is idle, waiting for you. Only sessions whose stdin is the PTY (interactive) can enter this state. | `⏸` |
+| `exited` | Child process is gone. The transcript is preserved. | `·` |
+| `errored` | Reserved for adapter-level failures. Not currently emitted. | `✗` |
+| `archived` | Soft-deleted. Hidden from `sessions.list` unless you ask for it. | (in the Archived bucket) |
+
+Transitions you'll see day-to-day:
+
+- `starting → running`: the agent starts producing output.
+- `running ↔ waiting`: the agent went idle (and came back when you typed).
+- `running → exited`: the agent ran `exit`, you killed it, or it crashed.
+- `exited → archived`: you pressed `a` to clear it out of the active list.
+
+## Create a session
+
+### From the TUI (v1 status)
+
+The Sessions tab in v1 has the navigation, sidebar, and modal scaffolding wired, but the New-session form itself is still a placeholder — pressing **`n`** on a project opens a modal that acknowledges the keystroke without yet spawning a backend. The form, project picker, and live attach are tracked under "M1.7" in the source and will land in a follow-up release.
+
+The fields the form will collect:
+
+| Field | Required | Notes |
+|---|---|---|
+| Project | yes | An absolute path. LazyAgents tracks one or many sessions per project. |
+| Backend | yes | `claude`, `codex`, `opencode`, or a custom adapter id. |
+| Worktree | no (default off) | If on, `git worktree add -b la/session-<short-sid> <base>` runs before the spawn. |
+| Prompt | no | Initial text fed to the agent. Leave empty for an interactive session. |
+| Args | no | Extra CLI arguments appended to the backend command. |
+
+Until the form lands, drive `sessions.create` over the IPC socket directly — the daemon side is fully wired.
+
+### Programmatically (JSON-RPC over the daemon socket)
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"sessions.create","params":{
+  "project_dir": "/home/alice/code/myapp",
+  "backend":     "claude",
+  "worktree":    true,
+  "prompt":      "Add a README about the build system."
+}}
+```
+
+Response includes the `session_id` (UUID v7), the resolved `cwd` (which is the worktree path if `worktree: true`), and the initial PTY size (`32 × 120`). The session state on return is always `starting`.
+
+## Attach, detach, list
+
+| TUI key | Effect |
+|---|---|
+| `j` / `k` / arrow keys | Move the cursor in the session list. |
+| `Enter` | Attach to the highlighted session. |
+| `Esc` | Detach from the current session (it keeps running). |
+| `q` | Quit `la`. Sessions and the daemon stay alive. |
+
+**Detach vs quit:** detaching releases your viewer; quitting `la` does the same plus shuts down the TUI process. Neither stops the session. The daemon is the one keeping it alive.
+
+**Reattach:** when you re-open `la`, the daemon replays everything in its in-memory ring buffer (2 MiB per session) on attach so you catch up to "now". Output beyond that is in the persisted transcript (see below) but isn't streamed back automatically.
+
+## Where the output goes
+
+LazyAgents records every PTY chunk — your input, the agent's output, even adapter events — into SQLite. The schema makes the transcript queryable and lets you replay any contiguous range.
+
+- For the first **8 MiB** of a session, chunks live in the `session_chunks` table inside `lad.sqlite`.
+- After that, the daemon **spills to a file** at `<state_dir>/sessions/<session_id>.log` — newline-delimited JSON, one record per chunk, base64-encoded payload. Spill files are uncompressed (cron run archives are compressed; transcripts are not).
+- The daemon also keeps a per-session **2 MiB ring buffer** in memory for fast replay on reattach.
+
+Spill files are not safe to edit by hand. If you want a "save my transcript" feature, use `sessions.replay` from the RPC.
+
+## Replay
+
+Two ways to ask for output the daemon already has:
+
+1. **Reattach replay (the common case).** `sessions.attach` with `resume_from_seq: <last_seq>` asks the daemon to replay only chunks newer than the one you last saw, then keep streaming live. The TUI does this for you on every reconnect.
+2. **Explicit replay.** `sessions.replay` with `{ session_id, from_seq, max_bytes? }` queues a range of past output as `session.output` notifications. Useful for tools that want to fetch a historical slice without resetting the live cursor.
+
+If the ring buffer evicted some bytes before your viewer caught up, the daemon emits a `session.gap` notification with the dropped seq range and byte count. The TUI surfaces this as a "missed N bytes" indicator — the data still exists in the transcript, but the ring can't replay it.
+
+## Resize
+
+Sessions ship at `32 rows × 120 cols`. When you resize your terminal, the TUI re-pins its view and (in a future release) calls `sessions.resize` to push the new size into the PTY. The PTY layer fully supports this on Unix (`TIOCSWINSZ` + `SIGWINCH`) and Windows (`ResizePseudoConsole`); only the daemon-side RPC dispatcher is still being wired through, so child apps that depend on `SIGWINCH` will not redraw mid-session in v1. Restart the session if the geometry needs to change.
+
+## Archive vs delete
+
+Both refuse to touch a session that's still in the active registry — you must stop it first (`sessions.signal` with `TERM` or `KILL`, or just type `exit` to the agent).
+
+| | Archive (TUI `a`) | Delete |
+|---|---|---|
+| Row removed from SQLite | no | yes (cascades to transcript chunks) |
+| Transcript chunks removed | no | yes |
+| `.log` spill file removed | no | no (orphaned on disk) |
+| Worktree directory removed | yes (best-effort) | no |
+| Worktree branch removed | only if it has no commits beyond base | no |
+| Reversible | row remains; restoration is roadmap | no |
+
+**Default to archive.** Delete is for transcripts you actively want gone. There is no GC on orphaned spill files in v1 — if you `sessions.delete` a session that spilled, you should clean up `<state_dir>/sessions/<sid>.log` by hand.
+
+## Discover and import existing sessions
+
+LazyAgents can surface sessions you started directly with `claude`, `codex`, or `opencode` — without copying anything. The discovery walk is read-only.
+
+The daemon side is fully wired (`adapters.discover` + `sessions.import`), and the TUI emits an `ImportDiscovered` action on the `i` key — the live import overlay is the same M1.7 work as the New-session form. Until then, drive the import over JSON-RPC.
+
+After import, the session shows up alongside native LazyAgents sessions, and "resuming" it (planned for the same milestone) will spawn a fresh backend process with the right resume flag, pointed at the original transcript file (which LazyAgents never modifies).
+
+Discovery roots (and how to override them):
+
+| Backend | Default path | Env override |
+|---|---|---|
+| Claude | `~/.claude/projects/` | `CLAUDE_SESSIONS_DIR` |
+| Codex | `~/.codex/sessions/` | `CODEX_SESSIONS_DIR` |
+| OpenCode | `$XDG_DATA_HOME/opencode/sessions` | `OPENCODE_SESSIONS_DIR` |
+
+Already-imported rows are flagged so the TUI greys them out. Re-importing is idempotent. Full data-ownership rules are in [`docs/data-ownership.md`](https://github.com/TinyWhite1997/LazyAgents/blob/main/docs/data-ownership.md).
+
+## Hooks
+
+LazyAgents looks for an executable at `<project_root>/.lazyagents/hooks/post-create.sh` and runs it after a successful **worktree-backed** session spawn (i.e. when `sessions.create` was called with `worktree: true`). The hook gets 60 seconds; failure is advisory and does not abort the session. Use it for per-project setup like seeding env files or warming caches.
+
+Sessions created without a worktree skip the hook — there's no per-session directory to operate on.
+
+## UI preferences (theme, compact, key hints)
+
+The TUI's `[ui]` section lives in `$XDG_CONFIG_HOME/lazyagents/config.toml`:
+
+```toml
+[ui]
+theme = "auto"        # auto | dark | light
+key_hints = "rich"    # rich | compact | hidden
+compact = false
+```
+
+You can edit the file by hand, or use the in-TUI keys:
+
+| Key | Effect |
+|---|---|
+| `T` | Cycle theme: auto → dark → light |
+| `H` | Cycle key hints: rich → compact → hidden |
+| `C` | Toggle compact layout |
+
+Changes write through to `config.toml` immediately via an atomic rename. Any other sections (`[daemon]`, `[scheduler]`, `[adapters.*]`) you've added by hand are preserved verbatim.
+
+## Backup
+
+```sh
+lad backup --output ./lad-snapshot.sqlite
+```
+
+Uses SQLite's Online Backup API, so it's safe while the daemon is running. The snapshot is a single file — no WAL or SHM sidecars. Copy it offsite to back up every session row, transcript chunk, cron, and run. (Spill files at `<state_dir>/sessions/*.log` and worktree directories are not in the snapshot; back them up alongside if you need them.)
+
+## RPC reference
+
+For tools and scripts, the daemon speaks JSON-RPC 2.0 over a length-prefixed UDS / named-pipe. Method names you'll care about for sessions:
+
+- `sessions.list`, `sessions.create`, `sessions.attach`, `sessions.detach`
+- `sessions.write`, `sessions.resize`, `sessions.signal`
+- `sessions.archive`, `sessions.delete`
+- `sessions.import`, `sessions.replay`
+- `adapters.discover`
+- `events.subscribe` with topics: `session.output`, `session.state`, `session.gap`
+
+JSON Schemas for every params/result are checked into [`docs/schema/`](https://github.com/TinyWhite1997/LazyAgents/tree/main/docs/schema) and verified against the wire types in CI on every PR.

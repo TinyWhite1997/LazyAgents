@@ -44,3 +44,6 @@ Thumbs.db
 /.lazyagents/wt/
 /.lazyagents/*.sqlite*
 /.lazyagents/*.sock
+
+# mdBook build output for the docs/ handbook
+/docs/book/build/

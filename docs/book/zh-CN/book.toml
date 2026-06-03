@@ -1,0 +1,22 @@
+[book]
+title = "LazyAgents 用户手册"
+authors = ["LazyAgents contributors"]
+description = "安装、运行、并长期使用 LazyAgents —— 一个 tmux 风格的 daemon + TUI，用于托管无人值守编码 agent。"
+language = "zh"
+src = "src"
+
+[build]
+build-dir = "../build/zh-CN"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/TinyWhite1997/LazyAgents"
+edit-url-template = "https://github.com/TinyWhite1997/LazyAgents/edit/main/docs/book/zh-CN/src/{path}"
+site-url = "/zh-CN/"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 1
