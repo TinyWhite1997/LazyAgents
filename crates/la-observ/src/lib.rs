@@ -62,10 +62,11 @@ pub fn install_crash_reporter(crash_dir: impl Into<PathBuf>) {
     }));
 }
 
+#[allow(deprecated)]
 fn write_crash_report(
     crash_dir: &Path,
     ring: &RecentEvents,
-    info: &std::panic::PanicHookInfo<'_>,
+    info: &std::panic::PanicInfo<'_>,
 ) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(crash_dir)?;
     let ts = Utc::now();
@@ -87,7 +88,8 @@ fn write_crash_report(
     Ok(path)
 }
 
-fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+#[allow(deprecated)]
+fn panic_message(info: &std::panic::PanicInfo<'_>) -> String {
     if let Some(s) = info.payload().downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = info.payload().downcast_ref::<String>() {
