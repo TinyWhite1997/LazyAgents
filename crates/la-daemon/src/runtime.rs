@@ -14,8 +14,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use chrono::{
+    DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc,
+};
 use la_adapter::AgentAdapter;
 use la_core::{ManagerConfig, SessionManager, WorktreeManager};
 use la_ipc::transport::{Endpoint, Listener};
@@ -41,8 +44,10 @@ pub const WORKTREE_SWEEP_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const WORKTREE_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub const RUNS_ARCHIVE_RETENTION_DAYS: i64 = 90;
-pub const RUNS_ARCHIVE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const RUNS_ARCHIVE_UTC_SECONDS: u64 = 3 * 60 * 60 + 17 * 60;
+/// Wall-clock hour (local time) at which the daemon's run-archive
+/// loop fires (Rev2 §3.3, architecture §7: `17 3 * * *` local TZ).
+const RUNS_ARCHIVE_LOCAL_HOUR: u32 = 3;
+const RUNS_ARCHIVE_LOCAL_MINUTE: u32 = 17;
 
 /// Errors surfaced while spinning up a daemon.
 #[derive(Debug, thiserror::Error)]
@@ -90,11 +95,12 @@ pub struct DaemonConfig {
     /// Retention window for `runs` rows before they are compressed to
     /// `runs/archive/<yyyymm>.jsonl.zst` and deleted from SQLite.
     pub runs_archive_retention_days: i64,
-    /// Production leaves this `None`, which means "next 03:17 UTC".
-    /// Tests can set `Some(Duration::ZERO)` and use Tokio's paused time
-    /// to prove the day-counter path fires without sleeping.
+    /// Production leaves this `None`, which means "next local 03:17 in
+    /// the daemon's wall-clock timezone, recomputed after every fire".
+    /// Tests set `Some(Duration::ZERO)` and use Tokio's paused time to
+    /// drive the loop without sleeping; the loop then sleeps a constant
+    /// 24h between fires regardless of wall-clock time.
     pub runs_archive_initial_delay: Option<Duration>,
-    pub runs_archive_interval: Duration,
     /// WEK-57 / M3.9 scheduler tunables. Production uses defaults; tests
     /// shrink `global.global_max_concurrent_runs` to provoke the
     /// concurrency rail.
@@ -115,7 +121,6 @@ impl Default for DaemonConfig {
             worktree_sweep_interval: WORKTREE_SWEEP_INTERVAL,
             runs_archive_retention_days: RUNS_ARCHIVE_RETENTION_DAYS,
             runs_archive_initial_delay: None,
-            runs_archive_interval: RUNS_ARCHIVE_INTERVAL,
             scheduler: SchedulerConfig::default(),
         }
     }
@@ -159,7 +164,6 @@ impl Daemon {
             worktree_sweep_interval,
             runs_archive_retention_days,
             runs_archive_initial_delay,
-            runs_archive_interval,
             scheduler: scheduler_config,
         } = config;
 
@@ -305,9 +309,7 @@ impl Daemon {
         let runs_archive_loop = Some(spawn_runs_archive_loop(RunsArchiveLoopConfig {
             storage: manager.storage().clone(),
             retention_days: runs_archive_retention_days,
-            initial_delay: runs_archive_initial_delay
-                .unwrap_or_else(delay_until_next_runs_archive_tick),
-            interval: runs_archive_interval,
+            initial_delay: runs_archive_initial_delay,
             shutdown: shutdown.clone(),
         }));
 
@@ -632,8 +634,12 @@ fn spawn_worktree_sweep_loop(cfg: WorktreeSweepLoopConfig) -> JoinHandle<()> {
 struct RunsArchiveLoopConfig {
     storage: la_storage::Storage,
     retention_days: i64,
-    initial_delay: Duration,
-    interval: Duration,
+    /// `Some(d)` short-circuits the wall-clock alignment and fires after
+    /// `d`, then sleeps a constant 24h between fires. Used by the test
+    /// suite under `tokio::time::pause()` so the loop can be advanced
+    /// deterministically without depending on the host's local time
+    /// zone. Production passes `None`.
+    initial_delay: Option<Duration>,
     shutdown: Arc<Notify>,
 }
 
@@ -643,16 +649,26 @@ fn spawn_runs_archive_loop(cfg: RunsArchiveLoopConfig) -> JoinHandle<()> {
             storage,
             retention_days,
             initial_delay,
-            interval,
             shutdown,
         } = cfg;
 
-        // Retention cleanup is deliberately monotonic after startup: the
-        // first delay is aligned to the next 03:17 UTC wall-clock tick, and
-        // later ticks use a 24h monotonic interval. System clock/NTP jumps
-        // are picked up on daemon restart; unlike cron firing, this cleanup
-        // path can tolerate delayed realignment.
-        let mut sleep = Box::pin(tokio::time::sleep(initial_delay));
+        // Two firing modes:
+        //   - Production (`initial_delay = None`): compute the next
+        //     local 03:17 in the daemon's wall-clock timezone, sleep
+        //     until that UTC instant, archive, then recompute. The
+        //     recompute ensures DST transitions and daemon restarts
+        //     don't accumulate drift the way a monotonic 24h interval
+        //     would.
+        //   - Test (`initial_delay = Some(d)`): sleep `d`, archive,
+        //     then sleep a fixed 24h. Lets `tokio::time::pause()` drive
+        //     the loop without depending on host TZ or wall-clock.
+        let test_interval = Duration::from_secs(24 * 60 * 60);
+        let first_delay = match initial_delay {
+            Some(d) => d,
+            None => delay_until_next_local_archive_fire(&chrono::Local, Utc::now()),
+        };
+        let mut sleep = Box::pin(tokio::time::sleep(first_delay));
+
         loop {
             tokio::select! {
                 _ = shutdown.notified() => break,
@@ -671,35 +687,94 @@ fn spawn_runs_archive_loop(cfg: RunsArchiveLoopConfig) -> JoinHandle<()> {
                             tracing::warn!(%err, retention_days, "runs archive tick failed");
                         }
                     }
-                    sleep.as_mut().reset(tokio::time::Instant::now() + interval);
+                    let delay = match initial_delay {
+                        Some(_) => test_interval,
+                        None => delay_until_next_local_archive_fire(&chrono::Local, Utc::now()),
+                    };
+                    sleep.as_mut().reset(tokio::time::Instant::now() + delay);
                 }
             }
         }
     })
 }
 
-fn delay_until_next_runs_archive_tick() -> Duration {
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    delay_until_next_runs_archive_tick_from(now_secs)
+/// Compute the wall-clock distance from `now` to the next occurrence of
+/// `RUNS_ARCHIVE_LOCAL_HOUR:RUNS_ARCHIVE_LOCAL_MINUTE` in `tz`. The
+/// result is always >= 1s so two back-to-back ticks at the exact
+/// minute never busy-loop, and DST spring-forward gaps fall through to
+/// the next valid local instant.
+fn delay_until_next_local_archive_fire<Tz>(tz: &Tz, now: DateTime<Utc>) -> Duration
+where
+    Tz: TimeZone,
+{
+    let local_now = now.with_timezone(tz);
+    let local_date = local_now.date_naive();
+    let target_time = NaiveTime::from_hms_opt(
+        RUNS_ARCHIVE_LOCAL_HOUR,
+        RUNS_ARCHIVE_LOCAL_MINUTE,
+        0,
+    )
+    .expect("hard-coded HH:MM is valid");
+
+    // Search forward day-by-day until we land on a local instant that is
+    // strictly later than `local_now`. Limited to a bounded number of
+    // iterations so a pathological TZ (e.g. one that skips the target
+    // minute for an extended block) cannot wedge the daemon. The cap is
+    // generous because the worst real-world case is DST spring-forward,
+    // which only skips one local hour.
+    let mut day = local_date;
+    for _ in 0..7 {
+        let candidate = day.and_time(target_time);
+        match tz.from_local_datetime(&candidate) {
+            LocalResult::Single(local_dt) => {
+                let candidate_utc = local_dt.with_timezone(&Utc);
+                if candidate_utc > now {
+                    return (candidate_utc - now)
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(1))
+                        .max(Duration::from_secs(1));
+                }
+            }
+            LocalResult::Ambiguous(first, _) => {
+                // DST fall-back: same wall time happens twice. Take the
+                // first occurrence to stay deterministic, mirroring
+                // the scheduler's policy (WEK-59).
+                let candidate_utc = first.with_timezone(&Utc);
+                if candidate_utc > now {
+                    return (candidate_utc - now)
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(1))
+                        .max(Duration::from_secs(1));
+                }
+            }
+            LocalResult::None => {
+                // DST spring-forward gap: 03:17 might not exist on this
+                // day. Fall through to the next day.
+            }
+        }
+        day = next_local_date(day);
+    }
+    // Fallback: bounded search exhausted (should be unreachable for
+    // real-world timezones). Fire in one hour so the daemon doesn't
+    // wedge silently.
+    Duration::from_secs(60 * 60)
 }
 
-fn delay_until_next_runs_archive_tick_from(now_secs: u64) -> Duration {
-    let day_pos = now_secs % RUNS_ARCHIVE_INTERVAL.as_secs();
-    let wait_secs = if day_pos < RUNS_ARCHIVE_UTC_SECONDS {
-        RUNS_ARCHIVE_UTC_SECONDS - day_pos
-    } else {
-        RUNS_ARCHIVE_INTERVAL.as_secs() - day_pos + RUNS_ARCHIVE_UTC_SECONDS
-    };
-    Duration::from_secs(wait_secs)
+fn next_local_date(date: NaiveDate) -> NaiveDate {
+    date.succ_opt().unwrap_or_else(|| {
+        // NaiveDate::MAX safety belt — should never trigger.
+        NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap_or(date)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use la_storage::{BackendUpsert, CronUpsert, NewProject, NewRun, Storage, StorageConfig};
+    use chrono::{FixedOffset, Timelike};
+    use chrono_tz::Tz;
+    use la_storage::{
+        BackendUpsert, CronUpsert, NewProject, NewRun, RunFinish, Storage, StorageConfig,
+    };
     use tempfile::TempDir;
 
     async fn archive_loop_storage() -> (TempDir, Storage, Arc<Notify>) {
@@ -752,6 +827,9 @@ mod tests {
             })
             .await
             .expect("cron");
+        // Insert a long-finished completed run so the archive judgment
+        // (Rev2 §3.3: `finished_at < now-retention` AND terminal status)
+        // matches it on every test tick.
         storage
             .runs()
             .create(NewRun {
@@ -759,12 +837,28 @@ mod tests {
                 cron_id: Some("cron-1".into()),
                 session_id: None,
                 scheduled_at: "2000-01-01 03:17:00".into(),
-                started_at: None,
-                status: "pending".into(),
+                started_at: Some("2000-01-01 03:17:01".into()),
+                status: "running".into(),
                 coalesced_count: 1,
             })
             .await
             .expect("run");
+        storage
+            .runs()
+            .finish(
+                "run-old",
+                RunFinish {
+                    finished_at: "2000-01-01 03:18:00".into(),
+                    status: "completed".into(),
+                    exit_code: Some(0),
+                    cost_usd_est: None,
+                    error_kind: None,
+                    error_detail: None,
+                    tail_log: None,
+                },
+            )
+            .await
+            .expect("finish");
         (dir, storage, Arc::new(Notify::new()))
     }
 
@@ -775,8 +869,7 @@ mod tests {
         let handle = spawn_runs_archive_loop(RunsArchiveLoopConfig {
             storage: storage.clone(),
             retention_days: 90,
-            initial_delay: Duration::from_secs(24 * 60 * 60),
-            interval: Duration::from_secs(24 * 60 * 60),
+            initial_delay: Some(Duration::from_secs(24 * 60 * 60)),
             shutdown: shutdown.clone(),
         });
 
@@ -807,8 +900,7 @@ mod tests {
         let handle = spawn_runs_archive_loop(RunsArchiveLoopConfig {
             storage: storage.clone(),
             retention_days: 90,
-            initial_delay: Duration::ZERO,
-            interval: Duration::from_secs(24 * 60 * 60),
+            initial_delay: Some(Duration::ZERO),
             shutdown: shutdown.clone(),
         });
 
@@ -829,6 +921,8 @@ mod tests {
         tokio::time::resume();
         tokio::time::sleep(Duration::from_millis(20)).await;
         let second_len = tokio::fs::metadata(&archive).await.unwrap().len();
+        // The second tick has no new rows to archive (the only row was
+        // deleted in tick 1), so the file must be byte-identical.
         assert_eq!(first_len, second_len);
 
         shutdown.notify_waiters();
@@ -836,22 +930,82 @@ mod tests {
     }
 
     #[test]
-    fn runs_archive_delay_realigns_to_next_0317_utc_from_wall_clock() {
-        assert_eq!(
-            delay_until_next_runs_archive_tick_from(3 * 60 * 60 + 16 * 60 + 59),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            delay_until_next_runs_archive_tick_from(RUNS_ARCHIVE_UTC_SECONDS),
-            RUNS_ARCHIVE_INTERVAL
-        );
-        assert_eq!(
-            delay_until_next_runs_archive_tick_from(RUNS_ARCHIVE_UTC_SECONDS + 1),
-            RUNS_ARCHIVE_INTERVAL - Duration::from_secs(1)
-        );
-        assert_eq!(
-            delay_until_next_runs_archive_tick_from(2 * RUNS_ARCHIVE_INTERVAL.as_secs() + 60),
-            Duration::from_secs(RUNS_ARCHIVE_UTC_SECONDS - 60)
-        );
+    fn delay_realigns_to_next_local_0317_at_fixed_offset() {
+        // 03:00 UTC at UTC+0 → 17 minutes to next local 03:17.
+        let tz = FixedOffset::east_opt(0).unwrap();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 3, 0, 0)
+            .unwrap();
+        let delay = delay_until_next_local_archive_fire(&tz, now);
+        assert_eq!(delay, Duration::from_secs(17 * 60));
+
+        // 03:17 UTC at UTC+0 → next fire is tomorrow.
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 3, 17, 0)
+            .unwrap();
+        let delay = delay_until_next_local_archive_fire(&tz, now);
+        // Must be > 23h (next day's 03:17). Generous bound — 24h ± 1s.
+        assert!(delay >= Duration::from_secs(24 * 60 * 60));
+        assert!(delay <= Duration::from_secs(24 * 60 * 60 + 1));
+
+        // 03:00 UTC at UTC+9 → local is 12:00 same day → next 03:17 local
+        // is tomorrow 03:17 +09:00 = today 18:17 UTC.
+        let tz = FixedOffset::east_opt(9 * 3600).unwrap();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 3, 0, 0)
+            .unwrap();
+        let delay = delay_until_next_local_archive_fire(&tz, now);
+        assert_eq!(delay, Duration::from_secs(15 * 3600 + 17 * 60));
+    }
+
+    /// WEK-60 / WEK-39 Blocker #4(2) regression: the next fire is
+    /// computed from the local wall clock (`chrono::Local`), so it
+    /// always lands on a local 03:17 — not on `previous_fire + 24h`,
+    /// which would slip by one hour every DST transition. Two
+    /// distinct moments are pinned across `America/Los_Angeles`'s
+    /// 2025-11-02 fall-back boundary and both must resolve to a local
+    /// 03:17, even though one of the resulting intervals is ~25h of
+    /// UTC and the other is ~23h.
+    #[test]
+    fn delay_survives_dst_fall_back_in_la_local_tz() {
+        let tz: Tz = "America/Los_Angeles".parse().unwrap();
+        let assert_lands_on_local_0317 = |now: DateTime<Utc>| {
+            let delay = delay_until_next_local_archive_fire(&tz, now);
+            let next_fire = now + chrono::Duration::from_std(delay).unwrap();
+            let next_local = next_fire.with_timezone(&tz);
+            assert_eq!(
+                (next_local.hour(), next_local.minute()),
+                (3, 17),
+                "next fire should land on local 03:17; now={now} next={next_local}"
+            );
+            // Must be in the future, never zero or in the past.
+            assert!(delay >= Duration::from_secs(1));
+            // Must be at most ~26h (DST can stretch a 24h cron to ~25h).
+            assert!(
+                delay <= Duration::from_secs(26 * 60 * 60),
+                "delay should be <= ~26h even crossing DST; got {delay:?}"
+            );
+        };
+
+        // Just before the 2025-11-02 fall-back. Local time is
+        // 2025-11-02 00:30 PDT (UTC-7). Next local 03:17 is later
+        // today, *after* the clock falls back at 02:00, so the UTC
+        // interval is one hour longer than a non-DST day.
+        let before_fallback =
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2025, 11, 2, 7, 30, 0).unwrap();
+        assert_lands_on_local_0317(before_fallback);
+
+        // Right after the fall-back's second 02:00 instant. Local time
+        // is 2025-11-02 02:30 PST (UTC-8). Next local 03:17 is just
+        // 47 minutes away on the same day — the monotonic+24h loop
+        // would instead fire at 02:17 local on Nov 3, the bug this
+        // test guards against.
+        let after_fallback =
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2025, 11, 2, 10, 30, 0).unwrap();
+        assert_lands_on_local_0317(after_fallback);
+
+        // One second after that fire. Next fire should be tomorrow's
+        // 03:17 PST, which is ~24h away (the day after DST is a
+        // normal-length PST day).
+        let after_fire =
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2025, 11, 2, 11, 17, 1).unwrap();
+        assert_lands_on_local_0317(after_fire);
     }
 }
