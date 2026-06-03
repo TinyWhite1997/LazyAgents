@@ -231,7 +231,7 @@ fn seven_day_timeline_all_catchup_modes_stay_under_cap() {
 }
 
 #[test]
-fn seven_day_dst_windows_skip_spring_gap_and_cover_both_fall_offsets() {
+fn seven_day_dst_windows_skip_spring_gap_and_collapse_fall_overlap() {
     let tz: Tz = Los_Angeles;
 
     let spring = CronSpec::parse("30 2 * * *", "America/Los_Angeles").unwrap();
@@ -260,10 +260,13 @@ fn seven_day_dst_windows_skip_spring_gap_and_cover_both_fall_offsets() {
         .with_timezone(&Utc);
     let fall_end = fall_start + Duration::days(7);
     let fall_fires = fall.fires_between(fall_start, fall_end, 16);
+    // ADR-0002: ambiguous 01:30 on the fall-back day collapses to the first
+    // (PDT) occurrence, so the 7-day window has one fire per day instead of
+    // the raw IANA count of 8.
     assert_eq!(
         fall_fires.len(),
-        8,
-        "7-day fall-back window must include both 01:30 offsets"
+        7,
+        "7-day fall-back window must collapse ambiguous 01:30 to a single take-first fire"
     );
     let fall_day: Vec<_> = fall_fires
         .iter()
@@ -274,23 +277,22 @@ fn seven_day_dst_windows_skip_spring_gap_and_cover_both_fall_offsets() {
         })
         .collect();
     assert_eq!(
-        fall_day.len(),
-        2,
-        "fall-back day must fire once per offset: {fall_fires:#?}"
-    );
-    assert_eq!(
-        fall_day[0],
-        tz.with_ymd_and_hms(2026, 11, 1, 1, 30, 0)
+        fall_day,
+        vec![tz
+            .with_ymd_and_hms(2026, 11, 1, 1, 30, 0)
             .earliest()
             .unwrap()
-            .with_timezone(&Utc)
+            .with_timezone(&Utc)],
+        "fall-back day keeps only the earlier PDT 01:30, not both offsets: {fall_fires:#?}"
     );
-    assert_eq!(
-        fall_day[1],
-        tz.with_ymd_and_hms(2026, 11, 1, 1, 30, 0)
-            .latest()
-            .unwrap()
-            .with_timezone(&Utc)
+    let pst_repeat = tz
+        .with_ymd_and_hms(2026, 11, 1, 1, 30, 0)
+        .latest()
+        .unwrap()
+        .with_timezone(&Utc);
+    assert!(
+        !fall_fires.contains(&pst_repeat),
+        "PST 01:30 (09:30Z) must be suppressed under take-first: {fall_fires:#?}"
     );
 }
 
@@ -369,6 +371,112 @@ fn dst_fall_back_takes_first_ambiguous_hour_only() {
         day_fires,
         vec![Utc.with_ymd_and_hms(2026, 11, 1, 8, 30, 0).unwrap()],
         "fall-back day's ambiguous 01:30 should keep only the first occurrence, got {fires:#?}",
+    );
+}
+
+#[test]
+fn dst_fall_back_every_minute_fires_once_per_wall_clock_minute() {
+    // ADR-0002: `* 1 * * *` runs every minute of the 01:00 wall-clock hour.
+    // On the LA fall-back day, 01:00..01:59 PDT (08:00..08:59 UTC) replays as
+    // 01:00..01:59 PST (09:00..09:59 UTC). Take-first must collapse the 60
+    // duplicates so each (local_date, local_minute) fires exactly once.
+    let tz: Tz = Los_Angeles;
+    let spec = CronSpec::parse("* 1 * * *", "America/Los_Angeles").unwrap();
+
+    let day_start = tz
+        .with_ymd_and_hms(2026, 11, 1, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    // The next non-ambiguous local instant after the fall-back overlap is
+    // 02:00 PST (10:00 UTC); window up to there isolates the ambiguous hour.
+    let day_end = tz
+        .with_ymd_and_hms(2026, 11, 1, 2, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let fires = spec.fires_between(day_start, day_end, 240);
+
+    assert_eq!(
+        fires.len(),
+        60,
+        "01:00 wall-clock hour must fire 60 times (once per minute) under take-first, not 120: {fires:#?}"
+    );
+    let earliest_pdt = tz
+        .with_ymd_and_hms(2026, 11, 1, 1, 0, 0)
+        .earliest()
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(
+        fires[0], earliest_pdt,
+        "first fire must be the PDT 01:00 instant"
+    );
+    let latest_pdt_min = tz
+        .with_ymd_and_hms(2026, 11, 1, 1, 59, 0)
+        .earliest()
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(
+        *fires.last().unwrap(),
+        latest_pdt_min,
+        "last fire of the hour must be the PDT 01:59 instant, not any PST repeat"
+    );
+    let first_pst_instant = tz
+        .with_ymd_and_hms(2026, 11, 1, 1, 0, 0)
+        .latest()
+        .unwrap()
+        .with_timezone(&Utc);
+    assert!(
+        !fires.contains(&first_pst_instant),
+        "PST replay of 01:00 must be suppressed under take-first: {fires:#?}"
+    );
+}
+
+#[test]
+fn dst_spring_forward_every_minute_skips_missing_local_hour() {
+    // ADR-0002 keeps `cron`/`chrono-tz` behavior for the spring-forward gap:
+    // 2026-03-08 02:00..02:59 America/Los_Angeles does not exist on the local
+    // clock. A `* 2 * * *` cron must produce zero fires inside that window
+    // and resume at the next day's 02:00 PDT instant.
+    let tz: Tz = Los_Angeles;
+    let spec = CronSpec::parse("* 2 * * *", "America/Los_Angeles").unwrap();
+
+    let start = tz
+        .with_ymd_and_hms(2026, 3, 8, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    let end = tz
+        .with_ymd_and_hms(2026, 3, 9, 3, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let fires = spec.fires_between(start, end, 240);
+
+    let gap_fires: Vec<_> = fires
+        .iter()
+        .copied()
+        .filter(|f| {
+            let local = f.with_timezone(&tz);
+            local.month() == 3 && local.day() == 8
+        })
+        .collect();
+    assert!(
+        gap_fires.is_empty(),
+        "spring-forward day must produce no 02:xx local fires: {fires:#?}"
+    );
+
+    let next_day_first = tz
+        .with_ymd_and_hms(2026, 3, 9, 2, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(
+        fires.first().copied(),
+        Some(next_day_first),
+        "first fire after the gap must be 2026-03-09 02:00 PDT: {fires:#?}"
+    );
+    assert_eq!(
+        fires.len(),
+        60,
+        "the 24h window after the gap must contain exactly the 60 minutes of 02:00 PDT next day: {fires:#?}"
     );
 }
 
