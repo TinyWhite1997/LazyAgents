@@ -29,7 +29,27 @@ The full rationale is in [ADR-0002](https://github.com/TinyWhite1997/LazyAgents/
 
 ## Create a cron
 
-In the TUI, switch to the **Crons** tab and press **`n`** to open the editor. Cycle fields with `Tab`:
+> **v1 status.** The daemon-side cron surface (`crons.upsert`, `crons.set_enabled`, `crons.run_now`, `crons.dry_run`, the admission gate, scheduler, catch-up, archiving) is fully wired in v1 — every behaviour described below is what `lad` actually does once a cron lands in SQLite. The **TUI Crons tab is still mock-backed** (tracked as M3.5 in the source): the editor, list, and `Space` / `r` / `R` / `d` keys all manipulate an in-memory `MockCronSource` and **do not yet round-trip to the daemon**. To create, enable, or trigger a real cron today, drive `crons.*` over the IPC socket; the TUI binding tables below describe the M3.5 wiring already drafted in the UI layer.
+
+### v1 path: JSON-RPC
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"crons.upsert","params":{
+  "name":      "nightly-refactor",
+  "project_id":"<your project id>",
+  "backend_id":"claude",
+  "spawn_args": [],
+  "prompt":    "Run the nightly refactor checklist.",
+  "cron_expr": "0 2 * * *",
+  "tz":        "America/Los_Angeles"
+}}
+```
+
+Then a two-step enable: a first `crons.set_enabled` returns a 5-minute confirmation token + summary, and a second call with the token actually flips it on. See [Enabling a cron is a two-step gate](#enabling-a-cron-is-a-two-step-gate) below.
+
+### TUI editor (M3.5 wiring, today mock-backed)
+
+In the TUI you switch to the **Crons** tab and press **`n`** to open the editor. Cycle fields with `Tab`:
 
 | Field | Notes |
 |---|---|
@@ -41,27 +61,29 @@ In the TUI, switch to the **Crons** tab and press **`n`** to open the editor. Cy
 | Prompt | Up to 64 KiB. Don't put credentials here — see [Security caveats](#security-caveats). |
 | Budget | Daily USD cap, runtime per run, max concurrent runs, etc. |
 
-`Ctrl+S` saves the draft. `Esc` discards.
+`Ctrl+S` saves the draft. `Esc` discards. **In v1 these writes land in the TUI's mock source only**; M3.5 swaps in a live `IpcCronSource` and the same keystrokes will round-trip to `crons.upsert`.
 
 ## Crons-tab keys
 
-| Key | Effect |
-|---|---|
-| `j` / `k` / `↓` / `↑` | Move cursor |
-| `n` | New cron draft |
-| `e` / `i` / `Enter` | Edit the highlighted cron |
-| `Space` | Toggle enabled/disabled (first enable shows a confirmation modal — see below) |
-| `r` | Trigger this cron right now (`crons.run_now`) |
-| `R` | Dry-run — preview the next 5 fire times |
-| `d` | Delete (with a confirmation modal) |
-| `Ctrl+S` | Save the current draft |
-| `Esc` | Cancel the draft |
+| Key | Effect (today — against the mock) | Effect after M3.5 wires the live source |
+|---|---|---|
+| `j` / `k` / `↓` / `↑` | Move cursor | Same |
+| `n` | New cron draft | Same; save will call `crons.upsert` |
+| `e` / `i` / `Enter` | Edit the highlighted cron | Same |
+| `Space` | Toggle local enabled flag | `crons.set_enabled` two-step gate |
+| `r` | Mock `trigger_now` | `crons.run_now` |
+| `R` | Local dry-run preview | `crons.dry_run` |
+| `d` | Delete from mock | `crons.delete` (with confirmation modal) |
+| `Ctrl+S` | Save the current draft | Same; round-trips to `crons.upsert` |
+| `Esc` | Cancel the draft | Same |
+
+Until M3.5 lands, **don't rely on the TUI to schedule real work** — anything you do here is local-only and disappears when you quit `la`.
 
 ## Enabling a cron is a two-step gate
 
 Crons don't become enabled on save — you have to explicitly enable them. The first call to `crons.set_enabled` returns a confirmation token and a summary (next 5 fire times, daily run estimate, budget check). The second call must present that token within 5 minutes. This is by design: changing any sensitive field (backend, args, prompt, schedule, timezone, runtime limits, budget) **auto-disables** the cron and invalidates pending tokens, so a malicious edit can't go from save → live without your confirmation.
 
-In the TUI you just press `Space` and confirm; the round-trip is hidden. The protection is what keeps an enabled-by-accident cron from blowing through your API budget overnight.
+Once M3.5 wires the TUI to the live source, pressing `Space` and confirming will perform that round-trip transparently. In v1 you do the two calls yourself over the socket.
 
 ## What fires when the cron triggers
 
@@ -115,8 +137,8 @@ Old `runs` rows are pruned after a retention window (default 90 days, swept once
 
 ## Dry-run before you enable
 
-Press `R` on a cron row (or call `crons.dry_run` with `count: N` up to 20) to see the next N fire times in the cron's own timezone. This is the cheapest way to catch a `0 9 * * 7` (Sunday at 09:00) when you meant `0 9 * * 1` (Monday).
+Call `crons.dry_run` with `count: N` (up to 20) to see the next N fire times in the cron's own timezone. This is the cheapest way to catch a `0 9 * * 7` (Sunday at 09:00) when you meant `0 9 * * 1` (Monday). The TUI's `R` key drives a local preview today; after M3.5 it will round-trip to the daemon.
 
 ## See it without enabling
 
-`crons.run_now` (key `r`) bypasses the schedule and fires the cron once immediately, going through the same admission gate as a scheduled fire (so quotas still apply). Useful for sanity-checking a fresh cron before you flip it on.
+`crons.run_now` bypasses the schedule and fires the cron once immediately, going through the same admission gate as a scheduled fire (so quotas still apply). Useful for sanity-checking a fresh cron before you flip it on. The TUI's `r` key will drive this once M3.5 lands; for v1 invoke the RPC directly.

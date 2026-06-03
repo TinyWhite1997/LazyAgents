@@ -21,15 +21,17 @@ cargo install mdbook --locked
 
 ### Build both books
 
+From the repo root:
+
 ```sh
-cd docs/book/en   && mdbook build
-cd docs/book/zh-CN && mdbook build
+mdbook build docs/book/en
+mdbook build docs/book/zh-CN
 ```
 
 Output lands at `docs/book/build/en/` and `docs/book/build/zh-CN/` (one HTML site each). Open `index.html` in a browser or serve it:
 
 ```sh
-cd docs/book/en && mdbook serve --open    # http://localhost:3000
+mdbook serve --open docs/book/en       # http://localhost:3000
 ```
 
 `mdbook serve` watches for changes and auto-rebuilds.

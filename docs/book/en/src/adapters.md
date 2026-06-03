@@ -85,7 +85,19 @@ The walk is bounded to the file-type globs above; it does not chase symlinks out
 
 ## Importing a discovered session
 
-In the TUI, the import overlay (driven by `adapters.discover` + `sessions.import`) shows discovered rows; press `i` on one and a fresh LazyAgents row is added with `origin = "import"`. The row pins:
+> **v1 status.** Daemon-side `adapters.discover` and `sessions.import` are wired end-to-end (the `(backend, external_id)` uniqueness constraint is enforced in migration `0003_session_external_reference.sql`). The **TUI import overlay is still M1.7-pending** — pressing `i` today only flips a flag on the TUI's mock `SessionSource`; it does not yet call `sessions.import`. To actually import in v1, drive the RPC pair over the IPC socket.
+
+### v1 path: JSON-RPC
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"adapters.discover","params":{"backend":"claude"}}
+{"jsonrpc":"2.0","id":2,"method":"sessions.import","params":{
+  "backend":      "claude",
+  "external_id":  "<the external_id from the discover result>"
+}}
+```
+
+The import handler creates a fresh LazyAgents row with `origin = "import"`:
 
 - a fresh `session_id` (UUID v7),
 - `external_id` set to the backend's id,
@@ -93,6 +105,8 @@ In the TUI, the import overlay (driven by `adapters.discover` + `sessions.import
 - `created_at`, `title`, `project_hint` from the backend's first-line metadata.
 
 Re-importing the same `(backend, external_id)` is a no-op — uniqueness is enforced in the schema (migration `0003_session_external_reference.sql`).
+
+The TUI `i` keystroke will round-trip to the same RPC pair once the M1.7 import overlay lands; until then it manipulates local mock state only.
 
 ## Resuming an imported session
 
