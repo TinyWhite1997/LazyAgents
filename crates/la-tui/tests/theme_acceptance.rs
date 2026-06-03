@@ -87,12 +87,83 @@ fn toggle_compact_flips_pref() {
     assert!(!a.ui_prefs.compact);
 }
 
-/// WEK-42 / M4.3 review feedback: T/H/C are documented as globals, so
-/// they must work while a modal is open (otherwise the user opens
-/// FullHints to read the binding and can't actually fire it). Pre-fix
-/// the modal short-circuit silently dropped capital-letter keystrokes.
+/// WEK-42 / M4.3 review fix: the translator routes T/H/C inside a
+/// modal, but the App's modal short-circuit used to drop them on the
+/// floor (handle_in_modal had no arm). Pin both halves: (a) firing
+/// `CycleTheme` while a modal is open actually mutates `ui_prefs.theme`;
+/// (b) the modal stays open afterwards (the toggle is a pref change,
+/// not a modal action).
 #[test]
-fn t_h_c_work_inside_a_modal() {
+fn ui_pref_messages_apply_even_when_modal_is_open() {
+    let mut a = App::new(MockSessionSource::fixture());
+    a.handle(AppMsg::ToggleFullHints);
+    assert!(matches!(a.modal, Some(la_tui::app::Modal::FullHints)));
+
+    let theme_before = a.ui_prefs.theme;
+    let hints_before = a.ui_prefs.key_hints;
+    let compact_before = a.ui_prefs.compact;
+
+    a.handle(AppMsg::CycleTheme);
+    assert_ne!(
+        a.ui_prefs.theme, theme_before,
+        "CycleTheme inside a modal must mutate ui_prefs.theme"
+    );
+    assert!(
+        matches!(a.modal, Some(la_tui::app::Modal::FullHints)),
+        "modal must stay open after a global pref toggle"
+    );
+
+    a.handle(AppMsg::CycleKeyHints);
+    assert_ne!(a.ui_prefs.key_hints, hints_before);
+    assert!(matches!(a.modal, Some(la_tui::app::Modal::FullHints)));
+
+    a.handle(AppMsg::ToggleCompact);
+    assert_ne!(a.ui_prefs.compact, compact_before);
+    assert!(matches!(a.modal, Some(la_tui::app::Modal::FullHints)));
+}
+
+/// Companion test: when a modal IS open and the message is NOT a UI
+/// pref, the normal modal-dispatch path must still fire. Guards against
+/// the pre-modal short-circuit accidentally swallowing all messages.
+#[test]
+fn modal_dispatch_still_works_alongside_pref_short_circuit() {
+    let mut a = App::new(MockSessionSource::fixture());
+    a.handle(AppMsg::ToggleFullHints);
+    assert!(matches!(a.modal, Some(la_tui::app::Modal::FullHints)));
+    // Cancel from inside FullHints closes it — that path must still be
+    // reachable after the pre-modal pref short-circuit.
+    a.handle(AppMsg::Cancel);
+    assert!(a.modal.is_none(), "modal cancel still works");
+}
+
+/// Pref toggles must also persist to disk when fired inside a modal —
+/// the pre-modal short-circuit runs the same `persist_ui_prefs` path
+/// the non-modal handler does.
+#[test]
+fn ui_pref_persists_to_toml_even_when_toggled_inside_modal() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("config.toml");
+
+    let mut a = App::new(MockSessionSource::fixture())
+        .with_ui_prefs(UiPrefs::default(), Some(path.clone()));
+    a.handle(AppMsg::ToggleFullHints);
+    a.handle(AppMsg::CycleTheme); // Auto → Dark, with FullHints open
+    a.handle(AppMsg::Cancel); // close overlay
+
+    let reloaded = ui_prefs::load(&path);
+    assert_eq!(
+        reloaded.theme,
+        Theme::Dark,
+        "pref toggled inside a modal must hit disk just like the non-modal path"
+    );
+}
+
+/// Translator-level companion to `ui_pref_messages_apply_even_when_modal_is_open`:
+/// the input layer must produce the right AppMsg even with a modal
+/// open, so the App-level check above isn't testing a path the user
+/// can't reach through real keystrokes.
+#[test]
+fn t_h_c_route_through_translator_inside_a_modal() {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use la_tui::app::{Focus, Tab};
     use la_tui::input::{translate, HitBoxes};

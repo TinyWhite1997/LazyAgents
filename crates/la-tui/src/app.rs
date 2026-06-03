@@ -359,11 +359,31 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             None => return AppOutcome::Continue,
             Some(other) => other,
         };
-        // Modal short-circuits — while a modal is open, only its keys are
-        // valid (PRD §5.6 上下文驱动).
-        if let Some(modal) = self.modal.clone() {
-            return self.handle_in_modal(modal, msg);
+        // WEK-42 / M4.3 review fix: T/H/C are advertised as globals and
+        // the translator routes them inside modals, but the modal
+        // short-circuit below would otherwise drop them on the floor.
+        // Apply UI-pref toggles BEFORE the modal short-circuit so the
+        // user can read the binding in `?` overlay and immediately try
+        // it without closing the overlay first. The modal stays open —
+        // the toggle is a global preference change, not a modal action.
+        if let Some(other) = self.try_apply_ui_pref(msg) {
+            // try_apply_ui_pref returned the message back ⇒ not a pref.
+            // Fall through to the normal modal/keybinding path.
+            let msg = other;
+            // Modal short-circuits — while a modal is open, only its keys are
+            // valid (PRD §5.6 上下文驱动).
+            if let Some(modal) = self.modal.clone() {
+                return self.handle_in_modal(modal, msg);
+            }
+            return self.dispatch_non_modal(msg);
         }
+        AppOutcome::Continue
+    }
+
+    /// Handle one user-input message in the non-modal context. Split out
+    /// of [`Self::handle`] so the pre-modal UI-pref short-circuit can
+    /// fall through cleanly without an extra level of nesting.
+    fn dispatch_non_modal(&mut self, msg: AppMsg) -> AppOutcome {
         match msg {
             AppMsg::Quit => return AppOutcome::Quit,
             AppMsg::NextTab => {
@@ -498,24 +518,17 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             }
 
             // --- UI prefs ----------------------------------------------
-            AppMsg::CycleTheme => {
-                self.ui_prefs.theme = self.ui_prefs.theme.next();
-                self.persist_ui_prefs();
-                self.last_toast = Some(format!("theme: {}", self.ui_prefs.theme.label()));
-            }
-            AppMsg::CycleKeyHints => {
-                self.ui_prefs.key_hints = self.ui_prefs.key_hints.next();
-                self.persist_ui_prefs();
-                self.last_toast =
-                    Some(format!("key hints: {}", self.ui_prefs.key_hints.label()));
-            }
-            AppMsg::ToggleCompact => {
-                self.ui_prefs.compact = !self.ui_prefs.compact;
-                self.persist_ui_prefs();
-                self.last_toast = Some(format!(
-                    "compact: {}",
-                    if self.ui_prefs.compact { "on" } else { "off" }
-                ));
+            //
+            // These three variants are normally applied BEFORE the modal
+            // short-circuit by [`Self::try_apply_ui_pref`] so that `T`/
+            // `H`/`C` work as true globals even inside a modal (review
+            // fix for WEK-42 / M4.3). Reaching this arm is the
+            // non-modal fallthrough; the toggle + persist + toast logic
+            // is shared with the pre-modal path, so we just delegate.
+            AppMsg::CycleTheme | AppMsg::CycleKeyHints | AppMsg::ToggleCompact => {
+                // try_apply_ui_pref consumes the message (returns None)
+                // when it matches one of the three UI-pref variants.
+                let _ = self.try_apply_ui_pref(msg);
             }
         }
         AppOutcome::Continue
@@ -531,6 +544,46 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
         };
         if let Err(e) = crate::ui_prefs::save(path, &self.ui_prefs) {
             self.last_toast = Some(format!("config save failed: {e}"));
+        }
+    }
+
+    /// Apply a UI-pref toggle (T/H/C) before the modal short-circuit.
+    /// Returns `None` when the message was a pref and has been applied
+    /// (the modal — if any — stays open and we end this `handle` tick);
+    /// returns `Some(msg)` otherwise so the caller can fall through to
+    /// the modal/non-modal dispatch.
+    ///
+    /// The user-facing intent (WEK-42 / M4.3 review): when `?` overlay
+    /// is open and the user presses `T`, the theme should change AND
+    /// the overlay should stay visible so they can keep reading. The
+    /// modal short-circuit downstream would otherwise route into
+    /// [`Self::handle_in_modal`], which has no arm for these messages
+    /// and silently drops them.
+    fn try_apply_ui_pref(&mut self, msg: AppMsg) -> Option<AppMsg> {
+        match msg {
+            AppMsg::CycleTheme => {
+                self.ui_prefs.theme = self.ui_prefs.theme.next();
+                self.persist_ui_prefs();
+                self.last_toast = Some(format!("theme: {}", self.ui_prefs.theme.label()));
+                None
+            }
+            AppMsg::CycleKeyHints => {
+                self.ui_prefs.key_hints = self.ui_prefs.key_hints.next();
+                self.persist_ui_prefs();
+                self.last_toast =
+                    Some(format!("key hints: {}", self.ui_prefs.key_hints.label()));
+                None
+            }
+            AppMsg::ToggleCompact => {
+                self.ui_prefs.compact = !self.ui_prefs.compact;
+                self.persist_ui_prefs();
+                self.last_toast = Some(format!(
+                    "compact: {}",
+                    if self.ui_prefs.compact { "on" } else { "off" }
+                ));
+                None
+            }
+            other => Some(other),
         }
     }
 
