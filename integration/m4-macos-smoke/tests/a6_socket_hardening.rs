@@ -7,12 +7,15 @@
 //!
 //! 1. **Socket mode = 0600** — `stat -f '%Lp' lad-1.sock` == `600`.
 //! 2. **Parent dir mode = 0700** — `stat -f '%Lp' lazyagents` == `700`.
-//! 3. **Non-owner dial is refused** — when CI runs as root the test
-//!    drops to a different uid via `sudo -u nobody`; on a developer
-//!    machine where dropping uids isn't an option, the test is skipped
-//!    (announced via stdout, not silently dropped). The expected
-//!    failure is `ECONNREFUSED` / `EACCES`; we deliberately reject the
-//!    "tolerate a log line" fallback the issue body called out.
+//! 3. **Non-owner dial is refused** — re-dial from a different uid via
+//!    `sudo -n -u nobody`. Two paths qualify: (a) the test is already
+//!    `root` (CI's default), or (b) passwordless sudo to `nobody` is
+//!    available. Otherwise the test **fails** (not silently skips) —
+//!    A6 §3 is a hard DoD line and a green run that didn't exercise
+//!    it would defeat the whole point. The expected failure is
+//!    `ECONNREFUSED` / `EACCES`; `EPERM` is NOT accepted because the
+//!    DoD pins those two exact errnos and a kernel returning `EPERM`
+//!    here would indicate the hardening fired in an unexpected band.
 //! 4. **launchd short-circuit (PID-stability)** — when
 //!    `LAZYAGENTS_MANAGED_BY=launchd` is set, the bootstrap path must
 //!    NOT spawn a second `lad`. The full launchctl bootstrap dance
@@ -154,18 +157,43 @@ async fn a6_runtime_dir_is_mode_0700() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a6_non_owner_dial_is_refused() {
     let our_uid = unsafe { libc::geteuid() };
+    // A6 §3 must actually run, not silently skip. Two execution
+    // modes qualify:
+    //   (a) we ARE root → we can drop to `nobody` directly via sudo.
+    //   (b) we are not root, but passwordless sudo to `nobody` is
+    //       configured (GitHub macOS hosted runners ship with NOPASSWD
+    //       sudo for the runner user) → `sudo -n -u nobody true`
+    //       returns 0 and we exercise the same path.
+    // If NEITHER holds we FAIL the test rather than print a skip
+    // notice: macOS Reviewer round 2 flagged that silent green here
+    // means A6 §3 isn't actually verified in PR CI, and the macOS
+    // hosted runner does have NOPASSWD sudo so we shouldn't need an
+    // escape hatch. A future host that genuinely cannot run sudo
+    // should publish that fact via a CI failure, not a green run.
     if our_uid != 0 {
-        // The DoD pins this exact branch: CI runs as root and re-dials
-        // from a different uid via `sudo -u nobody`. A developer
-        // machine cannot drop uids without sudo password prompts, so we
-        // announce + skip rather than producing a false green. We
-        // explicitly do NOT fall back to a log-grep check — the issue
-        // body rules that out as a "tolerate" alternative.
-        eprintln!(
-            "skipping a6_non_owner_dial_is_refused: not running as root \
-             (uid={our_uid}); macOS CI runner runs as root"
+        let probe = Command::new("sudo")
+            .arg("-n")
+            .arg("-u")
+            .arg("nobody")
+            .arg("true")
+            .output();
+        let sudo_ok = matches!(&probe, Ok(out) if out.status.success());
+        assert!(
+            sudo_ok,
+            "a6_non_owner_dial_is_refused cannot drop uids: uid={our_uid}, \
+             `sudo -n -u nobody true` did not succeed (output: {:?}). \
+             A6 §3 is a hard DoD line; refusing to skip silently. If this is \
+             a developer machine without NOPASSWD sudo, run the test under \
+             `sudo cargo test ...` or fix the sudoers config; CI macOS-14 / \
+             macos-13 hosted runners ship NOPASSWD sudo by default.",
+            probe.as_ref().map(|out| {
+                format!(
+                    "status={:?} stderr={:?}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            }),
         );
-        return;
     }
 
     let (_dir, socket, _handle, _join) = bring_up().await;
@@ -205,11 +233,14 @@ except OSError as e:
         String::from_utf8_lossy(&output.stderr),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // macOS reports either ECONNREFUSED or EACCES depending on whether
-    // the parent dir's 0700 lookup or the socket's 0600 connect rejected
-    // first. Both are acceptable per the DoD; anything else (especially
-    // ENOENT or ECONNRESET) would indicate the hardening regressed.
-    let accepted = ["ECONNREFUSED", "EACCES", "EPERM"];
+    // The DoD pins this to ECONNREFUSED or EACCES — the two errnos
+    // the 0600 socket / 0700 parent dir actually return on macOS.
+    // EPERM is intentionally NOT in the accepted set: the round-2
+    // macOS review asked whether there was architectural basis for
+    // EPERM and the answer is no — if the kernel returned EPERM the
+    // hardening fired in a band we didn't design for and we want
+    // that to surface as a test failure, not green.
+    let accepted = ["ECONNREFUSED", "EACCES"];
     assert!(
         accepted.iter().any(|name| stderr.contains(name)),
         "expected one of {accepted:?} from non-owner dial; got: {stderr}"

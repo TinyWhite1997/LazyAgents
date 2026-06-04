@@ -2,14 +2,20 @@
 //! needs to assert the same auto-daemonize policy.
 //!
 //! This is the single owner of the rules architecture §3 + WEK-73 §S1
-//! pin:
-//! - If the socket is already reachable, return [`BootstrapNote::AlreadyUp`].
+//! pin. The branch order is significant — env-driven service-manager
+//! ownership takes precedence over a reachable socket so a host whose
+//! socket happens to be reachable (e.g. a stale `lad` still bound, an
+//! orphaned process post-crash) cannot mask the launchd / systemd /
+//! Windows task hand-off the install path put in place:
 //! - If `LAZYAGENTS_MANAGED_BY=<tag>` is set in the env (i.e. systemd /
-//!   launchd / Windows task installed the daemon), refuse to spawn —
-//!   the service manager owns the lifecycle and a second `lad` would
-//!   race it on the same socket. Returns [`BootstrapNote::ManagedBy`].
+//!   launchd / Windows task installed the daemon), refuse to spawn AND
+//!   refuse to claim `AlreadyUp` even if the socket is reachable —
+//!   the service manager owns the lifecycle and the status bar must
+//!   surface that fact. Returns [`BootstrapNote::ManagedBy`].
 //! - If `LAZYAGENTS_NO_AUTODAEMON` is set, return
-//!   [`BootstrapNote::AutoSpawnDisabled`].
+//!   [`BootstrapNote::AutoSpawnDisabled`] (same rationale: caller has
+//!   declared they want manual control regardless of socket state).
+//! - If the socket is already reachable, return [`BootstrapNote::AlreadyUp`].
 //! - Otherwise locate `lad` and run `lad daemonize`, then wait for the
 //!   socket to appear within [`SPAWN_READY_TIMEOUT`].
 //!
@@ -109,16 +115,16 @@ pub fn bootstrap_daemon(socket: &Path) -> BootstrapOutcome {
         }
     };
 
-    if probe_socket(&rt, socket) {
-        return BootstrapOutcome {
-            connected: true,
-            note: BootstrapNote::AlreadyUp,
-        };
-    }
-    // S1 / WEK-73: service-manager-owned lifecycle. We treat
-    // LAZYAGENTS_MANAGED_BY exactly like LAZYAGENTS_NO_AUTODAEMON but
-    // surface a friendlier note so the status bar can tell the user
-    // why the TUI is declining to spawn.
+    // S1 / WEK-73: service-manager-owned lifecycle. Checked BEFORE the
+    // socket probe (WEK-74 review round 2): once an install path has
+    // exported LAZYAGENTS_MANAGED_BY, this client must never claim
+    // AlreadyUp / connected=true on that socket — that would let the
+    // status bar lie about who owns the daemon, and a future bug that
+    // breaks the socket-probe order could let auto-spawn re-enter from
+    // a host whose socket happened to be reachable. LAZYAGENTS_NO_AUTODAEMON
+    // is checked in the same band for symmetry: the caller has
+    // declared they want manual control, full stop, regardless of
+    // whatever `lad` happens to be answering on the socket right now.
     if let Some(tag) = std::env::var_os(MANAGED_BY_ENV)
         .and_then(|v| v.into_string().ok())
         .filter(|s| !s.is_empty())
@@ -132,6 +138,12 @@ pub fn bootstrap_daemon(socket: &Path) -> BootstrapOutcome {
         return BootstrapOutcome {
             connected: false,
             note: BootstrapNote::AutoSpawnDisabled,
+        };
+    }
+    if probe_socket(&rt, socket) {
+        return BootstrapOutcome {
+            connected: true,
+            note: BootstrapNote::AlreadyUp,
         };
     }
     let Some(lad) = locate_lad() else {
