@@ -360,10 +360,13 @@ async fn discover_reads_nested_envelope() {
     let file = nested.join("ses_cccccccccccccccccccc.json");
     fs::write(
         &file,
-        format!(
-            "{{\"meta\":{{\"id\":\"ses_cccccccccccccccccccc\",\"worktree\":\"{}\"}}}}",
-            proj.display()
-        ),
+        serde_json::to_string(&serde_json::json!({
+            "meta": {
+                "id": "ses_cccccccccccccccccccc",
+                "worktree": proj.display().to_string(),
+            }
+        }))
+        .unwrap(),
     )
     .unwrap();
 
