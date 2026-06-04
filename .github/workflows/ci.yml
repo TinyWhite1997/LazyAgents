@@ -1,5 +1,21 @@
 name: ci
 
+# WEK-72 / M4.0.5 — PR-level three-OS matrix.
+#
+# Anchor A1 (matrix CI on PR before M4.1) + A5.3 (runner ↔ target pin).
+# Job names are stable (`ci / <runner>`) so M4.6 can pin them as required
+# checks on `main` once the matrix has been green for ≥1 PR cycle.
+# Branch protection flip itself stays in M4.6 — this task only raises the
+# signal.
+#
+# A5.3 runner pin table (do NOT use `*-latest` — release.yml shares this
+# mapping and tag-cut reproducibility depends on the pin):
+#
+#   ubuntu-22.04   → x86_64-unknown-linux-gnu
+#   macos-14       → aarch64-apple-darwin
+#   macos-13       → x86_64-apple-darwin
+#   windows-2022   → x86_64-pc-windows-msvc
+
 on:
   workflow_dispatch:
   pull_request:
@@ -7,31 +23,40 @@ on:
   push:
     branches: [main]
 
-# WEK-5 范围决策：v1 阶段只在 Linux 验证；代码保持跨平台兼容（cfg
-# gates、portable-pty 等），但 CI 仅跑 ubuntu-latest。macOS / Windows
-# 进入 M4 发布前再上 matrix。PR #7 误开了三端 matrix，已在本提交里
-# 还原。
 jobs:
-  test:
-    name: cargo test (linux)
-    runs-on: ubuntu-latest
+  ci:
+    name: ci / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - macos-14
+          - macos-13
+          - windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.os }}
+
       - name: cargo fmt --check
+        if: matrix.os == 'ubuntu-22.04'
         run: cargo fmt --all -- --check
+
       - name: cargo clippy
         run: cargo clippy --workspace --lib --bins -- -D warnings
-      - name: la-storage migration smoke
-        run: cargo test -p la-storage migrations_enable_wal_and_schema_meta
-      # WEK-40 验收：任何 la-proto 类型改动都必须同步 docs/schema/。
-      # 这里在 cargo test 之前显式跑一次 gen-schema 并 diff，
-      # 让「PR 没更新 schema」立刻在独立、易读的 step 里红，
-      # 而不是埋在 cargo test 输出里的 schema_files_match_generated_output。
+
+      # WEK-40: any la-proto type change must regenerate docs/schema/.
+      # Run once on Linux — schema output is platform-independent, so
+      # repeating on macOS/Windows would only burn minutes.
       - name: gen-schema --check (golden diff)
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
         run: |
           set -euo pipefail
           out=$(mktemp -d)
@@ -41,24 +66,28 @@ jobs:
             echo '::error::docs/schema/ is stale. Re-run: cargo run -p la-proto --bin la-proto-gen-schema'
             exit 1
           fi
+
       - name: cargo test
         run: cargo test --workspace --all-targets
 
-  # WEK-51: Linux-only is the v1 verification scope, but the code must
-  # stay cross-platform compilable. This job catches things like a crate
-  # using `windows_sys::*` without declaring it in its own Cargo.toml.
-  # libsqlite3-sys (pulled via sqlx → la-storage) needs a C cross
-  # compiler to build for windows-gnu, so install mingw-w64.
-  windows-check:
-    name: cargo check (windows target)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: install mingw-w64
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
-      - uses: dtolnay/rust-toolchain@1.96.0
+      # WEK-72 DoD #1: example config parses + validates once on Linux —
+      # same single-run scope as fmt/gen-schema because the toml schema is
+      # platform-independent. WEK-71 merged in PR #56, so per the
+      # WEK-72 / WEK-71 协作 clause this PR (the later-merging one)
+      # wires the step in.
+      - name: lad config check (example template)
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          cargo run -p la-daemon --bin lad -- config check \
+            --config crates/la-daemon/templates/config.example.toml
+
+      # Folded in from the retired m2-smoke.yml — snapshots are useful for
+      # diagnosing failures across runners, so upload per OS.
+      - name: upload m2-smoke snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          targets: x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo check --target x86_64-pc-windows-gnu
-        run: cargo check --workspace --lib --bins --target x86_64-pc-windows-gnu
+          name: m2-smoke-snapshots-${{ matrix.os }}
+          path: target/m2-smoke/snapshots/
+          if-no-files-found: warn
