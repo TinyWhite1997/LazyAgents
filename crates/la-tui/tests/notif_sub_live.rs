@@ -1,3 +1,9 @@
+// Uses `la_ipc::transport::Listener::bind` with a UDS endpoint, which
+// returns `Unsupported "UDS is not available on Windows"` at runtime.
+// Gating the file to unix keeps WEK-72's matrix CI green on
+// windows-2022; the Windows transport has its own coverage.
+#![cfg(unix)]
+
 //! WEK-36 / M3.5 status-bar integration tests.
 //!
 //! Two acceptance criteria are exercised end-to-end against a stub
