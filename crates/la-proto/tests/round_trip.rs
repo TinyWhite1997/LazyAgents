@@ -1160,7 +1160,12 @@ fn schema_files_match_generated_output() {
                 continue;
             }
         };
-        if got != *want {
+        // The generator writes LF (`json + "\n"`) and the goldens are
+        // pinned to LF by .gitattributes. Belt-and-braces: normalize
+        // CRLF -> LF in case Git on Windows still rewrites checkouts
+        // (e.g. on a fork without our .gitattributes applied yet).
+        let got_norm = got.replace("\r\n", "\n");
+        if got_norm != *want {
             drifted.push(name.clone());
         }
     }
