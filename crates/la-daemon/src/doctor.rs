@@ -159,6 +159,7 @@ pub struct DoctorInputs {
 
 /// Run every check against `inputs` and return the rendered lines +
 /// final exit tier. Pure: no I/O happens here.
+#[allow(clippy::vec_init_then_push)] // cfg-gated push in the middle precludes a clean vec![…] literal
 pub fn run_with_inputs(inputs: &DoctorInputs) -> DoctorReport {
     let mut lines = Vec::new();
 
