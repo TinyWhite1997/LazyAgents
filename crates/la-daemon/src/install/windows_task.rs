@@ -24,7 +24,7 @@ use std::process::Command;
 
 use super::actions::{ActionOutcome, ServiceVerb};
 use super::paths::{InstallContext, WindowsTaskPaths};
-use super::template::render_template;
+use super::template::{render_template, xml_escape_text};
 use super::{InstallError, InstallResult, ServiceController, ServiceMode};
 
 pub const TEMPLATE: &str = include_str!("../../templates/lad-task.xml");
@@ -56,12 +56,13 @@ impl WindowsTaskController {
             )));
         }
 
-        let exec = ctx.exec_path.to_string_lossy().to_string();
-        let config = ctx.config_path.to_string_lossy().to_string();
-        let working = self.paths.working_dir.to_string_lossy().to_string();
+        let exec = xml_escape_text(&ctx.exec_path.to_string_lossy());
+        let config = xml_escape_text(&ctx.config_path.to_string_lossy());
+        let working = xml_escape_text(&self.paths.working_dir.to_string_lossy());
+        let user = xml_escape_text(&ctx.user);
 
         let mut vars = BTreeMap::new();
-        vars.insert("user_id", ctx.user.as_str());
+        vars.insert("user_id", user.as_str());
         vars.insert("exec_path", exec.as_str());
         vars.insert("config_path", config.as_str());
         vars.insert("working_dir", working.as_str());
@@ -390,6 +391,32 @@ mod tests {
         let err = ctrl.rendered_task_xml(&c).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("SYSTEM"), "{msg}");
+    }
+
+    #[test]
+    fn task_xml_escapes_metacharacters_in_paths_and_user() {
+        // A Windows username from AD-style logins (`CORP\foo&bar`) or
+        // a path with `&` is legal on real Windows. Unescaped, the
+        // generated XML is invalid and `schtasks /Create /XML` rejects
+        // the file with an opaque error.
+        let mut c = ctx();
+        c.exec_path = PathBuf::from(r"C:\Program Files\Acme & Co\lad.exe");
+        c.user = "CORP\\foo&bar".to_string();
+        let ctrl = WindowsTaskController::from_ctx(&c);
+        let rendered = ctrl.rendered_task_xml(&c).unwrap();
+        assert!(
+            rendered.contains(r"<Command>C:\Program Files\Acme &amp; Co\lad.exe</Command>"),
+            "exec path not escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains("<UserId>CORP\\foo&amp;bar</UserId>"),
+            "user id not escaped: {rendered}"
+        );
+        // The raw `&bar` substring must not appear unescaped anywhere.
+        assert!(
+            !rendered.contains("&bar"),
+            "raw `&bar` leaked unescaped: {rendered}"
+        );
     }
 
     #[test]

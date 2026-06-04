@@ -24,7 +24,7 @@ use std::process::Command;
 
 use super::actions::{ActionOutcome, ServiceVerb};
 use super::paths::{InstallContext, LaunchdPaths};
-use super::template::render_template;
+use super::template::{render_template, xml_escape_text};
 use super::{InstallError, InstallResult, ServiceController, ServiceMode};
 
 pub const TEMPLATE: &str = include_str!("../../templates/dev.lazyagents.lad.plist");
@@ -69,16 +69,22 @@ impl LaunchdController {
     }
 
     pub fn rendered_plist(&self, ctx: &InstallContext) -> InstallResult<String> {
-        let exec = ctx.exec_path.to_string_lossy().to_string();
-        let config = ctx.config_path.to_string_lossy().to_string();
-        let home = ctx.home.to_string_lossy().to_string();
-        let stdout = self.paths.stdout_path.to_string_lossy().to_string();
-        let stderr = self.paths.stderr_path.to_string_lossy().to_string();
+        // Every placeholder lands inside an XML `<string>` text node,
+        // so the values must be XML-escaped. Otherwise a username or
+        // path containing `&` / `<` / `>` (legal on the filesystem
+        // and in AD-style logins like `CORP\foo&bar`) produces an
+        // invalid plist that launchd silently rejects.
+        let exec = xml_escape_text(&ctx.exec_path.to_string_lossy());
+        let config = xml_escape_text(&ctx.config_path.to_string_lossy());
+        let home = xml_escape_text(&ctx.home.to_string_lossy());
+        let user = xml_escape_text(&ctx.user);
+        let stdout = xml_escape_text(&self.paths.stdout_path.to_string_lossy());
+        let stderr = xml_escape_text(&self.paths.stderr_path.to_string_lossy());
         let mut vars = BTreeMap::new();
         vars.insert("exec_path", exec.as_str());
         vars.insert("config_path", config.as_str());
         vars.insert("home_path", home.as_str());
-        vars.insert("user", ctx.user.as_str());
+        vars.insert("user", user.as_str());
         vars.insert("stdout_path", stdout.as_str());
         vars.insert("stderr_path", stderr.as_str());
         let rendered = render_template(TEMPLATE, &vars)?;
@@ -201,6 +207,28 @@ impl ServiceController for LaunchdController {
                 ServiceVerb::Start,
                 format!("would run launchctl kickstart -k {}", self.service_target()),
             ));
+        }
+        // A2 requires the three install verbs to be independently
+        // composable: `lad install --service launchd --start` must work
+        // even when the user did NOT pass `--enable`. launchctl
+        // `kickstart` fails on a service that isn't bootstrapped into
+        // the gui/<uid> domain, so we transparently bootstrap the
+        // current plist first. This matches the implicit guarantee in
+        // the post-install hint ("`lad install --service launchd
+        // --start` to start now") and keeps `--enable` strictly
+        // optional (it controls "load at next login", not "load now").
+        if !self.is_loaded() && self.paths.plist_path.exists() {
+            let out = require_launchctl(&[
+                "bootstrap",
+                &self.domain_target(),
+                &self.paths.plist_path.to_string_lossy(),
+            ])?;
+            if !out.status.success() {
+                return Err(InstallError::command(
+                    "launchctl bootstrap (auto for --start)",
+                    out.stderr_string(),
+                ));
+            }
         }
         let out = require_launchctl(&["kickstart", "-k", &self.service_target()])?;
         if out.status.success() {
@@ -470,5 +498,55 @@ mod tests {
         assert!(!rendered.contains("/tmp/"));
         // PATH minimal set; HOME/USER explicit.
         assert!(rendered.contains("/usr/bin:/bin:/usr/sbin:/sbin"));
+    }
+
+    #[test]
+    fn plist_xml_escapes_metacharacters_in_paths_and_user() {
+        // Real-world paths can contain `&` (think "C:\Users\foo & bar"
+        // or `/Users/Alice & Bob`); usernames in mixed environments
+        // can contain `<` / `>` / quotes. Unescaped, these would
+        // produce invalid plist XML that launchd rejects at bootstrap.
+        let mut c = ctx();
+        c.exec_path = PathBuf::from("/opt/Acme & Co/lad");
+        c.config_path = PathBuf::from("/Users/al<ice/cfg.toml");
+        c.user = "al'ice & \"bob\"".to_string();
+        let ctrl = LaunchdController::from_ctx(&c);
+        let rendered = ctrl.rendered_plist(&c).unwrap();
+        // Raw metacharacters must NOT appear in <string> values; their
+        // escaped forms must.
+        assert!(
+            rendered.contains("<string>/opt/Acme &amp; Co/lad</string>"),
+            "exec path not escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains("<string>/Users/al&lt;ice/cfg.toml</string>"),
+            "config path not escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains("<string>al&apos;ice &amp; &quot;bob&quot;</string>"),
+            "user not escaped: {rendered}"
+        );
+        // And the doc must still be well-formed enough that an XML
+        // parser can read every element; quickest local check is that
+        // we have a single balanced root <plist>.
+        let plist_open = rendered.matches("<plist").count();
+        let plist_close = rendered.matches("</plist>").count();
+        assert_eq!(plist_open, 1);
+        assert_eq!(plist_close, 1);
+    }
+
+    #[test]
+    fn start_dry_run_message_unchanged() {
+        // A2 hard rule: `lad install --service launchd --start` is a
+        // valid orthogonal combo even without `--enable`. The dry-run
+        // output stays focused on the kickstart command — the
+        // auto-bootstrap fallback is a real-mode behavior, gated on
+        // `!is_loaded() && plist_path.exists()` and never shells out in
+        // dry-run.
+        let c = ctx();
+        let ctrl = LaunchdController::from_ctx(&c);
+        let outcome = ctrl.start(&c).expect("dry-run start");
+        let s = outcome.to_string();
+        assert!(s.contains("launchctl kickstart -k"), "{s}");
     }
 }

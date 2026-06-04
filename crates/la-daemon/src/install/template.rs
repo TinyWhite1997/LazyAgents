@@ -23,6 +23,28 @@ pub enum TemplateError {
     UnterminatedBlock,
 }
 
+/// Escape `&`, `<`, `>`, `"`, and `'` so a value is safe to embed in
+/// an XML text node or attribute. The launchd plist and the Windows
+/// Scheduled Task XML both run user paths / usernames through here
+/// (paths can legally contain `&`, especially under
+/// `C:\Users\<name>\AppData\...` mixed with company names), and an
+/// unescaped value would otherwise produce an invalid XML document
+/// that launchd / schtasks rejects at import time.
+pub fn xml_escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Render a template by substituting `{{ key }}` markers with values
 /// from `vars`. Keys in `vars` are matched after trimming whitespace
 /// from inside the braces.
@@ -95,5 +117,19 @@ mod tests {
             render_template("{ literal } {{ x }} { again }", &vars).unwrap(),
             "{ literal } 1 { again }"
         );
+    }
+
+    #[test]
+    fn xml_escape_text_escapes_metacharacters() {
+        assert_eq!(
+            xml_escape_text(r#"a&b<c>d"e'f"#),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+        // Idempotent on already-escaped text only at the textual level
+        // — `&amp;` becomes `&amp;amp;`. That's the correct XML
+        // behavior: escape once, at the point of substitution.
+        assert_eq!(xml_escape_text("&amp;"), "&amp;amp;");
+        // No-op on safe ASCII / unicode.
+        assert_eq!(xml_escape_text("/Users/赵小明/lad"), "/Users/赵小明/lad");
     }
 }
