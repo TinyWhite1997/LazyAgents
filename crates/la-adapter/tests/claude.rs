@@ -38,20 +38,30 @@ async fn discover_walks_projects_layout_and_filters() {
     let file_a = enc_a.join("00000000-0000-0000-0000-000000000aaa.jsonl");
     fs::write(
         &file_a,
-        format!(
-            "{{\"type\":\"session_start\",\"session_id\":\"00000000-0000-0000-0000-000000000aaa\",\"cwd\":\"{}\",\"timestamp\":\"2026-06-01T09:00:00Z\"}}\n",
-            proj_a.display()
-        ),
+        // Use serde_json::to_string so paths with backslashes (Windows)
+        // get escaped correctly into the JSON body.
+        serde_json::to_string(&serde_json::json!({
+            "type": "session_start",
+            "session_id": "00000000-0000-0000-0000-000000000aaa",
+            "cwd": proj_a.display().to_string(),
+            "timestamp": "2026-06-01T09:00:00Z",
+        }))
+        .unwrap()
+            + "\n",
     )
     .unwrap();
 
     let file_b = enc_b.join("00000000-0000-0000-0000-000000000bbb.jsonl");
     fs::write(
         &file_b,
-        format!(
-            "{{\"type\":\"session_start\",\"sessionId\":\"00000000-0000-0000-0000-000000000bbb\",\"workingDir\":\"{}\",\"createdAt\":\"2026-06-01T10:00:00Z\"}}\n",
-            proj_b.display()
-        ),
+        serde_json::to_string(&serde_json::json!({
+            "type": "session_start",
+            "sessionId": "00000000-0000-0000-0000-000000000bbb",
+            "workingDir": proj_b.display().to_string(),
+            "createdAt": "2026-06-01T10:00:00Z",
+        }))
+        .unwrap()
+            + "\n",
     )
     .unwrap();
 
@@ -60,8 +70,13 @@ async fn discover_walks_projects_layout_and_filters() {
     fs::write(
         &file_c,
         format!(
-            "not json\n{{\"type\":\"session_start\",\"id\":\"00000000-0000-0000-0000-000000000ccc\",\"cwd\":\"{}\"}}\n",
-            proj_b.display()
+            "not json\n{}\n",
+            serde_json::to_string(&serde_json::json!({
+                "type": "session_start",
+                "id": "00000000-0000-0000-0000-000000000ccc",
+                "cwd": proj_b.display().to_string(),
+            }))
+            .unwrap(),
         ),
     )
     .unwrap();
