@@ -1,0 +1,73 @@
+# LazyAgents config — `config.toml`
+#
+# Lookup chain (resolve_config_path, WEK-71 / M4.2 addendum A4):
+#   $LAZYAGENTS_CONFIG
+#     → $XDG_CONFIG_HOME/lazyagents/config.toml
+#     → $HOME/.config/lazyagents/config.toml
+#     → $HOME/Library/Application Support/lazyagents/config.toml   (macOS only)
+#     → %APPDATA%\lazyagents\config.toml                           (Windows)
+#
+# Every section is optional. An empty file is valid. Load precedence
+# inside `lad start` is:
+#   CLI flag  >  env (LAZYAGENTS_*)  >  this file  >  built-in default
+#
+# All sections use `deny_unknown_fields` — typos fail `lad config check`
+# with the offending field name + the list of accepted keys.
+
+[daemon]
+# Override the listening socket. Default = OS-resolved per-protocol-major
+# path (e.g. `$XDG_RUNTIME_DIR/lazyagents/lad-1.sock`). Non-default MUST
+# be an absolute path.
+# socket_path = "/run/user/1000/lazyagents/lad-1.sock"
+
+# SQLite + spilled-transcript directory. Default = $XDG_STATE_HOME/lazyagents
+# (or $HOME/.local/share/lazyagents on systems without XDG_STATE_HOME).
+# state_dir = "/var/lib/lazyagents"
+
+# Logging verbosity: trace | debug | info | warn | error
+log_level = "info"
+
+# Tracing output format: json | compact (compact is dev-only)
+log_format = "json"
+
+# Architecture §10.1: TCP listener is a v1.x feature. Leaving this empty
+# keeps the daemon UDS / Named Pipe only. Setting it in v1 is rejected at
+# startup with an instructive error.
+listen_tcp = ""
+
+[scheduler]
+# Single admission gate cap (M3 [WEK-57] — global, NOT per-cron).
+global_max_concurrent_runs = 8
+
+# CPU load floor for the soft-throttle gate.
+cpu_load_throttle = 4.0
+
+# Archive directory for runs older than the retention window. Default =
+# $state_dir/archive.
+# archive_dir = "/var/lib/lazyagents/archive"
+
+[worktree]
+# Prune git worktrees older than this many days when scheduler reaps.
+prune_after_days = 7
+
+[adapters.claude]
+# Override the Claude CLI binary name or absolute path. Default = "claude".
+# command = "claude"
+extra_args = []
+
+[adapters.codex]
+# command = "codex"
+prefer_json_mode = true
+extra_args = []
+
+[adapters.opencode]
+# command = "opencode"
+extra_args = []
+
+[ui]
+# auto | dark | light
+theme = "auto"
+# rich | compact | hidden
+key_hints = "rich"
+# Compact transcript mode in the TUI.
+compact = false
