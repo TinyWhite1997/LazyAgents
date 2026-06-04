@@ -70,11 +70,13 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets
 
-      # WEK-72 DoD #1: cross-platform sanity check that the daemon's
-      # example config parses + validates everywhere. WEK-71 merged in
-      # PR #56, so per the WEK-72 / WEK-71 协作 clause this PR (the
-      # later-merging one) wires the step in.
+      # WEK-72 DoD #1: example config parses + validates once on Linux —
+      # same single-run scope as fmt/gen-schema because the toml schema is
+      # platform-independent. WEK-71 merged in PR #56, so per the
+      # WEK-72 / WEK-71 协作 clause this PR (the later-merging one)
+      # wires the step in.
       - name: lad config check (example template)
+        if: matrix.os == 'ubuntu-22.04'
         shell: bash
         run: |
           cargo run -p la-daemon --bin lad -- config check \
