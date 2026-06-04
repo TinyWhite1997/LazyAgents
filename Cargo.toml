@@ -8,6 +8,7 @@ members = [
     "crates/la-storage",
     "crates/la-scheduler",
     "crates/la-observ",
+    "crates/la-config",
     "crates/la-core",
     "crates/la-daemon",
     "crates/la-tui",

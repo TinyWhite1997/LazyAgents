@@ -27,6 +27,7 @@ la-adapter = { path = "../la-adapter" }
 la-pty = { path = "../la-pty" }
 la-scheduler = { path = "../la-scheduler" }
 la-observ = { path = "../la-observ" }
+la-config = { path = "../la-config" }
 chrono = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

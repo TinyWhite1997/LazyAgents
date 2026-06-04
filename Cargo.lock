@@ -958,6 +958,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "la-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "la-core"
 version = "0.1.0"
 dependencies = [
@@ -990,6 +1001,7 @@ dependencies = [
  "chrono-tz",
  "getrandom 0.2.17",
  "la-adapter",
+ "la-config",
  "la-core",
  "la-ipc",
  "la-observ",

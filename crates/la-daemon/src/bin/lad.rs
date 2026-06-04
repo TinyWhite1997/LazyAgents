@@ -34,7 +34,7 @@ use la_daemon::{
 };
 
 const HELP: &str = "\
-lad — LazyAgents daemon (WEK-21 / M1.7)
+lad — LazyAgents daemon (WEK-21 / M1.7 + WEK-71 / M4.2)
 
 USAGE:
     lad <command> [flags]
@@ -45,13 +45,24 @@ COMMANDS:
     metrics            Print the active daemon's Prometheus text metrics.
     doctor             Diagnose socket / state paths and reachability.
     backup             Write a consistent SQLite snapshot to --output <path>.
+    config show        Print the merged configuration with provenance.
+    config check       Parse + validate config.toml without starting daemon.
+    config path        Print the config path resolve_config_path() would read.
 
 GLOBAL FLAGS:
-    --socket <path>    Override the socket path. Default = $LAZYAGENTS_RUNTIME_DIR
-                       or $XDG_RUNTIME_DIR/lazyagents/lad-<protocol>.sock.
+    --socket <path>    Override the socket path. Default = $LAZYAGENTS_SOCKET
+                       or $LAZYAGENTS_RUNTIME_DIR/lazyagents/lad-<protocol>.sock.
     --state-dir <dir>  Override the state (SQLite) directory.
     --log-level <lvl>  trace|debug|info|warn|error (default info).
+    --log-format <fmt> json|compact (default json).
+    --config <path>    Override the config file (default = resolve_config_path()).
     -h, --help         Show this help.
+
+ENVIRONMENT:
+    LAZYAGENTS_SOCKET / LAZYAGENTS_STATE_DIR / LAZYAGENTS_LOG_LEVEL /
+    LAZYAGENTS_LOG_FORMAT / LAZYAGENTS_CONFIG override the matching flags.
+    LAZYAGENTS_LOG is a deprecated alias for LAZYAGENTS_LOG_LEVEL
+    (warning emitted; removed in v1.1).
 ";
 
 fn main() -> ExitCode {
@@ -69,7 +80,13 @@ struct Parsed {
     cmd: Command,
     socket_override: Option<std::path::PathBuf>,
     state_dir_override: Option<std::path::PathBuf>,
-    log_level: String,
+    /// CLI-supplied log level (None = no `--log-level`); env/file
+    /// fallbacks are applied in [`derive_runtime`].
+    cli_log_level: Option<String>,
+    /// CLI-supplied log format (None = no `--log-format`).
+    cli_log_format: Option<String>,
+    /// CLI-supplied config path (`--config <path>`).
+    cli_config_path: Option<std::path::PathBuf>,
     #[cfg(debug_assertions)]
     test_shell_adapter_script: Option<String>,
 }
@@ -80,7 +97,14 @@ enum Command {
     Metrics,
     Doctor,
     Backup { output: std::path::PathBuf },
+    Config { sub: ConfigSub },
     Help,
+}
+
+enum ConfigSub {
+    Show,
+    Check,
+    Path,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, String> {
@@ -94,13 +118,28 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         "backup" => Command::Backup {
             output: std::path::PathBuf::new(),
         },
+        "config" => {
+            let sub_raw = iter
+                .next()
+                .cloned()
+                .ok_or_else(|| "config requires a subcommand: show | check | path".to_string())?;
+            let sub = match sub_raw.as_str() {
+                "show" => ConfigSub::Show,
+                "check" => ConfigSub::Check,
+                "path" => ConfigSub::Path,
+                other => return Err(format!("unknown config subcommand: {other}")),
+            };
+            Command::Config { sub }
+        }
         "-h" | "--help" | "help" => Command::Help,
         other => return Err(format!("unknown command: {other}")),
     };
 
     let mut socket_override = None;
     let mut state_dir_override = None;
-    let mut log_level = std::env::var("LAZYAGENTS_LOG").unwrap_or_else(|_| "info".to_string());
+    let mut cli_log_level: Option<String> = None;
+    let mut cli_log_format: Option<String> = None;
+    let mut cli_config_path: Option<std::path::PathBuf> = None;
     #[cfg(debug_assertions)]
     let mut test_shell_adapter_script = None;
 
@@ -123,10 +162,26 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 );
             }
             "--log-level" => {
-                log_level = iter
-                    .next()
-                    .cloned()
-                    .ok_or_else(|| "--log-level expects a value".to_string())?;
+                cli_log_level = Some(
+                    iter.next()
+                        .cloned()
+                        .ok_or_else(|| "--log-level expects a value".to_string())?,
+                );
+            }
+            "--log-format" => {
+                cli_log_format = Some(
+                    iter.next()
+                        .cloned()
+                        .ok_or_else(|| "--log-format expects a value".to_string())?,
+                );
+            }
+            "--config" => {
+                cli_config_path = Some(
+                    iter.next()
+                        .cloned()
+                        .ok_or_else(|| "--config expects a path".to_string())?
+                        .into(),
+                );
             }
             "--output" => match &mut cmd {
                 Command::Backup { output } => {
@@ -150,7 +205,9 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                     cmd: Command::Help,
                     socket_override,
                     state_dir_override,
-                    log_level,
+                    cli_log_level,
+                    cli_log_format,
+                    cli_config_path,
                     #[cfg(debug_assertions)]
                     test_shell_adapter_script,
                 });
@@ -163,7 +220,9 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         cmd,
         socket_override,
         state_dir_override,
-        log_level,
+        cli_log_level,
+        cli_log_format,
+        cli_config_path,
         #[cfg(debug_assertions)]
         test_shell_adapter_script,
     })
@@ -175,15 +234,60 @@ fn init_observability(level: &str, state_dir: &std::path::Path) {
     la_observ::install_crash_reporter(state_dir.join("crashes"));
 }
 
+/// Build a [`la_daemon::config_cmd::CliOverrides`] mirror of the
+/// parsed CLI flags. Centralised so every command (`start`,
+/// `daemonize`, `config show`, ...) sees the same precedence rules.
+fn cli_overrides(p: &Parsed) -> la_daemon::config_cmd::CliOverrides {
+    la_daemon::config_cmd::CliOverrides {
+        socket: p.socket_override.clone(),
+        state_dir: p.state_dir_override.clone(),
+        log_level: p.cli_log_level.clone(),
+        log_format: p.cli_log_format.clone(),
+        config_path: p.cli_config_path.clone(),
+    }
+}
+
+/// Load the file (if it exists), snapshot env, and derive the
+/// CLI > env > file > default values used by `start` / `daemonize`.
+fn derive_runtime(p: &Parsed) -> Result<la_daemon::config_cmd::ResolvedDaemonValues, String> {
+    let overrides = cli_overrides(p);
+    let env = la_daemon::config_cmd::EnvSnapshot::from_process();
+    let config_path = overrides
+        .config_path
+        .clone()
+        .or_else(|| env.config.clone())
+        .or_else(|| la_config::resolve_config_path().existing);
+    let file = match config_path.as_deref() {
+        Some(path) if path.exists() => Some(
+            la_config::Config::load_file(path)
+                .map_err(|e| format!("config parse failed at {}: {e}", path.display()))?,
+        ),
+        _ => None,
+    };
+    Ok(la_daemon::config_cmd::resolve_daemon_values(
+        &overrides,
+        &env,
+        file.as_ref(),
+    ))
+}
+
 fn run(p: Parsed) -> ExitCode {
-    match p.cmd {
+    match &p.cmd {
         Command::Help => {
             println!("{HELP}");
             ExitCode::SUCCESS
         }
+        Command::Config { sub } => run_config(sub, &p),
         Command::Doctor => {
-            let loc = resolve_socket(&p.socket_override);
-            let state_dir = p
+            let resolved = match derive_runtime(&p) {
+                Ok(r) => r,
+                Err(err) => {
+                    eprintln!("lad doctor: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            let loc = resolve_socket(&resolved.socket_override);
+            let state_dir = resolved
                 .state_dir_override
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
@@ -220,16 +324,24 @@ fn run(p: Parsed) -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Backup { output } => {
+            let output = output.clone();
             if output.as_os_str().is_empty() {
                 eprintln!("lad: backup requires --output <path>");
                 return ExitCode::from(2);
             }
-            let state_dir = p
+            let resolved = match derive_runtime(&p) {
+                Ok(r) => r,
+                Err(err) => {
+                    eprintln!("lad backup: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            let state_dir = resolved
                 .state_dir_override
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
-            init_observability(&p.log_level, &state_dir);
-            match run_backup(p.state_dir_override, output) {
+            init_observability(resolved.log_level.as_str(), &state_dir);
+            match run_backup(resolved.state_dir_override.clone(), output) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     eprintln!("lad: backup failed: {err}");
@@ -238,7 +350,14 @@ fn run(p: Parsed) -> ExitCode {
             }
         }
         Command::Metrics => {
-            let loc = resolve_socket(&p.socket_override);
+            let resolved = match derive_runtime(&p) {
+                Ok(r) => r,
+                Err(err) => {
+                    eprintln!("lad metrics: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            let loc = resolve_socket(&resolved.socket_override);
             match scrape_metrics(&loc.socket_path) {
                 Ok(text) => {
                     print!("{text}");
@@ -251,12 +370,19 @@ fn run(p: Parsed) -> ExitCode {
             }
         }
         Command::Daemonize => {
-            let state_dir = p
+            let resolved = match derive_runtime(&p) {
+                Ok(r) => r,
+                Err(err) => {
+                    eprintln!("lad daemonize: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            let state_dir = resolved
                 .state_dir_override
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
-            init_observability(&p.log_level, &state_dir);
-            let loc = resolve_socket(&p.socket_override);
+            init_observability(resolved.log_level.as_str(), &state_dir);
+            let loc = resolve_socket(&resolved.socket_override);
             if let Err(err) = ensure_runtime_dir(&loc.runtime_dir) {
                 eprintln!(
                     "lad: ensure_runtime_dir({}): {err}",
@@ -272,16 +398,22 @@ fn run(p: Parsed) -> ExitCode {
                 }
             };
             let mut passthrough = Vec::new();
-            if let Some(path) = &p.socket_override {
+            if let Some(path) = &resolved.socket_override {
                 passthrough.push("--socket".to_string());
                 passthrough.push(path.display().to_string());
             }
-            if let Some(dir) = &p.state_dir_override {
+            if let Some(dir) = &resolved.state_dir_override {
                 passthrough.push("--state-dir".to_string());
                 passthrough.push(dir.display().to_string());
             }
             passthrough.push("--log-level".to_string());
-            passthrough.push(p.log_level.clone());
+            passthrough.push(resolved.log_level.as_str().to_string());
+            passthrough.push("--log-format".to_string());
+            passthrough.push(resolved.log_format.as_str().to_string());
+            if let Some(cfg) = &p.cli_config_path {
+                passthrough.push("--config".to_string());
+                passthrough.push(cfg.display().to_string());
+            }
             #[cfg(debug_assertions)]
             if let Some(script) = &p.test_shell_adapter_script {
                 passthrough.push("--test-shell-adapter".to_string());
@@ -313,18 +445,82 @@ fn run(p: Parsed) -> ExitCode {
             }
         }
         Command::Start => {
-            let state_dir = p
+            let resolved = match derive_runtime(&p) {
+                Ok(r) => r,
+                Err(err) => {
+                    eprintln!("lad start: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            let state_dir = resolved
                 .state_dir_override
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
-            init_observability(&p.log_level, &state_dir);
-            match run_foreground(p) {
+            init_observability(resolved.log_level.as_str(), &state_dir);
+            match run_foreground(p, resolved) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     eprintln!("lad: {err}");
                     ExitCode::from(1)
                 }
             }
+        }
+    }
+}
+
+fn run_config(sub: &ConfigSub, p: &Parsed) -> ExitCode {
+    match sub {
+        ConfigSub::Show => {
+            let overrides = cli_overrides(p);
+            match la_daemon::config_cmd::show(&overrides) {
+                Ok(rendered) => {
+                    print!("{rendered}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("lad config show: {err}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        ConfigSub::Check => {
+            let path = p.cli_config_path.clone().or_else(|| {
+                la_daemon::config_cmd::EnvSnapshot::from_process()
+                    .config
+                    .or_else(|| la_config::resolve_config_path().existing)
+            });
+            match la_daemon::config_cmd::check(path.as_deref()) {
+                Ok(summary) => {
+                    if summary.existed {
+                        println!(
+                            "ok: {} sections in {}",
+                            summary.sections_present.len(),
+                            summary.path.display()
+                        );
+                    } else {
+                        println!(
+                            "ok: no config file present at {} (defaults will apply)",
+                            summary.path.display()
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("lad config check failed: {err}");
+                    if let la_daemon::config_cmd::CheckError::Schema(_) = err {
+                        eprintln!(
+                            "hint: accepted top-level sections are [daemon], [scheduler], \
+                             [worktree], [adapters.claude], [adapters.codex], \
+                             [adapters.opencode], [ui]"
+                        );
+                    }
+                    ExitCode::from(1)
+                }
+            }
+        }
+        ConfigSub::Path => {
+            println!("{}", la_daemon::config_cmd::path_string());
+            ExitCode::SUCCESS
         }
     }
 }
@@ -403,7 +599,10 @@ fn render_probe(result: &ProbeResult) -> String {
     }
 }
 
-fn run_foreground(p: Parsed) -> Result<(), DaemonError> {
+fn run_foreground(
+    p: Parsed,
+    resolved: la_daemon::config_cmd::ResolvedDaemonValues,
+) -> Result<(), DaemonError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(num_workers())
@@ -411,11 +610,11 @@ fn run_foreground(p: Parsed) -> Result<(), DaemonError> {
         .map_err(DaemonError::Io)?;
 
     runtime.block_on(async move {
-        let socket = match &p.socket_override {
+        let socket = match &resolved.socket_override {
             Some(path) => SocketDiscovery::with_override(path.clone()),
             None => SocketDiscovery::default(),
         };
-        let state_dir = p
+        let state_dir = resolved
             .state_dir_override
             .clone()
             .unwrap_or_else(la_daemon::default_state_dir);
