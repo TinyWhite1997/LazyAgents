@@ -17,7 +17,6 @@
 //! the binary at all.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -690,6 +689,7 @@ fn run_uninstall_cmd(spec: &UninstallSpec) -> ExitCode {
 
 #[cfg(unix)]
 fn scrape_metrics(socket_path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read as _;
     let metrics_socket = la_daemon::metrics_socket_path(socket_path);
     let mut stream = std::os::unix::net::UnixStream::connect(&metrics_socket)?;
     let mut text = String::new();
