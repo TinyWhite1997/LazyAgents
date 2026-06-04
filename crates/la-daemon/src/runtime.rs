@@ -21,7 +21,6 @@ use la_adapter::AgentAdapter;
 use la_core::{ManagerConfig, SessionManager, WorktreeManager};
 use la_ipc::transport::{Endpoint, Listener};
 use la_storage::{Storage, StorageConfig};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -585,6 +584,9 @@ async fn spawn_metrics_loop(
     socket_path: &Path,
     shutdown: Arc<Notify>,
 ) -> Result<JoinHandle<()>, DaemonError> {
+    // Imported inside the unix-only function so non-unix targets
+    // (Windows CI build with `-D warnings`) don't see a dead `use`.
+    use tokio::io::AsyncWriteExt as _;
     let metrics_path = metrics_socket_path(socket_path);
     if metrics_path.exists() {
         match tokio::net::UnixStream::connect(&metrics_path).await {
