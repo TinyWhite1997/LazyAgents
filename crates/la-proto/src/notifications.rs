@@ -5,7 +5,12 @@
 //! - `session.state`  — lifecycle transitions
 //! - `session.gap`    — backpressure drop notice (paired with `sessions.replay`)
 //! - `cron.fired`     — emitted post-M3 once the scheduler is wired up
-//! - `daemon.health`  — status-bar pulse
+//! - `daemon.health`  — status-bar pulse (adapter / backend probes)
+//! - `scheduler.health` — 5 s scheduler-loop pulse (queue depth, running
+//!   counts, loadavg throttle, next fire). Separate from `daemon.health`
+//!   because the two have different update cadences and subscribers (a
+//!   client may care about adapter probes but not the queue, or vice
+//!   versa) — see [`SchedulerHealth`] below.
 //!
 //! The daemon may push some of these only after the client has subscribed
 //! via [`crate::methods::EventsSubscribe`] (cron.fired / daemon.health), but
@@ -29,6 +34,7 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     SessionGap::NAME,
     CronFired::NAME,
     DaemonHealth::NAME,
+    SchedulerHealth::NAME,
     WorktreeChanged::NAME,
     WorktreeCommitCreated::NAME,
 ];
@@ -271,6 +277,75 @@ pub enum BackendHealthStatus {
 impl NotificationMethod for DaemonHealth {
     const NAME: &'static str = "daemon.health";
     type Params = DaemonHealthParams;
+}
+
+// ---------- scheduler.health ----------
+
+/// Scheduler-loop pulse for the TUI status bar (architecture §3, §5,
+/// §9.3). Pushed every 5 s to clients subscribed via
+/// `EventTopic::SchedulerHealth`.
+///
+/// **Distinct from** [`DaemonHealth`]: `daemon.health` is the
+/// adapter-probe view (used by the sidebar to render the per-backend
+/// icon), `scheduler.health` is the dispatch-loop view (used by the
+/// status bar to render queue depth, running counts, and the next-fire
+/// hint). Architecture §3.5 / §5 keeps the two surfaces separate so
+/// subscribers can opt into only what they render; collapsing them would
+/// force every status-bar consumer to also accept the (larger, sometimes
+/// stale) backends payload.
+///
+/// Aggregation responsibility (24 h rolling window for the runs/min
+/// sparkline, etc.) stays on the client per §3.5 — the daemon emits
+/// atomic snapshots, the TUI keeps the history.
+pub enum SchedulerHealth {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SchedulerHealthParams")]
+pub struct SchedulerHealthParams {
+    /// Number of fires currently buffered between the heap and the run
+    /// executor (excluding the run that is mid-admission). A spike here
+    /// means the heap is producing fires faster than the executor can
+    /// drain them — usually because the global concurrency cap is
+    /// saturated.
+    pub queue_depth: u32,
+    /// Live count of cron-spawned runs in the `running` state. Mirrors
+    /// the gate the admission rail uses for `global_max_concurrent_runs`
+    /// — *not* the count of all sessions (interactive ones don't count).
+    pub running_global: u32,
+    /// Per-cron live running count. Only crons with `> 0` running runs
+    /// are listed; an empty map means everything that fired is
+    /// currently idle. Keyed by `cron_id`.
+    pub running_per_cron: std::collections::BTreeMap<String, u32>,
+    /// `true` when the last admission decision deferred a fire because
+    /// the 1-min loadavg sample exceeded the configured `cpu_load_throttle`
+    /// threshold (§5.4 / §11.1). `false` when loadavg is fine or the
+    /// platform has no loadavg surface (Windows).
+    pub throttled_by_loadavg: bool,
+    /// Terminal run failures observed in the last 5 minutes (any cron).
+    /// The TUI status bar uses this to flip the queue indicator dot from
+    /// green to amber/red without a separate `runs.list` round-trip.
+    pub errors_last_5m: u32,
+    /// Next scheduled fire across all enabled crons. `None` when the
+    /// heap is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire: Option<SchedulerHealthNextFire>,
+}
+
+/// Next-fire hint embedded in [`SchedulerHealthParams`]. Carries enough
+/// to render the status-bar "next ↻" indicator without a `crons.list`
+/// round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "SchedulerHealthNextFire")]
+pub struct SchedulerHealthNextFire {
+    pub cron_id: String,
+    /// RFC3339 wall-clock time the cron will fire next, after backoff
+    /// flooring has been applied.
+    pub at: String,
+}
+
+impl NotificationMethod for SchedulerHealth {
+    const NAME: &'static str = "scheduler.health";
+    type Params = SchedulerHealthParams;
 }
 
 // ---------- worktree.changed ----------

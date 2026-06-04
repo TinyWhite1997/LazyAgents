@@ -34,13 +34,15 @@
 //! before exiting (so a fire that just popped from the channel still gets
 //! its `runs` row), then the scheduler control channel is closed.
 
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, TimeZone, Utc};
 use la_adapter::{SpawnRequest, StdinMode};
-use la_core::{BusEvent, SessionId, SessionManager};
-use la_proto::notifications::CronFiredParams;
+use la_core::{BusEvent, EventBus, SessionId, SessionManager};
+use la_proto::notifications::{CronFiredParams, SchedulerHealthNextFire, SchedulerHealthParams};
 use la_scheduler::{
     apply_catchup, catchup::CatchupMode, clock::system_clock, evaluate_admission, max_runtime,
     quota::backoff::FailureBackoff, AdmissionDecision, CronQuota, CronSpec, FireEvent, GlobalQuota,
@@ -62,6 +64,17 @@ pub const DEFAULT_GLOBAL_MAX_CONCURRENT_RUNS: u32 = 8;
 /// [`la_scheduler::MAX_CATCHUP`] inside its own loop.
 const REPLAY_INTERVAL_FLOOR: ChronoDuration = ChronoDuration::seconds(1);
 
+/// Default cadence for the `scheduler.health` broadcast (architecture
+/// §3 / §9.3 status-bar pulse). 5 s mirrors what the M4.4 brief pins:
+/// fast enough to render queue / running deltas before the user clicks
+/// elsewhere, slow enough that an idle daemon doesn't burn cycles
+/// churning a payload no client is reading.
+pub const SCHEDULER_HEALTH_INTERVAL: StdDuration = StdDuration::from_secs(5);
+
+/// Rolling window for the `errors_last_5m` counter on `scheduler.health`.
+/// Pinned at 5 minutes per the field name + DoD payload example.
+const ERRORS_WINDOW: StdDuration = StdDuration::from_secs(5 * 60);
+
 /// All the knobs the run executor needs that aren't already on the cron row.
 /// Pulled out so test wiring can shrink the global cap to provoke the
 /// concurrency rail without touching every cron row.
@@ -72,6 +85,11 @@ pub struct SchedulerConfig {
     /// notifier even when the fire channel is quiet. 250 ms keeps the
     /// daemon's §6.4 10 s budget intact without burning CPU.
     pub shutdown_poll: StdDuration,
+    /// Cadence at which the daemon broadcasts `scheduler.health`. Defaults
+    /// to [`SCHEDULER_HEALTH_INTERVAL`] (5 s). Tests usually shrink this
+    /// (e.g. `Duration::from_millis(50)`) to drive the loop without
+    /// waiting the full 5 s between pulses.
+    pub scheduler_health_interval: StdDuration,
 }
 
 impl Default for SchedulerConfig {
@@ -79,6 +97,7 @@ impl Default for SchedulerConfig {
         Self {
             global: GlobalQuota::default(),
             shutdown_poll: StdDuration::from_millis(250),
+            scheduler_health_interval: SCHEDULER_HEALTH_INTERVAL,
         }
     }
 }
@@ -97,15 +116,37 @@ pub struct SchedulerServices {
     /// `RunsRepo::count_running_global` query so a freshly-admitted-but-not-
     /// yet-spawned fire still counts towards the cap.
     pub running_global: Arc<Mutex<u32>>,
+    /// Per-cron live running count, mirrored from the same admit/decrement
+    /// path that maintains [`Self::running_global`]. Source of truth for
+    /// the `scheduler.health` payload's `running_per_cron` map. Crons that
+    /// have no running runs are dropped from the map by
+    /// [`Self::scheduler_health_snapshot`] so the wire payload stays small.
+    pub running_per_cron: Arc<Mutex<HashMap<String, u32>>>,
     /// The single mutex the WEK-57 design centres on. Held across the
     /// snapshot → evaluate → insert window so two fires for any cron
     /// cannot both pass the per-cron / global concurrency rails.
     /// Shared between the executor loop and the `crons.run_now` RPC path.
     pub admission_lock: Arc<Mutex<()>>,
-    /// JoinHandles for the two background tasks. Wrapped in Mutex so
-    /// [`Self::join_loops`] can take ownership without `&mut self` —
+    /// 5-minute rolling ring of terminal-failure Instants used by the
+    /// `scheduler.health.errors_last_5m` counter. The executor's
+    /// run-watcher pushes one Instant for every `failed` / `timed_out`
+    /// terminal outcome; the health snapshot prunes anything older than
+    /// [`ERRORS_WINDOW`] before counting. We use [`Instant`] rather than
+    /// wall-clock so a system-time step (NTP, suspend) doesn't make the
+    /// window expand or contract.
+    pub errors_window: Arc<Mutex<VecDeque<Instant>>>,
+    /// Last admission decision's loadavg-throttle flag. Atomic so the
+    /// scheduler-health task can read without contending with the
+    /// admission lock the executor holds. `true` when the most recent
+    /// admission evaluation deferred a fire because
+    /// `current_loadavg_1m > cpu_load_throttle`. The flag is cleared by
+    /// the next admit / refuse path so a brief CPU spike doesn't stay
+    /// red after recovery.
+    pub throttled_by_loadavg: Arc<AtomicBool>,
+    /// JoinHandles for the background tasks. Wrapped in Mutex so
+    /// [`Self::shutdown`] can take ownership without `&mut self` —
     /// useful because the daemon stores this struct behind `Arc`.
-    loops: Mutex<Option<(JoinHandle<()>, JoinHandle<()>)>>,
+    loops: Mutex<Option<SchedulerLoops>>,
     /// Executor-only shutdown signal. **Distinct from** the daemon-wide
     /// `Notify` the rest of the runtime shares so the executor doesn't
     /// race the heap loop on shutdown.
@@ -120,6 +161,34 @@ pub struct SchedulerServices {
     /// [`Self::shutdown`], strictly *after* the heap loop has been told
     /// to stop pushing new fires and its channel has closed.
     executor_shutdown: Arc<Notify>,
+    /// Health-loop-only shutdown signal. **Distinct from** the executor's
+    /// notifier so the health loop's `select!` always loses to shutdown,
+    /// not to whichever publish call happened to be in flight.
+    ///
+    /// `Notify::notify_waiters()` only wakes parked waiters and does not
+    /// store a permit; if it fires while the health loop is mid
+    /// `publish_scheduler_health().await`, the signal is lost and the next
+    /// `.notified()` parks forever. We pair the [`Notify`] with the
+    /// [`SchedulerHealthLoopConfig::shutdown_flag`] `AtomicBool` so the
+    /// loop checks the flag on every iteration before parking — the
+    /// executor doesn't have this problem because `fires.recv()` returns
+    /// `None` on channel close, giving it a built-in fallback exit.
+    scheduler_health_shutdown: Arc<Notify>,
+    /// Tied to [`Self::scheduler_health_shutdown`]; flipped to `true`
+    /// before the notifier is woken so a publish-in-flight loop sees the
+    /// stored signal on its next loop iteration.
+    scheduler_health_shutdown_flag: Arc<AtomicBool>,
+}
+
+/// JoinHandles owned by [`SchedulerServices`]. Split off into a struct
+/// so adding new background loops doesn't keep growing a tuple.
+struct SchedulerLoops {
+    scheduler_loop: JoinHandle<()>,
+    executor_loop: JoinHandle<()>,
+    /// The `scheduler.health` 5 s broadcast loop. Joined on graceful
+    /// shutdown so the last pulse the executor produced is fully
+    /// published before the bus closes.
+    scheduler_health_loop: JoinHandle<()>,
 }
 
 impl SchedulerServices {
@@ -155,8 +224,13 @@ impl SchedulerServices {
         spawn_diag_drain(channels.diagnostics, daemon_shutdown.clone());
 
         let running_global = Arc::new(Mutex::new(0_u32));
+        let running_per_cron = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
         let admission_lock = Arc::new(Mutex::new(()));
+        let errors_window = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let throttled_by_loadavg = Arc::new(AtomicBool::new(false));
         let executor_shutdown = Arc::new(Notify::new());
+        let scheduler_health_shutdown = Arc::new(Notify::new());
+        let scheduler_health_shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Initial cron load. We do this before returning so the daemon's
         // health endpoint and the TUI's first `crons.list` already see the
@@ -165,23 +239,51 @@ impl SchedulerServices {
 
         let executor_cfg = ExecutorConfig {
             storage: storage.clone(),
-            manager,
+            manager: manager.clone(),
             adapters,
             handle: handle.clone(),
             admission_lock: admission_lock.clone(),
             global: config.global,
             running_global: running_global.clone(),
+            running_per_cron: running_per_cron.clone(),
+            errors_window: errors_window.clone(),
+            throttled_by_loadavg: throttled_by_loadavg.clone(),
             shutdown_poll: config.shutdown_poll,
         };
         let executor_loop = spawn_executor(executor_cfg, fires, executor_shutdown.clone());
+
+        let scheduler_health_loop = spawn_scheduler_health_loop(SchedulerHealthLoopConfig {
+            handle: handle.clone(),
+            bus: manager.bus(),
+            running_global: running_global.clone(),
+            running_per_cron: running_per_cron.clone(),
+            errors_window: errors_window.clone(),
+            throttled_by_loadavg: throttled_by_loadavg.clone(),
+            interval: config.scheduler_health_interval,
+            // Dedicated notifier (paired with `shutdown_flag`) so the
+            // loop joins cleanly inside `Self::shutdown` even when the
+            // notify fires while a publish call is in flight. See the
+            // field docs on [`Self::scheduler_health_shutdown`].
+            shutdown: scheduler_health_shutdown.clone(),
+            shutdown_flag: scheduler_health_shutdown_flag.clone(),
+        });
 
         Ok(Self {
             handle,
             config,
             running_global,
+            running_per_cron,
             admission_lock,
-            loops: Mutex::new(Some((scheduler_loop, executor_loop))),
+            errors_window,
+            throttled_by_loadavg,
+            loops: Mutex::new(Some(SchedulerLoops {
+                scheduler_loop,
+                executor_loop,
+                scheduler_health_loop,
+            })),
             executor_shutdown,
+            scheduler_health_shutdown,
+            scheduler_health_shutdown_flag,
         })
     }
 
@@ -213,8 +315,13 @@ impl SchedulerServices {
         if let Err(err) = self.handle.shutdown().await {
             tracing::debug!(%err, "scheduler control channel shutdown failed");
         }
-        let pair = self.loops.lock().await.take();
-        if let Some((scheduler_loop, executor_loop)) = pair {
+        let loops = self.loops.lock().await.take();
+        if let Some(SchedulerLoops {
+            scheduler_loop,
+            executor_loop,
+            scheduler_health_loop,
+        }) = loops
+        {
             // First wait for the heap loop to finish; only then can we
             // be sure no more fires will be produced. The executor is
             // still running and will drain whatever the heap pushed
@@ -227,6 +334,17 @@ impl SchedulerServices {
             self.executor_shutdown.notify_waiters();
             if let Err(err) = executor_loop.await {
                 tracing::debug!(%err, "scheduler executor join failed");
+            }
+            // The scheduler.health loop has its own dedicated notifier
+            // (paired with a stored AtomicBool flag) so a notify that
+            // races a publish-in-flight is observed on the loop's next
+            // iteration. Set the flag before waking parked waiters so
+            // either ordering exits.
+            self.scheduler_health_shutdown_flag
+                .store(true, Ordering::Release);
+            self.scheduler_health_shutdown.notify_waiters();
+            if let Err(err) = scheduler_health_loop.await {
+                tracing::debug!(%err, "scheduler.health loop join failed");
             }
         }
     }
@@ -349,6 +467,19 @@ struct ExecutorConfig {
     admission_lock: Arc<Mutex<()>>,
     global: GlobalQuota,
     running_global: Arc<Mutex<u32>>,
+    /// Mirror of the per-cron run-count map owned by [`SchedulerServices`].
+    /// Bumped on admit, decremented on terminal finish; consumed by the
+    /// `scheduler.health` snapshotter. The map is empty by default; a cron
+    /// only acquires an entry on its first admit.
+    running_per_cron: Arc<Mutex<HashMap<String, u32>>>,
+    /// Mirror of the rolling 5-minute terminal-failure ring owned by
+    /// [`SchedulerServices`]. The run watcher pushes one Instant per
+    /// terminal `failed` / `timed_out` outcome.
+    errors_window: Arc<Mutex<VecDeque<Instant>>>,
+    /// Mirror of the loadavg-throttle flag owned by [`SchedulerServices`].
+    /// Set when admission defers a fire because loadavg exceeds the
+    /// configured threshold; cleared on any non-loadavg-defer outcome.
+    throttled_by_loadavg: Arc<AtomicBool>,
     shutdown_poll: StdDuration,
 }
 
@@ -424,6 +555,16 @@ async fn process_fire(cfg: &ExecutorConfig, fire: FireEvent) {
     let quota = cron_to_quota(&cron);
 
     let decision = evaluate_admission(&quota, &cfg.global, &snapshot);
+
+    // Surface the most recent admission outcome's loadavg-throttle bit
+    // for `scheduler.health`. Order matters: refusal classifications can
+    // overlap (`is_deferral` covers backoff + loadavg), so we look at
+    // the actual `error_kind` tag to avoid claiming loadavg trouble when
+    // the gate refused for backoff. Any non-loadavg outcome clears the
+    // flag so a brief spike doesn't stay red after recovery.
+    let loadavg_throttled = decision.error_kind() == Some("quota_cpu_load_throttle");
+    cfg.throttled_by_loadavg
+        .store(loadavg_throttled, Ordering::Relaxed);
 
     if let AdmissionDecision::Admit = decision {
         if let Err(err) = admit_and_spawn(cfg, &cron, &fire).await {
@@ -525,6 +666,11 @@ async fn admit_and_spawn_with_id(
         let mut count = cfg.running_global.lock().await;
         *count = count.saturating_add(1);
     }
+    // Mirror the bump into the per-cron map so `scheduler.health` reports
+    // running_per_cron the same instant. Decrement happens in
+    // `decrement_for_cron` on every terminal-finish path; the two are
+    // bracketed so the map never drifts from the global counter.
+    bump_running_for_cron(&cfg.running_per_cron, &cron.id).await;
 
     // 2. Insert the `runs` row (`spawning`). The admission lock is still
     //    held by the outer `process_fire`; this is the canonical write.
@@ -539,9 +685,10 @@ async fn admit_and_spawn_with_id(
         coalesced_count: fire.coalesced_count.max(1) as i64,
     };
     if let Err(e) = cfg.storage.runs().create(new_run).await {
-        // Roll back the in-memory counter on storage error so a wedged
-        // SQLite doesn't permanently inflate the global rail.
-        decrement_global(cfg).await;
+        // Roll back the in-memory counters on storage error so a wedged
+        // SQLite doesn't permanently inflate the global rail OR leak a
+        // per-cron map entry.
+        decrement_global_and_cron(cfg, &cron.id).await;
         return Err(AdmitError::Storage(e));
     }
 
@@ -563,7 +710,7 @@ async fn admit_and_spawn_with_id(
                 &format!("backend {:?} not registered", cron.backend_id),
             )
             .await;
-            decrement_global(cfg).await;
+            decrement_global_and_cron(cfg, &cron.id).await;
             return Err(AdmitError::AdapterMissing(cron.backend_id.clone()));
         }
     };
@@ -580,7 +727,7 @@ async fn admit_and_spawn_with_id(
                 &format!("project {} not found", cron.project_id),
             )
             .await;
-            decrement_global(cfg).await;
+            decrement_global_and_cron(cfg, &cron.id).await;
             return Err(AdmitError::ProjectMissing(cron.project_id.clone()));
         }
     };
@@ -609,7 +756,7 @@ async fn admit_and_spawn_with_id(
         Err(err) => {
             let msg = err.to_string();
             finish_run_with_error(cfg, &run_id, "failed", "spawn_failed", &msg).await;
-            decrement_global(cfg).await;
+            decrement_global_and_cron(cfg, &cron.id).await;
             return Err(AdmitError::Spawn(msg));
         }
     };
@@ -658,6 +805,32 @@ enum AdmitError {
 async fn decrement_global(cfg: &ExecutorConfig) {
     let mut count = cfg.running_global.lock().await;
     *count = count.saturating_sub(1);
+}
+
+/// Decrement both the global counter and the per-cron map. Use whenever
+/// an admit path that bumped both rolls back (early-exit storage / spawn
+/// failure) or terminates (run watcher final tick). The two counters MUST
+/// move in lock-step so `running_global == sum(running_per_cron.values())`
+/// is preserved for the `scheduler.health` payload.
+async fn decrement_global_and_cron(cfg: &ExecutorConfig, cron_id: &str) {
+    decrement_global(cfg).await;
+    decrement_for_cron(&cfg.running_per_cron, cron_id).await;
+}
+
+async fn bump_running_for_cron(map: &Arc<Mutex<HashMap<String, u32>>>, cron_id: &str) {
+    let mut guard = map.lock().await;
+    let slot = guard.entry(cron_id.to_string()).or_insert(0);
+    *slot = slot.saturating_add(1);
+}
+
+async fn decrement_for_cron(map: &Arc<Mutex<HashMap<String, u32>>>, cron_id: &str) {
+    let mut guard = map.lock().await;
+    if let Some(slot) = guard.get_mut(cron_id) {
+        *slot = slot.saturating_sub(1);
+        if *slot == 0 {
+            guard.remove(cron_id);
+        }
+    }
 }
 
 /// Bump `crons.last_fired_at` / `next_fire_at` so daemon restart does not
@@ -736,6 +909,8 @@ fn spawn_run_watcher(cfg: &ExecutorConfig, run_id: String, session_id: SessionId
     let manager = cfg.manager.clone();
     let handle = cfg.handle.clone();
     let running_global = cfg.running_global.clone();
+    let running_per_cron = cfg.running_per_cron.clone();
+    let errors_window = cfg.errors_window.clone();
     let max_rt = max_runtime(&cron_to_quota(&cron));
     tokio::spawn(async move {
         // Poll the session row for terminal state. la-core doesn't expose
@@ -856,13 +1031,41 @@ fn spawn_run_watcher(cfg: &ExecutorConfig, run_id: String, session_id: SessionId
             let _ = handle.clear_backoff_state(cron.id.clone()).await;
         }
 
+        // `scheduler.health.errors_last_5m` counts terminal failures of any
+        // cron in a rolling 5-minute window. `failed` + `timed_out` are the
+        // user-visible failure modes; `completed` and `cancelled` are not.
+        // Pushing the Instant here (rather than from `process_fire`) keeps
+        // the counter aligned with the runs table — every counted error
+        // corresponds to a `runs` row that the TUI's runs list will show.
+        if matches!(outcome.status.as_str(), "failed" | "timed_out") {
+            push_error_event(&errors_window).await;
+        }
+
         decrement_global_owned(&running_global).await;
+        decrement_for_cron(&running_per_cron, &cron.id).await;
     });
 }
 
 async fn decrement_global_owned(counter: &Arc<Mutex<u32>>) {
     let mut count = counter.lock().await;
     *count = count.saturating_sub(1);
+}
+
+async fn push_error_event(window: &Arc<Mutex<VecDeque<Instant>>>) {
+    let mut guard = window.lock().await;
+    guard.push_back(Instant::now());
+    prune_error_window(&mut guard);
+}
+
+fn prune_error_window(window: &mut VecDeque<Instant>) {
+    let cutoff = match Instant::now().checked_sub(ERRORS_WINDOW) {
+        Some(t) => t,
+        // Daemon just booted; nothing to prune.
+        None => return,
+    };
+    while window.front().map_or(false, |&t| t < cutoff) {
+        window.pop_front();
+    }
 }
 
 struct TerminalOutcome {
@@ -905,6 +1108,126 @@ fn spawn_diag_drain(mut diag: mpsc::Receiver<la_scheduler::SchedulerEvent>, shut
             }
         }
     });
+}
+
+/// Wiring for [`spawn_scheduler_health_loop`]. Pulled out so the call
+/// site doesn't grow a 7-argument constructor and tests can build it
+/// with a shrunk interval without re-stating every field.
+pub(crate) struct SchedulerHealthLoopConfig {
+    pub(crate) handle: SchedulerHandle,
+    pub(crate) bus: EventBus,
+    pub(crate) running_global: Arc<Mutex<u32>>,
+    pub(crate) running_per_cron: Arc<Mutex<HashMap<String, u32>>>,
+    pub(crate) errors_window: Arc<Mutex<VecDeque<Instant>>>,
+    pub(crate) throttled_by_loadavg: Arc<AtomicBool>,
+    pub(crate) interval: StdDuration,
+    pub(crate) shutdown: Arc<Notify>,
+    /// Stored shutdown bit. Set to `true` *before* `shutdown.notify_waiters()`
+    /// is fired so a publish-in-flight loop catches the signal on its next
+    /// iteration (Notify itself doesn't store permits).
+    pub(crate) shutdown_flag: Arc<AtomicBool>,
+}
+
+/// Spawn the 5 s `scheduler.health` broadcast loop. Emits a fresh
+/// pulse onto the daemon's bus once per `interval` until `shutdown`
+/// fires. The first pulse goes out *before* the timer starts so a TUI
+/// that subscribes right after `events.subscribe` doesn't wait the
+/// full cadence for its first frame — same idea as
+/// [`crate::health::run_probe_loop`].
+fn spawn_scheduler_health_loop(cfg: SchedulerHealthLoopConfig) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // First pulse: synchronous so the wire stream is honest from
+        // message #1.
+        publish_scheduler_health(&cfg).await;
+
+        let mut ticker = tokio::time::interval(cfg.interval);
+        // The interval's first tick fires immediately; skip it because
+        // we just published synchronously above.
+        ticker.tick().await;
+
+        loop {
+            // Check the stored shutdown bit BEFORE parking on `notified()`.
+            // Notify itself doesn't store permits, so a notify_waiters()
+            // that lands while we were inside `publish_scheduler_health`
+            // would otherwise be lost and the next `notified()` would park
+            // forever. Reading the flag here closes that race.
+            if cfg.shutdown_flag.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = cfg.shutdown.notified() => break,
+                _ = ticker.tick() => {
+                    publish_scheduler_health(&cfg).await;
+                }
+            }
+        }
+    })
+}
+
+async fn publish_scheduler_health(cfg: &SchedulerHealthLoopConfig) {
+    let running_global = *cfg.running_global.lock().await;
+    let running_per_cron = snapshot_running_per_cron(&cfg.running_per_cron).await;
+    let errors_last_5m = snapshot_errors_last_5m(&cfg.errors_window).await;
+    // The scheduler's snapshot is an authoritative source for the next
+    // upcoming fire — the heap is keyed by fire time and `snapshot`
+    // returns entries earliest-first (la-scheduler::scheduler.rs §117).
+    // We pull only the head; the TUI status bar's "next ↻" indicator is
+    // a single value, not a list.
+    let next_fire = match cfg.handle.snapshot().await {
+        Ok(entries) => entries.into_iter().next().map(|e| SchedulerHealthNextFire {
+            cron_id: e.id,
+            at: e.fire_at.to_rfc3339(),
+        }),
+        Err(err) => {
+            // The scheduler loop is gone (shutdown raced us) — skip the
+            // hint rather than the whole pulse so the TUI still sees the
+            // running counters drain to zero.
+            tracing::debug!(%err, "scheduler.health: snapshot unavailable");
+            None
+        }
+    };
+    // Read the queue indirectly: the heap's snapshot length is *not* the
+    // queue depth between heap and executor. We model `queue_depth` as
+    // the number of currently in-flight admissions (executor has popped
+    // a fire but not yet completed processing). Practically that's the
+    // same as `running_global` while the executor is single-threaded:
+    // every fire that's been popped is either rejected (no impact) or
+    // produces a run that increments `running_global`. Until we have a
+    // dedicated buffered-fires counter, surfacing `running_global` here
+    // is the honest upper bound — the wire shape is stable so we can
+    // tighten the source later without breaking clients.
+    let queue_depth = running_global;
+    let throttled_by_loadavg = cfg.throttled_by_loadavg.load(Ordering::Relaxed);
+
+    let params = SchedulerHealthParams {
+        queue_depth,
+        running_global,
+        running_per_cron,
+        throttled_by_loadavg,
+        errors_last_5m,
+        next_fire,
+    };
+    metrics::gauge!("lad_scheduler_running_global").set(running_global as f64);
+    metrics::gauge!("lad_scheduler_errors_last_5m").set(errors_last_5m as f64);
+    cfg.bus.publish(BusEvent::SchedulerHealth(params));
+}
+
+async fn snapshot_running_per_cron(
+    map: &Arc<Mutex<HashMap<String, u32>>>,
+) -> BTreeMap<String, u32> {
+    let guard = map.lock().await;
+    guard
+        .iter()
+        .filter(|(_, &n)| n > 0)
+        .map(|(k, &v)| (k.clone(), v))
+        .collect()
+}
+
+async fn snapshot_errors_last_5m(window: &Arc<Mutex<VecDeque<Instant>>>) -> u32 {
+    let mut guard = window.lock().await;
+    prune_error_window(&mut guard);
+    guard.len() as u32
 }
 
 // ===========================================================================
@@ -1021,6 +1344,9 @@ pub async fn run_now(
         admission_lock: services.admission_lock.clone(),
         global: services.config.global,
         running_global: services.running_global.clone(),
+        running_per_cron: services.running_per_cron.clone(),
+        errors_window: services.errors_window.clone(),
+        throttled_by_loadavg: services.throttled_by_loadavg.clone(),
         shutdown_poll: services.config.shutdown_poll,
     };
     let fire = FireEvent {
@@ -1309,6 +1635,9 @@ mod tests {
             admission_lock,
             global: GlobalQuota::default(),
             running_global,
+            running_per_cron: Arc::new(Mutex::new(HashMap::new())),
+            errors_window: Arc::new(Mutex::new(VecDeque::new())),
+            throttled_by_loadavg: Arc::new(AtomicBool::new(false)),
             shutdown_poll: StdDuration::from_millis(100),
         }
     }
@@ -1402,13 +1731,13 @@ mod tests {
         // taking the lock — but DO NOT consume; just inspect.
         {
             let guard = services.loops.lock().await;
-            let pair = guard.as_ref().expect("loops present pre-shutdown");
+            let loops = guard.as_ref().expect("loops present pre-shutdown");
             assert!(
-                !pair.0.is_finished(),
+                !loops.scheduler_loop.is_finished(),
                 "scheduler heap loop must outlive the daemon-wide notify"
             );
             assert!(
-                !pair.1.is_finished(),
+                !loops.executor_loop.is_finished(),
                 "scheduler executor must outlive the daemon-wide notify — \
                  otherwise any fire emitted between the accept-loop notify and \
                  SchedulerServices::shutdown is silently dropped"
@@ -1471,5 +1800,74 @@ mod tests {
             after.next_fire_at.is_some(),
             "refused scheduled fire must still advance next_fire_at"
         );
+    }
+
+    /// WEK-74 / M4.4: `scheduler.health` must publish on the daemon's
+    /// bus with the new wire shape — distinct from `daemon.health` and
+    /// carrying queue_depth / running_global / running_per_cron /
+    /// throttled_by_loadavg / errors_last_5m / next_fire. The cadence
+    /// is configurable via `SchedulerConfig::scheduler_health_interval`;
+    /// we shrink it to 30 ms so the test doesn't sit on the 5 s prod
+    /// default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduler_health_broadcasts_on_the_bus() {
+        let (_dir, storage, adapters, manager, _cron) = fixture().await;
+        let bus = manager.bus();
+        let mut rx = bus.subscribe();
+        let daemon_shutdown = Arc::new(Notify::new());
+        let mut config = SchedulerConfig::default();
+        // Test cadence: 30 ms is well below `recv` timeouts but >> the
+        // bus broadcast latency, so we catch the first synchronous
+        // pulse the loop publishes before the ticker even starts.
+        config.scheduler_health_interval = StdDuration::from_millis(30);
+        let services = SchedulerServices::start(
+            storage.clone(),
+            manager,
+            adapters,
+            config,
+            daemon_shutdown.clone(),
+        )
+        .await
+        .expect("scheduler boots");
+
+        // Drain up to a few events so we don't fail when a stray
+        // CronFired / DaemonHealth happens to be first on the bus.
+        let mut saw_scheduler_health = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(StdDuration::from_millis(200), rx.recv()).await {
+                Ok(Ok(BusEvent::SchedulerHealth(params))) => {
+                    // Shape assertions: every field on the wire MUST be
+                    // present and read by the field names the DoD pinned.
+                    assert_eq!(
+                        params.queue_depth, params.running_global,
+                        "queue_depth currently mirrors running_global; if this changes, \
+                         update the doc comment in publish_scheduler_health()"
+                    );
+                    assert!(
+                        params.running_per_cron.is_empty(),
+                        "no admit has happened yet, per-cron map must be empty"
+                    );
+                    assert!(!params.throttled_by_loadavg);
+                    assert_eq!(params.errors_last_5m, 0);
+                    // No enabled crons in fixture (the seeded `0 0 1 1 *`
+                    // is far in the future, but the heap still has it —
+                    // next_fire is Some).
+                    assert!(
+                        params.next_fire.is_some(),
+                        "fixture seeds a yearly cron; next_fire should be set"
+                    );
+                    saw_scheduler_health = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        assert!(
+            saw_scheduler_health,
+            "expected at least one SchedulerHealth event on the bus within ~4 s"
+        );
+
+        services.shutdown().await;
     }
 }

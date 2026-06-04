@@ -26,6 +26,7 @@ pub mod config_cmd;
 pub mod cron_security;
 pub mod daemonize;
 pub mod dispatcher;
+pub mod doctor;
 pub mod health;
 pub mod install;
 pub mod paths;

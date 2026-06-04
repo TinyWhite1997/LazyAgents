@@ -1,0 +1,29 @@
+[package]
+name = "m4-macos-smoke"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# WEK-74 / M4.4 A6: macOS-only socket-hardening + launchd short-circuit
+# assertions. Every test in `tests/` is cfg-gated on
+# `cfg(target_os = "macos")` so the crate compiles into a no-op on
+# Linux/Windows but the PR-level CI matrix can run the real assertions
+# on the `macos-14` / `macos-13` runners.
+
+[dev-dependencies]
+la-proto = { path = "../../crates/la-proto" }
+la-ipc = { path = "../../crates/la-ipc" }
+la-adapter = { path = "../../crates/la-adapter" }
+la-daemon = { path = "../../crates/la-daemon" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+nix = { workspace = true, features = ["user"] }

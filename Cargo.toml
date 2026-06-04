@@ -14,6 +14,7 @@ members = [
     "crates/la-tui",
     "integration/m0-smoke",
     "integration/m2-smoke",
+    "integration/m4-macos-smoke",
 ]
 
 [workspace.package]

@@ -17,8 +17,8 @@
 
 use la_proto::methods::EventTopic;
 use la_proto::notifications::{
-    CronFiredParams, DaemonHealthParams, SessionGapParams, SessionStateParams,
-    WorktreeChangedParams, WorktreeCommitCreatedParams,
+    CronFiredParams, DaemonHealthParams, SchedulerHealthParams, SessionGapParams,
+    SessionStateParams, WorktreeChangedParams, WorktreeCommitCreatedParams,
 };
 use tokio::sync::broadcast;
 
@@ -40,6 +40,10 @@ pub enum Topic {
     SessionGap,
     CronFired,
     DaemonHealth,
+    /// Scheduler-loop pulse (M4.4 / WEK-74). Distinct from
+    /// [`Self::DaemonHealth`] — adapter probes vs scheduler queue/run
+    /// metrics — so subscribers can opt into either independently.
+    SchedulerHealth,
     /// Per-worktree mutation pulse (M2.5 / WEK-28).
     WorktreeChanged,
     /// Per-worktree commit pulse (M2.5 / WEK-28).
@@ -55,6 +59,7 @@ impl Topic {
             Topic::SessionGap => EventTopic::SessionGap,
             Topic::CronFired => EventTopic::CronFired,
             Topic::DaemonHealth => EventTopic::DaemonHealth,
+            Topic::SchedulerHealth => EventTopic::SchedulerHealth,
             Topic::WorktreeChanged => EventTopic::WorktreeChanged,
             Topic::WorktreeCommit => EventTopic::WorktreeCommit,
         }
@@ -69,6 +74,7 @@ impl Topic {
             EventTopic::SessionGap => Topic::SessionGap,
             EventTopic::CronFired => Topic::CronFired,
             EventTopic::DaemonHealth => Topic::DaemonHealth,
+            EventTopic::SchedulerHealth => Topic::SchedulerHealth,
             EventTopic::WorktreeChanged => Topic::WorktreeChanged,
             EventTopic::WorktreeCommit => Topic::WorktreeCommit,
             EventTopic::SessionOutput => return None,
@@ -89,6 +95,7 @@ pub enum BusEvent {
     SessionGap(SessionGapParams),
     CronFired(CronFiredParams),
     DaemonHealth(DaemonHealthParams),
+    SchedulerHealth(SchedulerHealthParams),
     WorktreeChanged(WorktreeChangedParams),
     WorktreeCommitCreated(WorktreeCommitCreatedParams),
 }
@@ -100,6 +107,7 @@ impl BusEvent {
             BusEvent::SessionGap(_) => Topic::SessionGap,
             BusEvent::CronFired(_) => Topic::CronFired,
             BusEvent::DaemonHealth(_) => Topic::DaemonHealth,
+            BusEvent::SchedulerHealth(_) => Topic::SchedulerHealth,
             BusEvent::WorktreeChanged(_) => Topic::WorktreeChanged,
             BusEvent::WorktreeCommitCreated(_) => Topic::WorktreeCommit,
         }
