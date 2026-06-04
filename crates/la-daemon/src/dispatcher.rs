@@ -645,6 +645,7 @@ async fn handle_events_subscribe(
                 .filter(|b| b.status != la_proto::notifications::BackendHealthStatus::Available)
                 .count() as u32,
             backends,
+            managed_by: crate::install::detect_running_service(),
         };
         match Notification::new(DaemonHealth::NAME, &params) {
             Ok(n) => {

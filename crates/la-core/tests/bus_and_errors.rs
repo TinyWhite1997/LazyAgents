@@ -19,6 +19,7 @@ async fn bus_broadcasts_to_all_subscribers() {
         running: 2,
         errors_last_5m: 0,
         backends: Vec::new(),
+        managed_by: None,
     }));
     assert_eq!(sent, 2, "both subs should receive");
 

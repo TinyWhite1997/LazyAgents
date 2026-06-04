@@ -203,6 +203,14 @@ pub struct DaemonHealthParams {
     /// never probe leave it empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<BackendHealth>,
+    /// Wire tag of the service supervisor that started this daemon
+    /// (`"systemd"` / `"launchd"` / `"windows-task"`). Sourced from
+    /// `$LAZYAGENTS_MANAGED_BY` at boot. `None` when the daemon was
+    /// started directly (e.g. `lad start` from a shell or
+    /// `lad daemonize` from the TUI bootstrap). Additive in WEK-73 /
+    /// M4.1; older daemons leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<String>,
 }
 
 /// Probe state for a single registered adapter, broadcast as part of

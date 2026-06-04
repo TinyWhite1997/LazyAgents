@@ -34,7 +34,7 @@ use la_daemon::{
 };
 
 const HELP: &str = "\
-lad — LazyAgents daemon (WEK-21 / M1.7 + WEK-71 / M4.2)
+lad — LazyAgents daemon (WEK-21 / M1.7 + WEK-71 / M4.2 + WEK-73 / M4.1)
 
 USAGE:
     lad <command> [flags]
@@ -48,6 +48,8 @@ COMMANDS:
     config show        Print the merged configuration with provenance.
     config check       Parse + validate config.toml without starting daemon.
     config path        Print the config path resolve_config_path() would read.
+    install            Install a service unit (systemd / launchd / Windows task).
+    uninstall          Remove the service unit (idempotent).
 
 GLOBAL FLAGS:
     --socket <path>    Override the socket path. Default = $LAZYAGENTS_SOCKET
@@ -58,11 +60,19 @@ GLOBAL FLAGS:
     --config <path>    Override the config file (default = resolve_config_path()).
     -h, --help         Show this help.
 
+INSTALL FLAGS (install / uninstall):
+    --service <mode>   systemd | launchd | windows-task   (required)
+    --enable           install: also `enable` the unit (start-at-login).
+    --start            install: also `start` the unit now.
+    --dry-run          install/uninstall: log every action; touch nothing.
+
 ENVIRONMENT:
     LAZYAGENTS_SOCKET / LAZYAGENTS_STATE_DIR / LAZYAGENTS_LOG_LEVEL /
     LAZYAGENTS_LOG_FORMAT / LAZYAGENTS_CONFIG override the matching flags.
     LAZYAGENTS_LOG is a deprecated alias for LAZYAGENTS_LOG_LEVEL
     (warning emitted; removed in v1.1).
+    LAZYAGENTS_MANAGED_BY is set by service units (systemd / launchd /
+    windows-task) and tells the la bootstrap to skip auto-daemonize.
 ";
 
 fn main() -> ExitCode {
@@ -98,7 +108,24 @@ enum Command {
     Doctor,
     Backup { output: std::path::PathBuf },
     Config { sub: ConfigSub },
+    Install(InstallSpec),
+    Uninstall(UninstallSpec),
     Help,
+}
+
+#[derive(Default)]
+struct InstallSpec {
+    /// `--service <mode>`; required when the user runs `lad install`.
+    service: Option<String>,
+    enable: bool,
+    start: bool,
+    dry_run: bool,
+}
+
+#[derive(Default)]
+struct UninstallSpec {
+    service: Option<String>,
+    dry_run: bool,
 }
 
 enum ConfigSub {
@@ -131,6 +158,8 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             };
             Command::Config { sub }
         }
+        "install" => Command::Install(InstallSpec::default()),
+        "uninstall" => Command::Uninstall(UninstallSpec::default()),
         "-h" | "--help" | "help" => Command::Help,
         other => return Err(format!("unknown command: {other}")),
     };
@@ -192,6 +221,30 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                         .into();
                 }
                 _ => return Err("--output is only valid for backup".to_string()),
+            },
+            "--service" => {
+                let value = iter
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| "--service expects a mode".to_string())?;
+                match &mut cmd {
+                    Command::Install(spec) => spec.service = Some(value),
+                    Command::Uninstall(spec) => spec.service = Some(value),
+                    _ => return Err("--service is only valid for install/uninstall".to_string()),
+                }
+            }
+            "--enable" => match &mut cmd {
+                Command::Install(spec) => spec.enable = true,
+                _ => return Err("--enable is only valid for install".to_string()),
+            },
+            "--start" => match &mut cmd {
+                Command::Install(spec) => spec.start = true,
+                _ => return Err("--start is only valid for install".to_string()),
+            },
+            "--dry-run" => match &mut cmd {
+                Command::Install(spec) => spec.dry_run = true,
+                Command::Uninstall(spec) => spec.dry_run = true,
+                _ => return Err("--dry-run is only valid for install/uninstall".to_string()),
             },
             #[cfg(debug_assertions)]
             "--test-shell-adapter" => {
@@ -297,6 +350,8 @@ fn run(p: Parsed) -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Config { sub } => run_config(sub, &p),
+        Command::Install(spec) => run_install_cmd(spec, &p),
+        Command::Uninstall(spec) => run_uninstall_cmd(spec),
         Command::Doctor => {
             let resolved = match derive_runtime(&p) {
                 Ok(r) => r,
@@ -471,6 +526,22 @@ fn run(p: Parsed) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // S1 / 跨平台启停一致性: if a service unit is already installed
+            // on this host, and we are NOT being launched by it (no
+            // LAZYAGENTS_MANAGED_BY in our env), refuse so we don't end
+            // up with two daemons racing on the same socket. The
+            // service path is the authoritative one once installed.
+            if std::env::var_os("LAZYAGENTS_MANAGED_BY").is_none() {
+                if let Some(hint) = detect_local_service_unit() {
+                    eprintln!(
+                        "lad start: a {} service unit is already installed on this host. \
+                         A service manager owns lifecycle once installed; please use \
+                         `{}` instead of `lad start`.",
+                        hint.label, hint.suggested_cmd
+                    );
+                    return ExitCode::from(2);
+                }
+            }
             let state_dir = resolved
                 .state_dir_override
                 .clone()
@@ -545,6 +616,74 @@ fn run_config(sub: &ConfigSub, p: &Parsed) -> ExitCode {
         ConfigSub::Path => {
             println!("{}", la_daemon::config_cmd::path_string());
             ExitCode::SUCCESS
+        }
+    }
+}
+
+fn run_install_cmd(spec: &InstallSpec, p: &Parsed) -> ExitCode {
+    let Some(raw) = spec.service.as_deref() else {
+        eprintln!("lad install: --service <systemd|launchd|windows-task> is required");
+        return ExitCode::from(2);
+    };
+    let mode = match la_daemon::install::ServiceMode::parse(raw) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("lad install: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let args = la_daemon::install::InstallArgs {
+        mode,
+        enable: spec.enable,
+        start: spec.start,
+        config_path: p.cli_config_path.clone(),
+        dry_run: spec.dry_run,
+    };
+    match la_daemon::install::run_install(&args) {
+        Ok(outcomes) => {
+            for o in &outcomes {
+                println!("{o}");
+            }
+            println!();
+            println!(
+                "{}",
+                la_daemon::install::cli::render_post_install_hint(&args)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("lad install: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_uninstall_cmd(spec: &UninstallSpec) -> ExitCode {
+    let Some(raw) = spec.service.as_deref() else {
+        eprintln!("lad uninstall: --service <systemd|launchd|windows-task> is required");
+        return ExitCode::from(2);
+    };
+    let mode = match la_daemon::install::ServiceMode::parse(raw) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("lad uninstall: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let args = la_daemon::install::UninstallArgs {
+        mode,
+        dry_run: spec.dry_run,
+    };
+    match la_daemon::install::run_uninstall(&args) {
+        Ok(outcomes) => {
+            for o in &outcomes {
+                println!("{o}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("lad uninstall: {err}");
+            ExitCode::from(1)
         }
     }
 }
@@ -705,6 +844,52 @@ fn num_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().min(8))
         .unwrap_or(2)
+}
+
+struct LocalService {
+    label: &'static str,
+    suggested_cmd: &'static str,
+}
+
+/// Best-effort check for "is a service unit for `lad` already installed
+/// on this host?". Looks for the unit file on disk only — running
+/// `systemctl/launchctl/schtasks` from here would be slow and could
+/// prompt for permissions.
+fn detect_local_service_unit() -> Option<LocalService> {
+    use std::env;
+    if let Some(home_os) = env::var_os("HOME") {
+        let home = std::path::PathBuf::from(&home_os);
+        if cfg!(target_os = "linux") {
+            let unit = home.join(".config/systemd/user/lad.service");
+            if unit.is_file() {
+                return Some(LocalService {
+                    label: "systemd",
+                    suggested_cmd: "systemctl --user start lad.service",
+                });
+            }
+        }
+        if cfg!(target_os = "macos") {
+            let plist = home.join("Library/LaunchAgents/dev.lazyagents.lad.plist");
+            if plist.is_file() {
+                return Some(LocalService {
+                    label: "launchd",
+                    suggested_cmd: "launchctl kickstart -k gui/$UID/dev.lazyagents.lad",
+                });
+            }
+        }
+    }
+    if cfg!(windows) {
+        if let Some(appdata) = env::var_os("APPDATA") {
+            let xml = std::path::PathBuf::from(&appdata).join("lazyagents/lad-task.xml");
+            if xml.is_file() {
+                return Some(LocalService {
+                    label: "windows-task",
+                    suggested_cmd: "schtasks /Run /TN \\LazyAgents\\lad",
+                });
+            }
+        }
+    }
+    None
 }
 
 #[cfg(debug_assertions)]

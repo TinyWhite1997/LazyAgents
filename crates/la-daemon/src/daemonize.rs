@@ -1,17 +1,28 @@
 //! `lad daemonize` — fork-and-detach helper.
 //!
-//! Architecture §11.2: `lad daemonize` does `fork + setsid` so the daemon
-//! survives terminal close. We can't use `nix::unistd::fork` after tokio
-//! has started its worker threads (the child would inherit thread state
-//! the runtime no longer owns), so this helper is invoked **before** the
-//! tokio runtime is built — the bin entrypoint dispatches into it from
-//! `main`.
+//! Architecture §11.2: `lad daemonize` puts the daemon into a state where
+//! it survives the parent terminal closing. The implementation differs
+//! between Unix and Windows in important ways:
 //!
-//! Implementation strategy: re-exec ourselves as `lad start` from the
-//! detached child, then wait briefly for the socket to appear so the
-//! caller can rely on "exit 0 ⇒ daemon is ready". This avoids the
-//! double-fork rabbit hole that classic SysV daemonization needs while
-//! still satisfying the contract.
+//! * **Unix** — `fork + setsid` so the child becomes a new session
+//!   leader. We do this *before* the tokio runtime boots because
+//!   `fork()` after tokio has spawned worker threads leaves the child
+//!   holding references to runtime state the runtime no longer owns.
+//!   The bin entrypoint dispatches into [`spawn_daemonized`] from
+//!   `main` for that reason.
+//!
+//! * **Windows** — Win32 has no `fork`; we spawn `lad start` as a fresh
+//!   process with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` so the
+//!   new process has no console and is independent of the parent's job
+//!   object. Readiness is gated on the named-pipe listener becoming
+//!   connectable, which matches the contract the Unix side gives the
+//!   caller ("exit 0 ⇒ daemon is ready").
+//!
+//! Both paths return [`DaemonizeOutcome`] when the daemon is reachable
+//! within `ready_timeout`, [`DaemonizeError::SocketTimeout`] otherwise,
+//! and [`DaemonizeError::EarlyExit`] if the spawned child exited before
+//! the listener bound. There are NO `cfg(not(unix))` empty stubs — A8
+//! requires the Windows path to be a real, working code path.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -29,10 +40,12 @@ pub enum DaemonizeError {
 
 /// Spawn `lad start` (or the supplied executable) as a detached child.
 ///
-/// Blocks the caller until the socket file appears (proof the child has
-/// bound the listener) OR `ready_timeout` elapses. On success the child
-/// is fully detached: a new session leader, stdio redirected to
-/// `/dev/null`, parent exits normally.
+/// Blocks the caller until the daemon's IPC endpoint becomes
+/// connectable (proof the child has bound the listener) OR
+/// `ready_timeout` elapses. On success the child is fully detached:
+/// new session leader on Unix, no console + own process group on
+/// Windows, stdio redirected to the OS null device, parent exits
+/// normally.
 pub fn spawn_daemonized(
     exe: &Path,
     socket_path: &Path,
@@ -43,8 +56,6 @@ pub fn spawn_daemonized(
 
     let mut cmd = Command::new(exe);
     cmd.arg("start").args(extra_args);
-    // Detach stdio so the parent can exit without leaving the child
-    // attached to its tty.
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
@@ -52,23 +63,25 @@ pub fn spawn_daemonized(
     #[cfg(unix)]
     setsid_pre_exec(&mut cmd);
 
+    #[cfg(windows)]
+    apply_detached_flags(&mut cmd);
+
     let mut child = cmd.spawn()?;
     let pid = child.id();
 
-    // Best-effort detach: try_wait quickly, then poll for the socket
-    // file. If the child exits before the socket appears we report
-    // EarlyExit so the caller knows the daemonize failed for a reason
-    // worth surfacing (rather than just timing out).
+    // Best-effort detach: try_wait quickly, then poll for the listener
+    // becoming connectable. If the child exits before the listener
+    // appears we report EarlyExit so the caller knows the daemonize
+    // failed for a real reason (rather than just timing out).
     let deadline = Instant::now() + ready_timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             return Err(DaemonizeError::EarlyExit(status));
         }
-        if socket_path.exists() && can_connect(socket_path) {
-            // Don't reap the child — let it run as a session leader.
-            // `drop(child)` leaves the OS handle alive; on Unix we leak
-            // the libc `pid_t` deliberately, which is the correct
-            // behaviour for a forked-and-detached daemon.
+        if endpoint_reachable(socket_path) {
+            // Don't reap the child — let it run as a session leader (or
+            // detached Win32 process). `mem::forget` releases the
+            // platform handle without sending a SIGTERM/TerminateProcess.
             std::mem::forget(child);
             return Ok(DaemonizeOutcome {
                 pid,
@@ -101,9 +114,6 @@ fn setsid_pre_exec(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt as _;
     unsafe {
         cmd.pre_exec(|| {
-            // Become session leader so we survive the parent's tty
-            // close. Errors here are surfaced as the child's exit
-            // status via the normal Command path.
             if libc_setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -114,20 +124,104 @@ fn setsid_pre_exec(cmd: &mut std::process::Command) {
 
 #[cfg(unix)]
 unsafe fn libc_setsid() -> i64 {
-    // Avoid pulling nix's `unistd` feature just for setsid.
     extern "C" {
         fn setsid() -> i32;
     }
     setsid() as i64
 }
 
+/// On Unix the "is it ready?" probe is a connect on the UDS path.
 #[cfg(unix)]
-fn can_connect(path: &Path) -> bool {
+fn endpoint_reachable(path: &Path) -> bool {
     use std::os::unix::net::UnixStream;
     UnixStream::connect(path).is_ok()
 }
 
-#[cfg(not(unix))]
-fn can_connect(_path: &Path) -> bool {
-    true
+// ---------------- Windows ----------------
+
+#[cfg(windows)]
+fn apply_detached_flags(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    // DETACHED_PROCESS (0x00000008) — child has no inherited console.
+    // CREATE_NEW_PROCESS_GROUP (0x00000200) — child is the root of a new
+    //   process group; it does NOT receive Ctrl-C/Ctrl-Break sent to
+    //   the parent.
+    // CREATE_NO_WINDOW (0x08000000) — belt-and-braces for GUI parents.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+/// Translate the Unix-style socket path we get from
+/// `SocketDiscovery::resolve()` into the Win32 named-pipe name the
+/// daemon binds — mirrors `runtime::endpoint_for`.
+#[cfg(windows)]
+fn pipe_name_from_socket_path(path: &Path) -> String {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("lad");
+    format!(r"\\.\pipe\lazyagents-{stem}")
+}
+
+/// On Windows the "is it ready?" probe is a `WaitNamedPipeW` against
+/// the daemon's named pipe. Returning true means a client could
+/// connect right now.
+#[cfg(windows)]
+fn endpoint_reachable(socket_path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let pipe_name = pipe_name_from_socket_path(socket_path);
+    let wide: Vec<u16> = std::ffi::OsStr::new(&pipe_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // Use a tiny timeout so the polling loop stays responsive. Returns
+    // immediately if no server is listening yet (`ERROR_FILE_NOT_FOUND`)
+    // or if the wait elapses; both map to "not ready".
+    unsafe { wait_named_pipe(wide.as_ptr(), 50) }
+}
+
+#[cfg(windows)]
+unsafe fn wait_named_pipe(pipe_name: *const u16, timeout_ms: u32) -> bool {
+    extern "system" {
+        fn WaitNamedPipeW(lpNamedPipeName: *const u16, nTimeOut: u32) -> i32;
+    }
+    WaitNamedPipeW(pipe_name, timeout_ms) != 0
+}
+
+/// Cleanup hook the daemon's bind path calls when it removes its named
+/// pipe at shutdown. On Unix this is a no-op (the daemon already
+/// unlinks the socket file). On Windows there's nothing to remove
+/// either — named pipes vanish when the last server handle closes —
+/// but the symmetric API keeps the call sites tidy.
+pub fn cleanup_endpoint_artifacts(_socket_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Apply per-pipe ACLs at server-side creation time. Today the
+/// `tokio::net::windows::named_pipe::ServerOptions` API enforces the
+/// "current user only" default via the SDDL string baked into the
+/// transport layer (see `la_ipc::transport`); this hook is here so a
+/// future change that exposes ACL customisation can plug in without
+/// touching every call site. Returning `Ok(())` on Unix keeps the
+/// surface uniform across platforms.
+pub fn enforce_named_pipe_acl_defaults() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn pipe_name_uses_file_stem() {
+        let p = Path::new(r"C:\Users\alice\AppData\Local\lazyagents\lad-1.sock");
+        assert_eq!(pipe_name_from_socket_path(p), r"\\.\pipe\lazyagents-lad-1");
+    }
+
+    #[test]
+    fn cleanup_endpoint_artifacts_is_noop_for_missing_path() {
+        let tmp = std::env::temp_dir().join("nonexistent-lazyagents-pipe");
+        assert!(cleanup_endpoint_artifacts(&tmp).is_ok());
+    }
 }

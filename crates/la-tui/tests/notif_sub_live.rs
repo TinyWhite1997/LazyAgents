@@ -106,6 +106,7 @@ fn health_push() -> Message {
             docs_url: Some("https://example.com/install".into()),
             last_probed_at: "2026-06-02T00:00:00Z".into(),
         }],
+        managed_by: None,
     };
     Message::Notification(Notification::new(DaemonHealth::NAME, &payload).expect("encode health"))
 }
