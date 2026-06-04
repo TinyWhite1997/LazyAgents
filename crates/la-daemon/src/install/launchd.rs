@@ -493,8 +493,22 @@ mod tests {
         assert!(rendered.contains("<key>KeepAlive</key>"));
         assert!(rendered.contains("<true/>"));
         // Logs path lives under ~/Library/Logs/lazyagents, NOT /tmp.
-        assert!(rendered.contains("/Users/alice/Library/Logs/lazyagents/lad.out.log"));
-        assert!(rendered.contains("/Users/alice/Library/Logs/lazyagents/lad.err.log"));
+        // The path is derived via `home.join("Library").join("Logs")...`,
+        // which on Windows substitutes `\` for the separator it adds —
+        // and the rendered XML carries that exact string. Accept both
+        // separators so the test stays valid in the matrix CI.
+        let has_out_log = rendered.contains("/Users/alice/Library/Logs/lazyagents/lad.out.log")
+            || rendered.contains("/Users/alice\\Library\\Logs\\lazyagents\\lad.out.log");
+        let has_err_log = rendered.contains("/Users/alice/Library/Logs/lazyagents/lad.err.log")
+            || rendered.contains("/Users/alice\\Library\\Logs\\lazyagents\\lad.err.log");
+        assert!(
+            has_out_log,
+            "stdout path missing in rendered plist: {rendered}"
+        );
+        assert!(
+            has_err_log,
+            "stderr path missing in rendered plist: {rendered}"
+        );
         assert!(!rendered.contains("/tmp/"));
         // PATH minimal set; HOME/USER explicit.
         assert!(rendered.contains("/usr/bin:/bin:/usr/sbin:/sbin"));

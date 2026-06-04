@@ -261,9 +261,12 @@ mod tests {
         );
 
         let degraded = WindowsTaskPaths::from_appdata_or_home(None, Path::new("/home/u"));
-        assert!(degraded
-            .xml_path
-            .to_string_lossy()
-            .contains(".config/lazyagents"));
+        let xml = degraded.xml_path.to_string_lossy().to_string();
+        // On Windows, `PathBuf::join` substitutes `\` for the separator
+        // it added, so accept either form.
+        assert!(
+            xml.contains(".config/lazyagents") || xml.contains(".config\\lazyagents"),
+            "unexpected degraded xml path: {xml}"
+        );
     }
 }
