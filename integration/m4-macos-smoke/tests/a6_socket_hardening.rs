@@ -222,73 +222,151 @@ except OSError as e:
 
 // --- A6 §4: launchd short-circuit (no double-spawn, PID stable) -------------
 
-/// When `LAZYAGENTS_MANAGED_BY=launchd` is set, any client bootstrap
-/// path that *would* have spawned `lad daemonize` MUST skip the spawn
-/// — launchd owns the lifecycle once installed and a second `lad`
-/// would race the launchd-owned one on the same socket. This test
-/// asserts the no-spawn invariant in two ways:
+/// When `LAZYAGENTS_MANAGED_BY=launchd` is set, **any** code path
+/// that *would* have spawned `lad daemonize` MUST skip the spawn —
+/// launchd owns the lifecycle once installed and a second `lad`
+/// would race the launchd-owned one on the same socket.
 ///
-/// 1. With the env var set and a reachable socket, no extra `lad`
-///    process appears (`pgrep -f '^.*/lad( |$)' | wc -l` stays 1, or
-///    whatever the pre-test baseline was — we measure delta, not
-///    absolute, so a CI host running unrelated `lad` instances doesn't
-///    flake the test).
-/// 2. The PID of the daemon process before and after the bootstrap is
-///    identical — i.e. the "managed by" short-circuit did not racily
-///    restart anything.
+/// This test calls the **same library function** that the `la`
+/// binary calls at startup — `la_tui::bootstrap::bootstrap_daemon` —
+/// rather than reimplementing the policy in the test body. That's
+/// the reviewer's blocker fix: an in-process `connect(socket)`
+/// bypasses every short-circuit because no spawn code is on the
+/// path. The library entry point IS the policy.
 ///
-/// The actual full launchd install→bootstrap→kickstart→doctor→stop→bootout
+/// We assert three things:
+/// 1. The bootstrap returns `ManagedBy("launchd")` — the policy
+///    branch we care about fired.
+/// 2. The bootstrap reports `connected=false` even though we hand
+///    it the test daemon's reachable socket. (The point of the
+///    short-circuit is that the binary defers to the service
+///    manager; reporting AlreadyUp here would mean the env-var
+///    branch took a back seat to the socket probe and a future bug
+///    that breaks the socket-probe order could let auto-spawn
+///    re-enter.)
+/// 3. The `lad` process count is unchanged before vs. after. We
+///    measure delta, not absolute, so a CI host with unrelated
+///    `lad` instances doesn't flake the test.
+///
+/// The full launchd install→bootstrap→kickstart→doctor→stop→bootout
 /// path is the macOS Reviewer's M4.8 work (real `launchctl`, real
-/// `dev.lazyagents.lad.plist`); this test deliberately scopes down to
-/// the in-process invariant the env var encodes.
+/// `dev.lazyagents.lad.plist`); this test deliberately scopes down
+/// to the env-var short-circuit the bootstrap policy encodes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a6_launchd_short_circuit_does_not_spawn_second_lad() {
     let (_dir, socket, _handle, _join) = bring_up().await;
 
-    // Measure the lad-process count BEFORE we simulate the launchd
-    // bootstrap so we report a delta, not an absolute. This keeps the
-    // test honest on a dev macOS that has other `lad` instances
-    // running for unrelated reasons.
     let before = count_lad_processes();
 
-    // Simulate what the la TUI's bootstrap does when the env var is
-    // set: probe the socket (which IS reachable in this test) and
-    // confirm we do not spawn anything. The actual bootstrap_daemon
-    // function in la-tui only lives in the binary path so we cannot
-    // call it directly; the assertion below uses the same primitive —
-    // `LAZYAGENTS_MANAGED_BY` is read off the env, and any path that
-    // would auto-spawn declines.
-    std::env::set_var("LAZYAGENTS_MANAGED_BY", "launchd");
-    // Belt-and-braces: also set the older NO_AUTODAEMON kill switch so
-    // a regression in either guard fails this test rather than letting
-    // both cover for each other.
+    // Force the launchd code path. Save the prior values so we can
+    // restore them before asserting, otherwise a panic mid-assert
+    // would leak the env into sibling tests.
+    let prev_managed = std::env::var_os("LAZYAGENTS_MANAGED_BY");
     let prev_no_autod = std::env::var_os("LAZYAGENTS_NO_AUTODAEMON");
+    std::env::set_var("LAZYAGENTS_MANAGED_BY", "launchd");
+    // Belt-and-braces: also clear NO_AUTODAEMON so the test exercises
+    // ONLY the LAZYAGENTS_MANAGED_BY branch; if NO_AUTODAEMON were
+    // also set, the bootstrap would short-circuit on it first and
+    // mask a regression in the MANAGED_BY branch.
+    std::env::remove_var("LAZYAGENTS_NO_AUTODAEMON");
 
-    // Re-probe the socket — must succeed because the daemon we
-    // bootstrapped above is still up. This is the moment a buggy
-    // bootstrap would race and `spawn_lad_daemonize`; under the
-    // launchd short-circuit it must not.
-    let conn = connect(&Endpoint::uds(&socket)).await;
-    assert!(conn.is_ok(), "socket should still be reachable post-probe");
+    // The CRITICAL move: drive the library bootstrap, NOT a bare
+    // `connect`. This is the function `src/bin/la.rs` calls on every
+    // startup. If `la status` / `la doctor` / the TUI ever re-grow a
+    // spawn path that ignores LAZYAGENTS_MANAGED_BY, this assertion
+    // catches it.
+    let outcome = tokio::task::spawn_blocking({
+        let s = socket.clone();
+        move || la_tui::bootstrap::bootstrap_daemon(&s)
+    })
+    .await
+    .expect("bootstrap_daemon task");
 
-    // Give any wayward spawn a chance to show up. 200 ms is generous
-    // — `lad daemonize` would race-spawn within tens of ms on macOS.
+    // Give any wayward spawn a chance to surface in pgrep. 200 ms is
+    // generous — `lad daemonize` would race-spawn within tens of ms
+    // on macOS once it forked.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let after = count_lad_processes();
-    // Cleanup env before asserting so a fail message doesn't leak the
-    // env var into sibling tests.
-    std::env::remove_var("LAZYAGENTS_MANAGED_BY");
+
+    // Restore env BEFORE the assertions so a failure doesn't leak.
+    match prev_managed {
+        Some(v) => std::env::set_var("LAZYAGENTS_MANAGED_BY", v),
+        None => std::env::remove_var("LAZYAGENTS_MANAGED_BY"),
+    }
     if let Some(v) = prev_no_autod {
         std::env::set_var("LAZYAGENTS_NO_AUTODAEMON", v);
-    } else {
-        std::env::remove_var("LAZYAGENTS_NO_AUTODAEMON");
     }
 
+    assert!(
+        matches!(
+            outcome.note,
+            la_tui::bootstrap::BootstrapNote::ManagedBy(ref tag) if tag == "launchd"
+        ),
+        "bootstrap_daemon must short-circuit on LAZYAGENTS_MANAGED_BY=launchd; got {:?}",
+        outcome.note,
+    );
+    assert!(
+        !outcome.connected,
+        "even when the socket is reachable, the MANAGED_BY branch must surface connected=false \
+         so the status bar tells the user the service manager owns lifecycle; got connected=true \
+         which means the env-var short-circuit was reached only because the socket probe failed, \
+         not because the policy fired. That hides regressions where MANAGED_BY would silently \
+         be ignored on a host whose socket happens to be down.",
+    );
+    assert_eq!(
+        after,
+        before,
+        "LAZYAGENTS_MANAGED_BY=launchd must NOT cause any extra lad process to appear; \
+         observed lad-process count went from {before} to {after} (delta = {})",
+        after as isize - before as isize,
+    );
+}
+
+/// Companion to `a6_launchd_short_circuit_does_not_spawn_second_lad`:
+/// the SAME library bootstrap with `LAZYAGENTS_MANAGED_BY` unset
+/// and the socket already up MUST report `AlreadyUp` + connected=true
+/// + no extra lad spawn. This is the "happy path" that proves the
+/// env-var branch above isn't accidentally returning ManagedBy when
+/// the env is empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a6_bootstrap_with_reachable_socket_and_no_env_reports_already_up() {
+    let (_dir, socket, _handle, _join) = bring_up().await;
+
+    let before = count_lad_processes();
+    // Be defensive: a developer machine that has the var set in its
+    // shell would otherwise poison this test. We save / restore.
+    let prev_managed = std::env::var_os("LAZYAGENTS_MANAGED_BY");
+    let prev_no_autod = std::env::var_os("LAZYAGENTS_NO_AUTODAEMON");
+    std::env::remove_var("LAZYAGENTS_MANAGED_BY");
+    std::env::remove_var("LAZYAGENTS_NO_AUTODAEMON");
+
+    let outcome = tokio::task::spawn_blocking({
+        let s = socket.clone();
+        move || la_tui::bootstrap::bootstrap_daemon(&s)
+    })
+    .await
+    .expect("bootstrap_daemon task");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after = count_lad_processes();
+
+    if let Some(v) = prev_managed {
+        std::env::set_var("LAZYAGENTS_MANAGED_BY", v);
+    }
+    if let Some(v) = prev_no_autod {
+        std::env::set_var("LAZYAGENTS_NO_AUTODAEMON", v);
+    }
+
+    assert!(
+        matches!(outcome.note, la_tui::bootstrap::BootstrapNote::AlreadyUp),
+        "expected AlreadyUp with reachable socket and no env, got {:?}",
+        outcome.note,
+    );
+    assert!(outcome.connected, "AlreadyUp must imply connected=true");
     assert_eq!(
         after, before,
-        "LAZYAGENTS_MANAGED_BY=launchd must short-circuit any auto-daemonize; \
-         observed lad-process count went from {before} to {after}",
+        "AlreadyUp must short-circuit before any spawn; observed lad count {before} → {after}",
     );
 }
 

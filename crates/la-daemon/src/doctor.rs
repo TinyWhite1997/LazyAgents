@@ -175,6 +175,7 @@ pub fn run_with_inputs(inputs: &DoctorInputs) -> DoctorReport {
     lines.push(check_daemon_version_match(
         &inputs.server_version,
         inputs.running_daemon_version.as_deref(),
+        inputs.daemon_reachable,
     ));
 
     lines.push(check_state_dir_writable(
@@ -281,7 +282,11 @@ fn check_socket_permissions(socket: &Path) -> CheckLine {
     }
 }
 
-fn check_daemon_version_match(client: &str, daemon: Option<&str>) -> CheckLine {
+fn check_daemon_version_match(
+    client: &str,
+    daemon: Option<&str>,
+    daemon_reachable: bool,
+) -> CheckLine {
     let label = "daemon version".to_string();
     match daemon {
         Some(d) if d == client => CheckLine {
@@ -297,14 +302,29 @@ fn check_daemon_version_match(client: &str, daemon: Option<&str>) -> CheckLine {
                  restart the daemon or upgrade the client"
             ),
         },
-        None => CheckLine {
+        None if !daemon_reachable => CheckLine {
             // The "daemon socket reachable" line already raised
             // Critical; mirror Pass here to avoid double-counting the
-            // same root cause. The detail line still tells the user we
+            // same root cause. The detail still tells the user we
             // couldn't query.
             outcome: CheckOutcome::Pass,
             label,
             detail: format!("client la {client}; daemon unreachable, skipping match"),
+        },
+        None => CheckLine {
+            // Reachable but version handshake failed: socket
+            // connect()ed but the daemon either didn't speak the
+            // initialize/health RPC, timed out, or isn't the lad we
+            // expect (foreign listener on the path, protocol drift,
+            // half-broken daemon mid-restart). Per DoD §"退出码" this
+            // is a critical failure — exit 1.
+            outcome: CheckOutcome::Critical,
+            label,
+            detail: format!(
+                "client la {client}; daemon at the socket connect()s but did not return a \
+                 version — protocol drift, foreign listener on the socket path, or daemon \
+                 mid-restart. Restart `lad start` and re-run `la doctor`."
+            ),
         },
     }
 }
@@ -640,6 +660,73 @@ mod tests {
         let report = run_with_inputs(&inputs);
         assert_eq!(report.tier, ExitTier::Critical, "{}", report.render());
         assert_eq!(report.tier.code(), 1);
+    }
+
+    /// Regression for reviewer blocker #2 (M4.4):
+    /// when the socket is reachable but the daemon doesn't return a
+    /// version (handshake timed out, protocol drift, foreign listener
+    /// on the path, daemon mid-restart), `daemon version` MUST be
+    /// Critical — exit 1 — not silently skipped to Pass.
+    ///
+    /// Pre-fix code mirrored the `None` arm to Pass to avoid
+    /// double-counting the socket-reachable check; but if the socket
+    /// IS reachable, the Pass mask let exit 0/2 leak out and the
+    /// installer wouldn't bail. We split the `None` arm on
+    /// `daemon_reachable` so only the "unreachable" half mirrors Pass.
+    #[test]
+    fn reachable_socket_with_no_version_is_critical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("lad-1.sock");
+        std::fs::write(&socket, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut inputs = baseline_inputs(tmp.path().to_path_buf());
+        inputs.socket_path = socket;
+        // The TCP/UDS connect succeeded but the version handshake
+        // returned None. This is the exact failure mode the reviewer
+        // called out: protocol drift / foreign listener / half-broken
+        // daemon mid-restart. Must surface as Critical, exit 1.
+        inputs.daemon_reachable = true;
+        inputs.running_daemon_version = None;
+        let report = run_with_inputs(&inputs);
+        assert_eq!(report.tier, ExitTier::Critical, "{}", report.render());
+        assert_eq!(report.tier.code(), 1);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("did not return a version"),
+            "doctor must explain WHY the version line failed when socket is reachable: {rendered}"
+        );
+    }
+
+    /// Companion to `reachable_socket_with_no_version_is_critical`:
+    /// when the socket is unreachable, the version line must NOT
+    /// re-raise Critical — the socket-reachable line already did so,
+    /// and double-counting one root cause would confuse the post-install
+    /// hook UX (two ✗ lines, same restart fix).
+    #[test]
+    fn unreachable_socket_keeps_version_line_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inputs = baseline_inputs(tmp.path().to_path_buf());
+        // No socket file → reachable=false, version=None.
+        inputs.daemon_reachable = false;
+        inputs.running_daemon_version = None;
+        let report = run_with_inputs(&inputs);
+        // Critical via the socket-reachable line, not via the version
+        // line. We assert by walking the lines.
+        let version_line = report
+            .lines
+            .iter()
+            .find(|l| l.label == "daemon version")
+            .expect("version line present");
+        assert_eq!(
+            version_line.outcome,
+            CheckOutcome::Pass,
+            "unreachable socket must NOT also red-line `daemon version`: {}",
+            version_line.detail
+        );
     }
 
     #[test]

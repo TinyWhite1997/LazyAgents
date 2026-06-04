@@ -17,6 +17,7 @@ la-proto = { path = "../../crates/la-proto" }
 la-ipc = { path = "../../crates/la-ipc" }
 la-adapter = { path = "../../crates/la-adapter" }
 la-daemon = { path = "../../crates/la-daemon" }
+la-tui = { path = "../../crates/la-tui" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["process"] }

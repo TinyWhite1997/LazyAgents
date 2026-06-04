@@ -1270,6 +1270,7 @@ dependencies = [
  "la-daemon",
  "la-ipc",
  "la-proto",
+ "la-tui",
  "libc",
  "nix 0.29.0",
  "serde",

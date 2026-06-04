@@ -35,7 +35,7 @@
 //! its `runs` row), then the scheduler control channel is closed.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -110,6 +110,17 @@ pub struct SchedulerServices {
     /// Hard ceiling on global running cron-spawned runs. Read by RPC
     /// handlers that surface the admission decision (e.g. `crons.run_now`).
     pub config: SchedulerConfig,
+    /// Live count of fires currently buffered in the heap→executor
+    /// `mpsc::Receiver` (the "queue" the `scheduler.health.queue_depth`
+    /// field describes). Sampled by the executor on each loop tick from
+    /// `Receiver::len()` and by the publish loop directly. This is
+    /// strictly orthogonal to [`Self::running_global`]: a fire that has
+    /// been popped from the channel and is mid-admission is **not**
+    /// counted here even though it's in flight, and a fire produced by
+    /// the heap that the executor hasn't drained yet **is** counted
+    /// here even though no run row exists. Conflating the two would
+    /// hide the actual back-pressure signal the status bar needs.
+    pub queue_depth: Arc<AtomicU32>,
     /// Live count of in-flight cron-spawned runs. Bumped by the executor
     /// while the admission lock is held; decremented on terminal finish.
     /// The admission gate snapshot reads from this rather than the
@@ -228,6 +239,7 @@ impl SchedulerServices {
         let admission_lock = Arc::new(Mutex::new(()));
         let errors_window = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
         let throttled_by_loadavg = Arc::new(AtomicBool::new(false));
+        let queue_depth = Arc::new(AtomicU32::new(0));
         let executor_shutdown = Arc::new(Notify::new());
         let scheduler_health_shutdown = Arc::new(Notify::new());
         let scheduler_health_shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -248,6 +260,7 @@ impl SchedulerServices {
             running_per_cron: running_per_cron.clone(),
             errors_window: errors_window.clone(),
             throttled_by_loadavg: throttled_by_loadavg.clone(),
+            queue_depth: queue_depth.clone(),
             shutdown_poll: config.shutdown_poll,
         };
         let executor_loop = spawn_executor(executor_cfg, fires, executor_shutdown.clone());
@@ -259,6 +272,7 @@ impl SchedulerServices {
             running_per_cron: running_per_cron.clone(),
             errors_window: errors_window.clone(),
             throttled_by_loadavg: throttled_by_loadavg.clone(),
+            queue_depth: queue_depth.clone(),
             interval: config.scheduler_health_interval,
             // Dedicated notifier (paired with `shutdown_flag`) so the
             // loop joins cleanly inside `Self::shutdown` even when the
@@ -271,6 +285,7 @@ impl SchedulerServices {
         Ok(Self {
             handle,
             config,
+            queue_depth,
             running_global,
             running_per_cron,
             admission_lock,
@@ -480,6 +495,13 @@ struct ExecutorConfig {
     /// Set when admission defers a fire because loadavg exceeds the
     /// configured threshold; cleared on any non-loadavg-defer outcome.
     throttled_by_loadavg: Arc<AtomicBool>,
+    /// Mirror of the `mpsc::Receiver::len()` between the heap and the
+    /// executor. The executor restamps it every loop tick so the
+    /// `scheduler.health.queue_depth` field reads a true buffered-fires
+    /// count instead of being conflated with `running_global`. Stored
+    /// as `Arc<AtomicU32>` rather than read on-demand because the
+    /// publish loop can't see the executor's owned receiver.
+    queue_depth: Arc<AtomicU32>,
     shutdown_poll: StdDuration,
 }
 
@@ -490,18 +512,28 @@ fn spawn_executor(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            // Restamp the queue-depth gauge on every loop tick so the
+            // publish loop has a fresh number even between recv() calls.
+            // tokio's `Receiver::len()` is O(1) and lock-free.
+            cfg.queue_depth.store(fires.len() as u32, Ordering::Relaxed);
             tokio::select! {
                 biased;
                 _ = shutdown.notified() => {
                     // Drain remaining buffered fires so admission writes complete.
                     drain_remaining_fires(&cfg, &mut fires).await;
+                    cfg.queue_depth.store(0, Ordering::Relaxed);
                     break;
                 }
                 maybe_fire = fires.recv() => {
+                    // Snapshot length AFTER recv so the gauge tracks "what's
+                    // still buffered after we pulled this one off".
+                    cfg.queue_depth
+                        .store(fires.len() as u32, Ordering::Relaxed);
                     match maybe_fire {
                         Some(fire) => process_fire(&cfg, fire).await,
                         None => {
                             tracing::info!("fire channel closed; scheduler executor exiting");
+                            cfg.queue_depth.store(0, Ordering::Relaxed);
                             break;
                         }
                     }
@@ -516,6 +548,7 @@ fn spawn_executor(
 
 async fn drain_remaining_fires(cfg: &ExecutorConfig, fires: &mut mpsc::Receiver<FireEvent>) {
     while let Ok(fire) = fires.try_recv() {
+        cfg.queue_depth.store(fires.len() as u32, Ordering::Relaxed);
         process_fire(cfg, fire).await;
     }
 }
@@ -1120,6 +1153,9 @@ pub(crate) struct SchedulerHealthLoopConfig {
     pub(crate) running_per_cron: Arc<Mutex<HashMap<String, u32>>>,
     pub(crate) errors_window: Arc<Mutex<VecDeque<Instant>>>,
     pub(crate) throttled_by_loadavg: Arc<AtomicBool>,
+    /// Buffered-fires gauge maintained by the executor. See the field
+    /// of the same name on [`ExecutorConfig`].
+    pub(crate) queue_depth: Arc<AtomicU32>,
     pub(crate) interval: StdDuration,
     pub(crate) shutdown: Arc<Notify>,
     /// Stored shutdown bit. Set to `true` *before* `shutdown.notify_waiters()`
@@ -1187,17 +1223,15 @@ async fn publish_scheduler_health(cfg: &SchedulerHealthLoopConfig) {
             None
         }
     };
-    // Read the queue indirectly: the heap's snapshot length is *not* the
-    // queue depth between heap and executor. We model `queue_depth` as
-    // the number of currently in-flight admissions (executor has popped
-    // a fire but not yet completed processing). Practically that's the
-    // same as `running_global` while the executor is single-threaded:
-    // every fire that's been popped is either rejected (no impact) or
-    // produces a run that increments `running_global`. Until we have a
-    // dedicated buffered-fires counter, surfacing `running_global` here
-    // is the honest upper bound — the wire shape is stable so we can
-    // tighten the source later without breaking clients.
-    let queue_depth = running_global;
+    // Heap→executor buffered-fires count. Updated by the executor every
+    // loop tick via `Receiver::len()`; reading the AtomicU32 here gives
+    // the publish loop a fresh snapshot without contending the executor's
+    // owned receiver. This is **distinct from** `running_global` per the
+    // wire docs on `SchedulerHealthParams::queue_depth`: a single fire
+    // that is mid-admission (popped from the channel, not yet in `runs`)
+    // shows on neither gauge; the depth strictly tracks fires the heap
+    // produced but the executor hasn't drained yet.
+    let queue_depth = cfg.queue_depth.load(Ordering::Relaxed);
     let throttled_by_loadavg = cfg.throttled_by_loadavg.load(Ordering::Relaxed);
 
     let params = SchedulerHealthParams {
@@ -1208,6 +1242,7 @@ async fn publish_scheduler_health(cfg: &SchedulerHealthLoopConfig) {
         errors_last_5m,
         next_fire,
     };
+    metrics::gauge!("lad_scheduler_queue_depth").set(queue_depth as f64);
     metrics::gauge!("lad_scheduler_running_global").set(running_global as f64);
     metrics::gauge!("lad_scheduler_errors_last_5m").set(errors_last_5m as f64);
     cfg.bus.publish(BusEvent::SchedulerHealth(params));
@@ -1347,6 +1382,7 @@ pub async fn run_now(
         running_per_cron: services.running_per_cron.clone(),
         errors_window: services.errors_window.clone(),
         throttled_by_loadavg: services.throttled_by_loadavg.clone(),
+        queue_depth: services.queue_depth.clone(),
         shutdown_poll: services.config.shutdown_poll,
     };
     let fire = FireEvent {
@@ -1638,6 +1674,7 @@ mod tests {
             running_per_cron: Arc::new(Mutex::new(HashMap::new())),
             errors_window: Arc::new(Mutex::new(VecDeque::new())),
             throttled_by_loadavg: Arc::new(AtomicBool::new(false)),
+            queue_depth: Arc::new(AtomicU32::new(0)),
             shutdown_poll: StdDuration::from_millis(100),
         }
     }
@@ -1838,10 +1875,18 @@ mod tests {
                 Ok(Ok(BusEvent::SchedulerHealth(params))) => {
                     // Shape assertions: every field on the wire MUST be
                     // present and read by the field names the DoD pinned.
+                    // With no admit / no enqueue happening in this test
+                    // body, both queue_depth and running_global start at
+                    // 0 — but they are NOT the same signal in general
+                    // (see the wire docs on
+                    // `SchedulerHealthParams::queue_depth`).
                     assert_eq!(
-                        params.queue_depth, params.running_global,
-                        "queue_depth currently mirrors running_global; if this changes, \
-                         update the doc comment in publish_scheduler_health()"
+                        params.queue_depth, 0,
+                        "no fire has been produced yet, the heap→executor channel must be empty"
+                    );
+                    assert_eq!(
+                        params.running_global, 0,
+                        "no admit has happened yet, running_global must be 0"
                     );
                     assert!(
                         params.running_per_cron.is_empty(),
@@ -1866,6 +1911,75 @@ mod tests {
         assert!(
             saw_scheduler_health,
             "expected at least one SchedulerHealth event on the bus within ~4 s"
+        );
+
+        services.shutdown().await;
+    }
+
+    /// Regression for reviewer blocker #1 (M4.4):
+    /// `scheduler.health.queue_depth` MUST NOT be conflated with
+    /// `running_global`. The pre-fix code set
+    /// `queue_depth = running_global`, which meant a daemon running 2
+    /// concurrent fires with an empty heap→executor channel would
+    /// falsely report `queue_depth=2`. The fix wires queue_depth to the
+    /// executor's `mpsc::Receiver::len()` snapshot.
+    ///
+    /// Demo: bump `running_global` to 3 directly (the executor would
+    /// normally do this under the admission lock) and prove the health
+    /// pulse still reports `queue_depth=0` because no fire has been
+    /// produced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduler_health_queue_depth_is_decoupled_from_running_global() {
+        let (_dir, storage, adapters, manager, _cron) = fixture().await;
+        let bus = manager.bus();
+        let mut rx = bus.subscribe();
+        let daemon_shutdown = Arc::new(Notify::new());
+        let mut config = SchedulerConfig::default();
+        config.scheduler_health_interval = StdDuration::from_millis(30);
+        let services = SchedulerServices::start(
+            storage.clone(),
+            manager,
+            adapters,
+            config,
+            daemon_shutdown.clone(),
+        )
+        .await
+        .expect("scheduler boots");
+
+        // Pretend three runs are in flight even though no fire was ever
+        // pushed through the heap→executor channel. The DoD says the
+        // status bar must be able to distinguish "3 jobs running, empty
+        // queue" from "0 running, 3 piled up in the queue"; the old
+        // wiring couldn't tell the two apart.
+        {
+            let mut g = services.running_global.lock().await;
+            *g = 3;
+        }
+
+        let mut saw_pulse = false;
+        for _ in 0..30 {
+            match tokio::time::timeout(StdDuration::from_millis(200), rx.recv()).await {
+                Ok(Ok(BusEvent::SchedulerHealth(params))) => {
+                    if params.running_global != 3 {
+                        // Stale pulse from before we bumped the mutex; keep
+                        // draining until the executor sees the new value.
+                        continue;
+                    }
+                    assert_eq!(
+                        params.queue_depth, 0,
+                        "queue_depth is the heap→executor channel length, not running_global; \
+                         3 jobs running with an empty queue must read queue_depth=0"
+                    );
+                    saw_pulse = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        assert!(
+            saw_pulse,
+            "expected a SchedulerHealth pulse with running_global=3 within ~6 s"
         );
 
         services.shutdown().await;

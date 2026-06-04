@@ -52,6 +52,7 @@
 //! The binary entry point is in `src/bin/la.rs`.
 
 pub mod app;
+pub mod bootstrap;
 pub mod composer;
 pub mod crons;
 pub mod detach_notice;
