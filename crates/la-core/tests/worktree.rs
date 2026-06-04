@@ -17,6 +17,10 @@
 //! - **failure rollback**: `create_failure_rolls_back` proves a failed
 //!   `git worktree add` leaves no row, no directory, and no branch.
 
+// Drives `ShellAdapter` (unix `#!/bin/sh` scripts). Gated to unix
+// for WEK-72 matrix CI on windows-2022.
+#![cfg(unix)]
+
 mod support;
 
 use std::path::{Path, PathBuf};

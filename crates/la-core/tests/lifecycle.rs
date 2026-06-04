@@ -12,6 +12,12 @@
 //! Also exercises the orphan reaper and the writer-lock invariant so a
 //! future refactor can't quietly regress §3.
 
+// `ShellAdapter` spawns `#!/bin/sh` scripts — unix-only. The Windows
+// session-lifecycle path is exercised by integration tests that use
+// real adapter binaries. Gating the whole file keeps WEK-72's
+// matrix CI green on windows-2022.
+#![cfg(unix)]
+
 mod support;
 
 use std::time::Duration;
