@@ -482,15 +482,14 @@ pub fn probe_daemon_reachable(socket: &Path) -> bool {
     };
     rt.block_on(async {
         let endpoint = endpoint_for(socket);
-        match tokio::time::timeout(
-            Duration::from_millis(250),
-            la_ipc::transport::connect(&endpoint),
+        matches!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                la_ipc::transport::connect(&endpoint),
+            )
+            .await,
+            Ok(Ok(_))
         )
-        .await
-        {
-            Ok(Ok(_)) => true,
-            _ => false,
-        }
     })
 }
 

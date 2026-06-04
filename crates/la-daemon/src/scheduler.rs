@@ -1096,7 +1096,7 @@ fn prune_error_window(window: &mut VecDeque<Instant>) {
         // Daemon just booted; nothing to prune.
         None => return,
     };
-    while window.front().map_or(false, |&t| t < cutoff) {
+    while window.front().is_some_and(|&t| t < cutoff) {
         window.pop_front();
     }
 }
