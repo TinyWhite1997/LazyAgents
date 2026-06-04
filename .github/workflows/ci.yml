@@ -70,6 +70,16 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets
 
+      # WEK-72 DoD #1: cross-platform sanity check that the daemon's
+      # example config parses + validates everywhere. WEK-71 merged in
+      # PR #56, so per the WEK-72 / WEK-71 协作 clause this PR (the
+      # later-merging one) wires the step in.
+      - name: lad config check (example template)
+        shell: bash
+        run: |
+          cargo run -p la-daemon --bin lad -- config check \
+            --config crates/la-daemon/templates/config.example.toml
+
       # Folded in from the retired m2-smoke.yml — snapshots are useful for
       # diagnosing failures across runners, so upload per OS.
       - name: upload m2-smoke snapshots
@@ -79,14 +89,3 @@ jobs:
           name: m2-smoke-snapshots-${{ matrix.os }}
           path: target/m2-smoke/snapshots/
           if-no-files-found: warn
-
-      # WEK-72 DoD #1 step (lad config check): blocked on WEK-71 (M4.2)
-      # merging the `lad config` subcommand and the example template
-      # `crates/la-daemon/templates/config.example.toml`. Per the DoD,
-      # whichever PR lands second is the one that wires this step in.
-      # If WEK-71 merges first, uncomment and run on all matrix OSes:
-      #
-      # - name: lad config check (example template)
-      #   shell: bash
-      #   run: cargo run -p la-daemon --bin lad -- config check \
-      #          --config crates/la-daemon/templates/config.example.toml
