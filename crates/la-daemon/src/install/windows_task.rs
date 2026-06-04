@@ -162,6 +162,12 @@ impl ServiceController for WindowsTaskController {
                 format!("would run schtasks /Run /TN {}", self.paths.task_name),
             ));
         }
+        if !self.task_exists() {
+            return Ok(ActionOutcome::already(
+                ServiceVerb::Start,
+                format!("{} not installed", self.paths.task_name),
+            ));
+        }
         let out = require_schtasks(&["/Run", "/TN", &self.paths.task_name])?;
         if out.status.success() {
             Ok(ActionOutcome::done(
@@ -191,6 +197,12 @@ impl ServiceController for WindowsTaskController {
                 format!("would run schtasks /End /TN {}", self.paths.task_name),
             ));
         }
+        if !self.task_exists() {
+            return Ok(ActionOutcome::already(
+                ServiceVerb::Stop,
+                format!("{} not installed", self.paths.task_name),
+            ));
+        }
         let out = require_schtasks(&["/End", "/TN", &self.paths.task_name])?;
         if out.status.success() {
             Ok(ActionOutcome::done(
@@ -218,6 +230,12 @@ impl ServiceController for WindowsTaskController {
                     "would run schtasks /Change /TN {} /DISABLE",
                     self.paths.task_name
                 ),
+            ));
+        }
+        if !self.task_exists() {
+            return Ok(ActionOutcome::already(
+                ServiceVerb::Disable,
+                format!("{} not installed", self.paths.task_name),
             ));
         }
         let out = require_schtasks(&["/Change", "/TN", &self.paths.task_name, "/DISABLE"])?;
@@ -372,5 +390,63 @@ mod tests {
         let err = ctrl.rendered_task_xml(&c).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("SYSTEM"), "{msg}");
+    }
+
+    #[test]
+    fn rendered_xml_declaration_matches_file_encoding() {
+        // The file is written as raw UTF-8 bytes (`rendered.as_bytes()`),
+        // so the XML declaration MUST advertise UTF-8 — otherwise
+        // `schtasks /Create /XML` refuses the file on real Windows.
+        let c = ctx();
+        let ctrl = WindowsTaskController::from_ctx(&c);
+        let rendered = ctrl.rendered_task_xml(&c).unwrap();
+        let first_line = rendered.lines().next().unwrap();
+        assert!(
+            first_line.contains("encoding=\"UTF-8\""),
+            "XML declaration must say UTF-8 (matches as_bytes() write): {first_line:?}"
+        );
+        // And the body must be valid UTF-8 (sanity, since as_bytes() can't fail).
+        assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn clean_host_uninstall_round_trip_is_idempotent() {
+        // On a clean host (no `schtasks.exe`, or task never installed),
+        // `disable` / `stop` / `uninstall` must all short-circuit to
+        // `Already`. We can't shell out to a real schtasks from this
+        // unit test, but we can exercise the early-return branch by
+        // pointing `task_exists()` at a name that doesn't resolve and
+        // observing that no command is dispatched.
+        //
+        // `task_exists()` already returns `false` when `schtasks` is
+        // missing or the query fails — that's enough to prove the
+        // idempotent path; integration coverage on real Windows lives
+        // in WEK-72's matrix CI.
+        let c = ctx();
+        let mut ctrl = WindowsTaskController::from_ctx(&c);
+        ctrl.paths.task_name =
+            "\\LazyAgents\\definitely-does-not-exist-wek73-idempotency".to_string();
+
+        // task_exists() must report false (no such task / schtasks missing).
+        assert!(
+            !ctrl.task_exists(),
+            "phantom task must not exist for this test to be meaningful"
+        );
+
+        // Build a non-dry-run ctx so we go through the real branches.
+        let mut live = ctx();
+        live.dry_run = false;
+        for outcome in [
+            ctrl.disable(&live)
+                .expect("disable must not error on clean host"),
+            ctrl.stop(&live).expect("stop must not error on clean host"),
+            ctrl.uninstall(&live)
+                .expect("uninstall must not error on clean host"),
+        ] {
+            assert!(
+                matches!(outcome, ActionOutcome::Already { .. }),
+                "expected Already on clean host, got {outcome:?}"
+            );
+        }
     }
 }
