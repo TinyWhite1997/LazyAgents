@@ -41,6 +41,7 @@ use la_tui::{App, AppMsg, MockSessionSource};
 use tokio::runtime::Runtime;
 
 const AUTO_DAEMON_ENV: &str = "LAZYAGENTS_NO_AUTODAEMON";
+const MANAGED_BY_ENV: &str = "LAZYAGENTS_MANAGED_BY";
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Parse result for the top-level CLI flags. Anything other than
@@ -89,6 +90,8 @@ fn print_help() {
     println!();
     println!("ENV:");
     println!("  LAZYAGENTS_NO_AUTODAEMON=1   skip auto-spawning `lad daemonize`");
+    println!("  LAZYAGENTS_MANAGED_BY=<tag>  declared by service units (systemd/launchd/");
+    println!("                               windows-task); also disables auto-daemonize");
     println!("  LAZYAGENTS_UPDATE_MANIFEST_URL  override the --check-update endpoint");
 }
 
@@ -230,6 +233,11 @@ enum BootstrapNote {
     DaemonBinaryMissing,
     /// We tried to spawn but the daemon didn't come up in time / failed.
     SpawnFailed(String),
+    /// `LAZYAGENTS_MANAGED_BY=<tag>` is set: a service manager
+    /// (`systemd` / `launchd` / `windows-task`) owns the daemon's
+    /// lifecycle so `la` declines to auto-daemonize even if the socket
+    /// isn't reachable. WEK-73 / S1.
+    ManagedBy(String),
 }
 
 impl BootstrapOutcome {
@@ -247,6 +255,9 @@ impl BootstrapOutcome {
                 "no daemon (lad not on PATH); start with `lad daemonize`".to_string()
             }
             BootstrapNote::SpawnFailed(why) => format!("daemon spawn failed: {why}"),
+            BootstrapNote::ManagedBy(tag) => {
+                format!("daemon managed by {tag}; expected at {}", socket.display())
+            }
         }
     }
 }
@@ -274,6 +285,21 @@ fn bootstrap_daemon(socket: &Path) -> BootstrapOutcome {
         return BootstrapOutcome {
             connected: true,
             note: BootstrapNote::AlreadyUp,
+        };
+    }
+    // S1 / WEK-73: when the daemon is registered with a service
+    // manager, lifecycle is owned by that manager — `la` must NOT race
+    // it by also spawning `lad daemonize`. We treat
+    // LAZYAGENTS_MANAGED_BY exactly like LAZYAGENTS_NO_AUTODAEMON but
+    // surface a friendlier note so the user knows why the TUI is
+    // declining to spawn.
+    if let Some(tag) = std::env::var_os(MANAGED_BY_ENV)
+        .and_then(|v| v.into_string().ok())
+        .filter(|s| !s.is_empty())
+    {
+        return BootstrapOutcome {
+            connected: false,
+            note: BootstrapNote::ManagedBy(tag),
         };
     }
     if std::env::var_os(AUTO_DAEMON_ENV).is_some() {

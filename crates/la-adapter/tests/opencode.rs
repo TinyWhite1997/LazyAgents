@@ -286,18 +286,23 @@ async fn discover_reads_flat_layout() {
     let file_b = root.join("ses_bbbbbbbbbbbbbbbbbbbb.json");
     fs::write(
         &file_a,
-        format!(
-            "{{\"id\":\"ses_aaaaaaaaaaaaaaaaaaaa\",\"cwd\":\"{}\",\"title\":\"alpha\"}}",
-            proj_a.display()
-        ),
+        // serde_json escapes Windows backslashes so the body remains
+        // valid JSON regardless of the host filesystem encoding.
+        serde_json::to_string(&serde_json::json!({
+            "id": "ses_aaaaaaaaaaaaaaaaaaaa",
+            "cwd": proj_a.display().to_string(),
+            "title": "alpha",
+        }))
+        .unwrap(),
     )
     .unwrap();
     fs::write(
         &file_b,
-        format!(
-            "{{\"id\":\"ses_bbbbbbbbbbbbbbbbbbbb\",\"cwd\":\"{}\"}}",
-            proj_b.display()
-        ),
+        serde_json::to_string(&serde_json::json!({
+            "id": "ses_bbbbbbbbbbbbbbbbbbbb",
+            "cwd": proj_b.display().to_string(),
+        }))
+        .unwrap(),
     )
     .unwrap();
 
@@ -355,10 +360,13 @@ async fn discover_reads_nested_envelope() {
     let file = nested.join("ses_cccccccccccccccccccc.json");
     fs::write(
         &file,
-        format!(
-            "{{\"meta\":{{\"id\":\"ses_cccccccccccccccccccc\",\"worktree\":\"{}\"}}}}",
-            proj.display()
-        ),
+        serde_json::to_string(&serde_json::json!({
+            "meta": {
+                "id": "ses_cccccccccccccccccccc",
+                "worktree": proj.display().to_string(),
+            }
+        }))
+        .unwrap(),
     )
     .unwrap();
 

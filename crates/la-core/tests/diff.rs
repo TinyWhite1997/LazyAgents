@@ -44,6 +44,11 @@ async fn make_repo() -> (TempDir, PathBuf) {
     run_git(&repo, &["config", "user.email", "t@e.com"]).await;
     run_git(&repo, &["config", "user.name", "t"]).await;
     run_git(&repo, &["config", "commit.gpgsign", "false"]).await;
+    // Windows git ships with `core.autocrlf=true` by default, which
+    // would rewrite "hi\n" → "hi\r\n" on checkout and break the byte
+    // comparisons below. Pin LF for the fixture repo.
+    run_git(&repo, &["config", "core.autocrlf", "false"]).await;
+    run_git(&repo, &["config", "core.eol", "lf"]).await;
     tokio::fs::write(repo.join("README.md"), "hi\n")
         .await
         .unwrap();

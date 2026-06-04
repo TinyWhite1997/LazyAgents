@@ -9,6 +9,11 @@
 //! > Story 'Agent edited 10 files' reviews smoothly
 //! > Discard has 二次确认 (double confirmation)
 
+// Talks to the daemon over UDS; the Windows pipe path is exercised
+// by separate Windows-specific tests. Gating the whole file keeps
+// the WEK-72 matrix CI green on windows-2022.
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

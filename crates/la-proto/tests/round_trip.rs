@@ -823,6 +823,7 @@ fn cron_fired_and_daemon_health_round_trip() {
         running: 7,
         errors_last_5m: 0,
         backends: Vec::new(),
+        managed_by: None,
     };
     let n = Notification::new(DaemonHealth::NAME, &health).unwrap();
     let back: DaemonHealthParams =
@@ -886,6 +887,7 @@ fn daemon_health_backends_status_serializes_as_snake_case() {
                 last_probed_at: "2026-06-02T00:00:00Z".into(),
             },
         ],
+        managed_by: None,
     };
     let s = serde_json::to_string(&health).unwrap();
     // Status strings on the wire must be snake_case (TUI relies on this
@@ -1158,7 +1160,12 @@ fn schema_files_match_generated_output() {
                 continue;
             }
         };
-        if got != *want {
+        // The generator writes LF (`json + "\n"`) and the goldens are
+        // pinned to LF by .gitattributes. Belt-and-braces: normalize
+        // CRLF -> LF in case Git on Windows still rewrites checkouts
+        // (e.g. on a fork without our .gitattributes applied yet).
+        let got_norm = got.replace("\r\n", "\n");
+        if got_norm != *want {
             drifted.push(name.clone());
         }
     }

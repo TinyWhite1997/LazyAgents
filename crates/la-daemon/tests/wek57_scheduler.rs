@@ -12,6 +12,10 @@
 //! 5. Graceful shutdown: buffered fires drain into `runs` before
 //!    `Daemon::accept_loop` returns; no admission writes are lost.
 
+// Talks to the daemon over UDS; gated to unix for the WEK-72 matrix
+// CI. The Windows pipe path has its own coverage.
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

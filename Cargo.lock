@@ -1009,6 +1009,7 @@ dependencies = [
  "la-pty",
  "la-scheduler",
  "la-storage",
+ "libc",
  "metrics",
  "nix 0.29.0",
  "serde",
@@ -1018,6 +1019,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

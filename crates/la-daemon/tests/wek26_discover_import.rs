@@ -10,6 +10,11 @@
 //! - A second import call is idempotent — same `session_id` comes back,
 //!   no duplicate row.
 
+// Daemon IPC is UDS-only on unix; the Windows named-pipe path is
+// covered by separate tests. Gating the whole file keeps the WEK-72
+// matrix CI green without piecemeal `#[cfg(unix)]` annotations.
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

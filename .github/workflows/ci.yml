@@ -82,6 +82,30 @@ jobs:
           cargo run -p la-daemon --bin lad -- config check \
             --config crates/la-daemon/templates/config.example.toml
 
+      # WEK-73 / M4.1 DoD: dry-run lad install / uninstall on the native
+      # service mode per OS so a broken template renderer trips CI
+      # without depending on root / launchd / Scheduled Task perms.
+      - name: lad install --dry-run (systemd)
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          cargo run -q -p la-daemon --bin lad -- install --service systemd --dry-run
+          cargo run -q -p la-daemon --bin lad -- uninstall --service systemd --dry-run
+
+      - name: lad install --dry-run (launchd)
+        if: matrix.os == 'macos-14' || matrix.os == 'macos-13'
+        shell: bash
+        run: |
+          cargo run -q -p la-daemon --bin lad -- install --service launchd --dry-run
+          cargo run -q -p la-daemon --bin lad -- uninstall --service launchd --dry-run
+
+      - name: lad install --dry-run (windows-task)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          cargo run -q -p la-daemon --bin lad -- install --service windows-task --dry-run
+          cargo run -q -p la-daemon --bin lad -- uninstall --service windows-task --dry-run
+
       # Folded in from the retired m2-smoke.yml — snapshots are useful for
       # diagnosing failures across runners, so upload per OS.
       - name: upload m2-smoke snapshots

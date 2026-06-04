@@ -16,6 +16,12 @@
 //! when `LAD_BIN` is unset so PR CI doesn't depend on `cargo build`
 //! having been run first.
 
+// Every fixture in this file uses the daemon's UDS path
+// (`tokio::net::UnixStream`). The Windows named-pipe path is exercised
+// by separate tests; gating the whole file to unix keeps the WEK-72
+// matrix CI green on windows-2022.
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};

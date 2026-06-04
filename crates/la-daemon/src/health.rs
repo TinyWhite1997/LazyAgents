@@ -261,6 +261,11 @@ async fn probe_once_and_broadcast(cfg: &ProbeLoopConfig) {
             .filter(|b| b.status != BackendHealthStatus::Available)
             .count() as u32,
         backends: wire_entries,
+        // S1 / WEK-73: surface the supervising service manager so the
+        // TUI status bar can label the daemon's origin without
+        // querying systemd/launchd itself. `LAZYAGENTS_MANAGED_BY` is
+        // set by the service unit templates we install in M4.1.
+        managed_by: crate::install::detect_running_service(),
     };
     cfg.bus.publish(BusEvent::DaemonHealth(params));
 }

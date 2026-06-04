@@ -228,18 +228,38 @@ async fn discover_reads_nested_rollout_layout() {
 
     fs::write(
         &file_a,
-        format!(
-            "{{\"timestamp\":\"2026-06-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019e0000-0000-0000-0000-000000000000\",\"timestamp\":\"2026-06-02T10:00:00Z\",\"cwd\":\"{}\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.135.0\"}}}}\n{{\"type\":\"task_started\"}}\n",
-            proj_a.display()
-        ),
+        // serde_json escapes backslashes so Windows paths land in the
+        // body as valid JSON instead of an invalid `"C:\Users\..."`.
+        serde_json::to_string(&serde_json::json!({
+            "timestamp": "2026-06-02T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "019e0000-0000-0000-0000-000000000000",
+                "timestamp": "2026-06-02T10:00:00Z",
+                "cwd": proj_a.display().to_string(),
+                "originator": "codex_cli_rs",
+                "cli_version": "0.135.0",
+            }
+        }))
+        .unwrap()
+            + "\n{\"type\":\"task_started\"}\n",
     )
     .unwrap();
     fs::write(
         &file_b,
-        format!(
-            "{{\"timestamp\":\"2026-06-02T11:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019e0000-0000-0000-0000-000000000001\",\"timestamp\":\"2026-06-02T11:00:00Z\",\"cwd\":\"{}\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.135.0\"}}}}\n",
-            proj_b.display()
-        ),
+        serde_json::to_string(&serde_json::json!({
+            "timestamp": "2026-06-02T11:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "019e0000-0000-0000-0000-000000000001",
+                "timestamp": "2026-06-02T11:00:00Z",
+                "cwd": proj_b.display().to_string(),
+                "originator": "codex_cli_rs",
+                "cli_version": "0.135.0",
+            }
+        }))
+        .unwrap()
+            + "\n",
     )
     .unwrap();
 
