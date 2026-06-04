@@ -189,12 +189,17 @@ impl Default for WorktreeConfig {
     }
 }
 
-/// `[adapters.*]` umbrella — known backends are typed; extras land in
-/// `extra` so a workspace adding `[adapters.gemini]` does not crash
-/// `lad config check` today (the daemon will warn that the backend is
-/// unknown at runtime, where the diagnostic is meaningful).
+/// `[adapters.*]` umbrella. Known backends (`claude / codex / opencode`)
+/// are typed so `deny_unknown_fields` catches typos *inside* their
+/// tables. Brand-new backends a future daemon may add land in `extra`
+/// instead of failing the schema check, so a user can stage
+/// `[adapters.gemini]` config ahead of the daemon upgrade that
+/// recognises the backend; the daemon emits a runtime warning when it
+/// sees an unknown adapter id, which is the right place for that
+/// diagnostic. Section labels (`[adapters.<backend>]`) themselves are
+/// permissive on purpose — only the inner table fields are strict.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct AdaptersConfig {
     /// Anthropic Claude CLI.
     pub claude: ClaudeConfig,
@@ -202,6 +207,13 @@ pub struct AdaptersConfig {
     pub codex: CodexConfig,
     /// Opencode CLI.
     pub opencode: OpencodeConfig,
+    /// Adapter tables whose id is not yet typed by la-config. Values
+    /// share the generic [`AdapterConfig`] shape; per-backend keys that
+    /// don't fit `command / extra_args / env` will fail
+    /// `deny_unknown_fields` on `AdapterConfig` (so typo-resistance is
+    /// preserved at the field level even when the backend id is new).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, AdapterConfig>,
 }
 
 /// Generic per-adapter knobs shared across the typed backends.

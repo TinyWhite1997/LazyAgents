@@ -373,16 +373,19 @@ fn render(
     ));
 
     out.push_str("\n[scheduler]\n");
-    let sched_source = scheduler_source(file);
+    let sched_default = la_config::SchedulerConfig::default();
     out.push_str(&format!(
         "global_max_concurrent_runs = {}  # {}\n",
         file.scheduler.global_max_concurrent_runs,
-        sched_source.label()
+        key_source(
+            file.scheduler.global_max_concurrent_runs == sched_default.global_max_concurrent_runs
+        )
+        .label()
     ));
     out.push_str(&format!(
         "cpu_load_throttle = {}  # {}\n",
         file.scheduler.cpu_load_throttle,
-        sched_source.label()
+        key_source(file.scheduler.cpu_load_throttle == sched_default.cpu_load_throttle).label()
     ));
     out.push_str(&fmt_pathline(
         "archive_dir",
@@ -396,58 +399,67 @@ fn render(
     ));
 
     out.push_str("\n[worktree]\n");
+    let worktree_default = la_config::WorktreeConfig::default();
     out.push_str(&format!(
         "prune_after_days = {}  # {}\n",
         file.worktree.prune_after_days,
-        worktree_source(file).label()
+        key_source(file.worktree.prune_after_days == worktree_default.prune_after_days).label()
     ));
 
     out.push_str("\n[adapters.claude]\n");
-    push_adapter(&mut out, &file.adapters.claude.base, claude_default());
+    push_adapter(&mut out, &file.adapters.claude.base, &claude_default());
     out.push_str("\n[adapters.codex]\n");
-    push_adapter(&mut out, &file.adapters.codex.base, codex_default());
+    push_adapter(&mut out, &file.adapters.codex.base, &codex_default().base);
     out.push_str(&format!(
         "prefer_json_mode = {}  # {}\n",
         file.adapters.codex.prefer_json_mode,
-        if file.adapters.codex.prefer_json_mode == CodexConfig::default().prefer_json_mode {
-            Source::Default.label()
-        } else {
-            Source::ConfigFile.label()
-        }
+        key_source(file.adapters.codex.prefer_json_mode == CodexConfig::default().prefer_json_mode)
+            .label()
     ));
     out.push_str("\n[adapters.opencode]\n");
-    push_adapter(&mut out, &file.adapters.opencode.base, opencode_default());
+    push_adapter(&mut out, &file.adapters.opencode.base, &opencode_default());
+    for (id, cfg) in &file.adapters.extra {
+        out.push_str(&format!("\n[adapters.{id}]\n"));
+        // Whole table came from the file (since the default has no entry
+        // for this id); but still emit per-key labels in case the user
+        // left optional keys empty — that way the output shape matches
+        // the typed adapters above.
+        push_adapter(&mut out, cfg, &AdapterConfig::default());
+    }
 
     out.push_str("\n[ui]\n");
+    let ui_default = la_config::UiConfig::default();
     out.push_str(&format!(
         "theme = {:?}  # {}\n",
         file.ui.theme,
-        if file.ui.theme == la_config::UiConfig::default().theme {
-            Source::Default.label()
-        } else {
-            Source::ConfigFile.label()
-        }
+        key_source(file.ui.theme == ui_default.theme).label()
     ));
     out.push_str(&format!(
         "key_hints = {:?}  # {}\n",
         file.ui.key_hints,
-        if file.ui.key_hints == la_config::UiConfig::default().key_hints {
-            Source::Default.label()
-        } else {
-            Source::ConfigFile.label()
-        }
+        key_source(file.ui.key_hints == ui_default.key_hints).label()
     ));
     out.push_str(&format!(
         "compact = {}  # {}\n",
         file.ui.compact,
-        if file.ui.compact == la_config::UiConfig::default().compact {
-            Source::Default.label()
-        } else {
-            Source::ConfigFile.label()
-        }
+        key_source(file.ui.compact == ui_default.compact).label()
     ));
 
     out
+}
+
+/// Per-key source label helper: a value that matches the built-in
+/// default is reported as `Default`, anything else came from the file
+/// (CLI / env layers for these keys are not supported in v1). Used for
+/// `[scheduler] / [worktree] / [adapters.*] / [ui]` so a user who set
+/// only `cpu_load_throttle = 6.0` does not see `global_max_concurrent_runs`
+/// mis-labelled as `from config`.
+fn key_source(matches_default: bool) -> Source {
+    if matches_default {
+        Source::Default
+    } else {
+        Source::ConfigFile
+    }
 }
 
 fn fmt_pathline(key: &str, value: Option<&Path>, source: Source, default_label: &str) -> String {
@@ -465,53 +477,34 @@ fn fmt_strline(key: &str, value: &str, source: Source) -> String {
     format!("{key} = {:?}  # {}\n", value, source.label())
 }
 
-fn scheduler_source(file: &Config) -> Source {
-    if file.scheduler != la_config::SchedulerConfig::default() {
-        Source::ConfigFile
-    } else {
-        Source::Default
-    }
-}
-
-fn worktree_source(file: &Config) -> Source {
-    if file.worktree != la_config::WorktreeConfig::default() {
-        Source::ConfigFile
-    } else {
-        Source::Default
-    }
-}
-
 fn claude_default() -> AdapterConfig {
     ClaudeConfig::default().base
 }
-fn codex_default() -> AdapterConfig {
-    CodexConfig::default().base
+fn codex_default() -> CodexConfig {
+    CodexConfig::default()
 }
 fn opencode_default() -> AdapterConfig {
     OpencodeConfig::default().base
 }
 
-fn push_adapter(out: &mut String, current: &AdapterConfig, default: AdapterConfig) {
-    let source = if *current == default {
-        Source::Default
-    } else {
-        Source::ConfigFile
-    };
+fn push_adapter(out: &mut String, current: &AdapterConfig, default: &AdapterConfig) {
     out.push_str(&format!(
         "command = {:?}  # {}\n",
         current.command.clone().unwrap_or_default(),
-        source.label()
+        key_source(current.command == default.command).label()
     ));
     out.push_str(&format!(
         "extra_args = {:?}  # {}\n",
         current.extra_args,
-        source.label()
+        key_source(current.extra_args == default.extra_args).label()
     ));
     if !current.env.is_empty() {
         let map: BTreeMap<_, _> = current.env.iter().collect();
         out.push_str(&format!(
             "env = {:?}  # {}\n",
             map,
+            // Non-empty env always comes from the config file (default
+            // is empty); no need for a key_source call.
             Source::ConfigFile.label()
         ));
     }
@@ -572,6 +565,47 @@ foo = "bar"
         let msg = format!("{err}");
         assert!(msg.contains("unknown field"), "got: {msg}");
         assert!(msg.contains("unknown_section"), "got: {msg}");
+    }
+
+    #[test]
+    fn deny_unknown_fields_rejects_unknown_key_inside_typed_adapter() {
+        // Reviewer-flagged serde gotcha: `#[serde(flatten)]` of an inner
+        // struct that itself carries `deny_unknown_fields` can silently
+        // swallow stray keys. Make sure `[adapters.codex].wrong_key`
+        // actually fails — if it ever stops failing, switch the per-
+        // adapter structs to inline fields instead of flatten.
+        let raw = r#"
+[adapters.codex]
+wrong_key = 1
+"#;
+        let err = check_str(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("wrong_key"),
+            "expected serde to reject wrong_key under [adapters.codex]; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_adapter_section_is_accepted_and_lands_in_extra() {
+        // Forward-compat (reviewer item 1, option A): a config that
+        // names a brand-new backend the daemon doesn't yet typecheck
+        // must `lad config check` clean today so users can stage the
+        // value ahead of a daemon upgrade. Runtime rejection of the
+        // unknown adapter is the daemon's job, not the schema's.
+        let raw = r#"
+[adapters.gemini]
+command = "gemini"
+extra_args = ["--json"]
+"#;
+        let cfg = check_str(raw).expect("unknown adapter must not block config check");
+        let gemini = cfg
+            .adapters
+            .extra
+            .get("gemini")
+            .expect("unknown adapter should land in adapters.extra");
+        assert_eq!(gemini.command.as_deref(), Some("gemini"));
+        assert_eq!(gemini.extra_args, vec!["--json".to_string()]);
     }
 
     #[test]
@@ -644,5 +678,52 @@ listen_tcp = "0.0.0.0:7042"
 "#;
         let err = check_str(raw).unwrap_err();
         assert!(format!("{err}").contains("listen_tcp"));
+    }
+
+    #[test]
+    fn show_labels_each_scheduler_key_independently() {
+        // Reviewer item 2: a user who set ONLY `cpu_load_throttle = 6.0`
+        // must see `global_max_concurrent_runs = 8  # from default`
+        // (not `# from config`) — the per-key labelling fix lives or
+        // dies on this case.
+        let raw = "[scheduler]\ncpu_load_throttle = 6.0\n";
+        let file = Config::parse_str(raw).unwrap();
+        let rendered = render(
+            &CliOverrides::default(),
+            &EnvSnapshot::default(),
+            Some(&file),
+            None,
+        );
+        assert!(
+            rendered.contains("cpu_load_throttle = 6  # from config"),
+            "expected cpu_load_throttle labelled 'from config': {rendered}"
+        );
+        assert!(
+            rendered.contains("global_max_concurrent_runs = 8  # from default"),
+            "expected global_max_concurrent_runs labelled 'from default': {rendered}"
+        );
+    }
+
+    #[test]
+    fn show_includes_unknown_adapter_sections_from_extra() {
+        let raw = r#"
+[adapters.gemini]
+command = "gemini"
+"#;
+        let file = Config::parse_str(raw).unwrap();
+        let rendered = render(
+            &CliOverrides::default(),
+            &EnvSnapshot::default(),
+            Some(&file),
+            None,
+        );
+        assert!(
+            rendered.contains("[adapters.gemini]"),
+            "expected unknown adapter table in show output: {rendered}"
+        );
+        assert!(
+            rendered.contains("command = \"gemini\"  # from config"),
+            "expected per-key config source label: {rendered}"
+        );
     }
 }

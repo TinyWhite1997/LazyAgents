@@ -51,6 +51,22 @@ pub fn resolve_config_path() -> ResolvedConfigPath {
 /// write target. Always an absolute path on platforms where `$HOME` /
 /// `%APPDATA%` resolves; falls back to the relative chain head when
 /// neither is set (degraded sandbox).
+///
+/// ⚠️ M4.1 decision point: this "primary at install time" semantics
+/// **pins** whatever path exists when `lad install` runs. If a macOS
+/// user previously kept their config at
+/// `~/Library/Application Support/lazyagents/config.toml`, the plist
+/// will bake that path even after they later delete it and expect the
+/// XDG location to take over — they have to rerun `lad install` to
+/// refresh. The M4.1 owner should decide whether to:
+///   1. Keep `primary()` semantics here and emit a `# pinned at install
+///      time; rerun lad install to refresh` comment in the plist; or
+///   2. Switch the install writer to use [`ResolvedConfigPath::write_target`]
+///      directly so service files always point at the XDG location and
+///      Application Support stays purely a read-time compatibility step.
+///
+/// This crate intentionally does **not** make that decision — both
+/// behaviours are reachable from the same `ResolvedConfigPath`.
 pub fn config_path_for_install() -> PathBuf {
     let resolved = resolve_config_path();
     resolved.primary().clone()
