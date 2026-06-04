@@ -503,12 +503,17 @@ fn run_config(sub: &ConfigSub, p: &Parsed) -> ExitCode {
             }
         }
         ConfigSub::Check => {
-            let path = p.cli_config_path.clone().or_else(|| {
-                la_daemon::config_cmd::EnvSnapshot::from_process()
-                    .config
-                    .or_else(|| la_config::resolve_config_path().existing)
-            });
-            match la_daemon::config_cmd::check(path.as_deref()) {
+            // "explicit" = user (or CI) asked for THIS file. Either CLI
+            // flag `--config <path>` or env `LAZYAGENTS_CONFIG=<path>`
+            // counts; only the resolver-default lookup is implicit.
+            let env_config = la_daemon::config_cmd::EnvSnapshot::from_process().config;
+            let explicit = p.cli_config_path.is_some() || env_config.is_some();
+            let path = p
+                .cli_config_path
+                .clone()
+                .or(env_config)
+                .or_else(|| la_config::resolve_config_path().existing);
+            match la_daemon::config_cmd::check(path.as_deref(), explicit) {
                 Ok(summary) => {
                     if summary.existed {
                         println!(

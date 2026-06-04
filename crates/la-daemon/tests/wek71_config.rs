@@ -206,6 +206,66 @@ fn cli_log_level_typo_is_rejected_not_silently_demoted() {
     );
 }
 
+#[test]
+fn config_check_fails_when_explicit_config_path_is_missing() {
+    // Reviewer round 3 blocker: A1/M4.0.5 CI runs
+    // `lad config check --config templates/config.example.toml`. If
+    // the example ever gets deleted / renamed / CI cwd shifts, the
+    // gate must fail loudly — not exit 0 with "defaults will apply".
+    let Some(lad) = lad_bin() else {
+        assert_skip("LAD_BIN unset; skipping explicit_config_missing");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("does-not-exist.toml");
+    let out = run_lad(
+        &lad,
+        &["config", "check", "--config", missing.to_str().unwrap()],
+    );
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on missing --config; stdout={} stderr={}",
+        out.stdout_str(),
+        out.stderr_str()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("does not exist") && stderr.contains("does-not-exist.toml"),
+        "expected stderr to flag missing explicit path; stderr={stderr}"
+    );
+}
+
+#[test]
+fn config_check_with_env_pointing_at_missing_file_also_fails() {
+    // Same blocker, env channel — LAZYAGENTS_CONFIG=<missing> must
+    // also fail since both CLI and env are explicit "this is the
+    // file" signals.
+    let Some(lad) = lad_bin() else {
+        assert_skip("LAD_BIN unset; skipping env_config_missing");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("missing-from-env.toml");
+    let mut cmd = Command::new(&lad);
+    cmd.args(["config", "check"]);
+    // Strip developer env that could shadow the test.
+    cmd.env_remove("LAZYAGENTS_LOG");
+    cmd.env_remove("LAZYAGENTS_LOG_LEVEL");
+    cmd.env("LAZYAGENTS_CONFIG", &missing);
+    let out = collect(cmd);
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit when LAZYAGENTS_CONFIG points at missing file; stdout={} stderr={}",
+        out.stdout_str(),
+        out.stderr_str()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("does not exist") && stderr.contains("missing-from-env.toml"),
+        "expected stderr to flag missing env path; stderr={stderr}"
+    );
+}
+
 fn run_lad(lad: &Path, args: &[&str]) -> Out {
     let mut cmd = Command::new(lad);
     cmd.args(args);

@@ -86,13 +86,25 @@ pub fn show(overrides: &CliOverrides) -> Result<String, CheckError> {
 /// `lad config check` — schema + cross-field validation against the
 /// given path (defaults to `resolve_config_path()`'s primary).
 ///
-/// Returns `Ok(rendered_summary)` on success; on failure the caller
-/// should print the error and exit non-zero. `deny_unknown_fields` is
-/// enforced by the schema structs themselves — a typo surfaces as a
-/// [`CheckError::Schema`] carrying the offending field name in toml's
-/// human-readable message ("unknown field `sokcet_path`, expected one
-/// of …").
-pub fn check(path: Option<&Path>) -> Result<CheckSummary, CheckError> {
+/// `explicit` distinguishes how the path was chosen:
+///
+/// - `false` — caller did not pass `--config` / `LAZYAGENTS_CONFIG`;
+///   resolver picked the path. A missing file on disk here is fine
+///   (a fresh checkout with no user config falls back to defaults),
+///   so we return `Ok(existed=false)` and let the caller exit 0.
+/// - `true` — caller named a specific file; if it's not on disk that
+///   IS a failure. The A1/M4.0.5 CI hook runs
+///   `lad config check --config templates/config.example.toml`; if the
+///   template ever gets deleted, renamed, or the CI runner's cwd
+///   shifts, exit-0-on-missing would let the gate silently pass and
+///   stop proving the example file exists + parses. Returning
+///   `CheckError::Validation` here forces the gate to fail loudly.
+///
+/// `deny_unknown_fields` is enforced by the schema structs themselves
+/// — a typo surfaces as a [`CheckError::Schema`] carrying the
+/// offending field name in toml's human-readable message
+/// ("unknown field `sokcet_path`, expected one of …").
+pub fn check(path: Option<&Path>, explicit: bool) -> Result<CheckSummary, CheckError> {
     let resolved = resolve_config_path();
     let target = path
         .map(Path::to_path_buf)
@@ -100,9 +112,16 @@ pub fn check(path: Option<&Path>) -> Result<CheckSummary, CheckError> {
         .unwrap_or_else(|| resolved.write_target.clone());
 
     if !target.exists() {
-        // Missing-file is *not* a parse error; report it as a no-op
-        // success so CI on a fresh checkout (where the user has not
-        // shipped a config) does not block the pipeline.
+        if explicit {
+            return Err(CheckError::Validation(format!(
+                "config file {} does not exist (explicit --config / LAZYAGENTS_CONFIG)",
+                target.display()
+            )));
+        }
+        // Missing-file under the resolver-default path is *not* a
+        // parse error; report it as a no-op success so CI on a fresh
+        // checkout (where the user has not shipped a config) does
+        // not block the pipeline.
         return Ok(CheckSummary {
             path: target,
             existed: false,
@@ -834,5 +853,30 @@ command = "gemini"
             ..Default::default()
         };
         validate_cli_env_enums(&overrides, &env).unwrap();
+    }
+
+    #[test]
+    fn check_rejects_explicit_missing_path_but_accepts_implicit_missing() {
+        // Reviewer round 3 blocker: `lad config check --config X.toml`
+        // where X.toml doesn't exist must fail loudly so the A1/M4.0.5
+        // CI gate cannot silently pass after the template gets deleted
+        // or the runner cwd shifts. Implicit (no `--config` flag, no
+        // env override, resolver default also absent) stays Ok so a
+        // fresh checkout without a user config still passes.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.toml");
+
+        // explicit=true → error
+        let err = check(Some(&missing), true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not exist") && msg.contains("does-not-exist.toml"),
+            "expected explicit-missing error to name path: {msg}"
+        );
+
+        // explicit=false → ok(existed=false)
+        let summary = check(Some(&missing), false).unwrap();
+        assert!(!summary.existed);
+        assert_eq!(summary.path, missing);
     }
 }
