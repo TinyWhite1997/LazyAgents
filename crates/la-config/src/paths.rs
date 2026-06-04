@@ -19,13 +19,14 @@ pub struct ResolvedConfigPath {
     /// First chain entry that exists on disk. `None` = no file found.
     pub existing: Option<PathBuf>,
     /// Path the daemon should write to if it needs to materialise a
-    /// fresh default config. Always populated; on macOS still resolves
-    /// to `~/.config/lazyagents/config.toml` (third chain entry), NOT
-    /// `~/Library/Application Support/lazyagents/config.toml`. Rationale
-    /// (A4): the macOS-only entry is a *read* compatibility step so a
-    /// user who copied their config from `Application Support` continues
-    /// to work; writes always go to the XDG-style location so a single
-    /// dotfile sync covers Linux and macOS.
+    /// fresh default config. Always populated. On POSIX (Linux + macOS)
+    /// this is fixed to chain entry 3 — `$HOME/.config/lazyagents/config.toml`
+    /// — regardless of whether `$XDG_CONFIG_HOME` is set, matching the
+    /// issue DoD #4. macOS Application Support is **never** a write
+    /// target (it is purely a read-time compatibility step so a user who
+    /// copied their config from `Application Support` continues to
+    /// work). Windows runs the independent `%APPDATA%\lazyagents\config.toml`
+    /// chain.
     pub write_target: PathBuf,
     /// Full ordered list the chain walked, for `lad config path -v` /
     /// future diagnostics. Always non-empty.
@@ -168,24 +169,27 @@ fn build_chain(env: &EnvLookup) -> Vec<PathBuf> {
 }
 
 /// The path daemon bootstrap should write a fresh default config to.
-/// Matches the third chain entry on POSIX (XDG-style under `$HOME`) and
-/// `%APPDATA%\lazyagents\config.toml` on Windows. Never returns the
-/// macOS-only step — see `ResolvedConfigPath::write_target` docs.
+/// Issue DoD #4 fixes this to "chain entry 3" — `$HOME/.config/lazyagents/
+/// config.toml` on POSIX — regardless of whether `$XDG_CONFIG_HOME` is
+/// set, so an XDG-honouring user and a vanilla user write to the same
+/// place (dotfile sync stays trivial). Windows runs the independent
+/// `%APPDATA%\lazyagents\config.toml` chain. macOS Application Support
+/// is **never** a write target — it is purely a read-time compatibility
+/// entry. See `ResolvedConfigPath::write_target` docs.
 fn default_write_target(env: &EnvLookup) -> PathBuf {
     if cfg!(windows) {
         if let Some(appdata) = &env.appdata {
             return appdata.join("lazyagents").join("config.toml");
         }
-    }
-    if let Some(xdg) = &env.xdg_config_home {
-        return xdg.join("lazyagents").join("config.toml");
+        // Degraded Windows env: fall through to the XDG layout used by
+        // the Linux build so the daemon still has a sane fallback.
     }
     if let Some(home) = &env.home {
         return home.join(".config").join("lazyagents").join("config.toml");
     }
-    // Last-resort literal — extremely degraded env (no HOME, no XDG,
-    // no APPDATA). The daemon will surface the resulting permission
-    // error when it tries to write; better than silently picking `/`.
+    // Last-resort literal — extremely degraded env (no HOME, no APPDATA).
+    // The daemon will surface the resulting permission error when it
+    // tries to write; better than silently picking `/`.
     PathBuf::from(".config/lazyagents/config.toml")
 }
 
@@ -273,7 +277,10 @@ mod tests {
     }
 
     #[test]
-    fn write_target_falls_back_through_xdg_home_literal() {
+    fn write_target_is_home_dotconfig_even_when_xdg_set() {
+        // DoD #4: default write path = chain entry 3
+        // (`$HOME/.config/lazyagents/config.toml`) regardless of XDG.
+        // Earlier draft incorrectly preferred XDG; reviewer caught it.
         let xdg = EnvLookup {
             lazyagents_config: None,
             xdg_config_home: Some(PathBuf::from("/xdg")),
@@ -282,7 +289,7 @@ mod tests {
         };
         assert_eq!(
             default_write_target(&xdg),
-            PathBuf::from("/xdg/lazyagents/config.toml")
+            PathBuf::from("/home/u/.config/lazyagents/config.toml")
         );
 
         let home_only = EnvLookup {
@@ -300,6 +307,24 @@ mod tests {
         assert_eq!(
             default_write_target(&degraded),
             PathBuf::from(".config/lazyagents/config.toml")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_write_target_never_application_support() {
+        // Even if HOME points at a macOS layout and XDG_CONFIG_HOME is
+        // set, write_target stays at $HOME/.config — Application Support
+        // is read-time compat only.
+        let env = EnvLookup {
+            lazyagents_config: None,
+            xdg_config_home: Some(PathBuf::from("/Users/u/CustomXDG")),
+            home: Some(PathBuf::from("/Users/u")),
+            appdata: None,
+        };
+        assert_eq!(
+            default_write_target(&env),
+            PathBuf::from("/Users/u/.config/lazyagents/config.toml")
         );
     }
 

@@ -252,6 +252,12 @@ fn cli_overrides(p: &Parsed) -> la_daemon::config_cmd::CliOverrides {
 fn derive_runtime(p: &Parsed) -> Result<la_daemon::config_cmd::ResolvedDaemonValues, String> {
     let overrides = cli_overrides(p);
     let env = la_daemon::config_cmd::EnvSnapshot::from_process();
+    // Reject typo'd `--log-level` / `LAZYAGENTS_LOG_FORMAT` etc. *before*
+    // we silently demote them to None and fall back to the file/default
+    // layer — otherwise an unrecognised value disappears without an
+    // error and `lad config show` would mis-label the resolved value
+    // as `from default`.
+    la_daemon::config_cmd::validate_cli_env_enums(&overrides, &env).map_err(|e| e.to_string())?;
     let config_path = overrides
         .config_path
         .clone()
@@ -264,6 +270,19 @@ fn derive_runtime(p: &Parsed) -> Result<la_daemon::config_cmd::ResolvedDaemonVal
         ),
         _ => None,
     };
+    // Share `lad config check`'s cross-field validation with the daemon
+    // startup paths so `[daemon].listen_tcp = "..."` cannot pass `check`
+    // but be silently ignored by `start` (reviewer-flagged
+    // "configured but nothing happened" hole).
+    if let Some(cfg) = file.as_ref() {
+        la_daemon::config_cmd::validate(cfg).map_err(|e| {
+            let p = config_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<no path>".to_string());
+            format!("config validation failed at {p}: {e}")
+        })?;
+    }
     Ok(la_daemon::config_cmd::resolve_daemon_values(
         &overrides,
         &env,

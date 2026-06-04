@@ -69,7 +69,11 @@ pub fn show(overrides: &CliOverrides) -> Result<String, CheckError> {
         Some(p) if p.exists() => Some(Config::load_file(p)?),
         _ => None,
     };
+    if let Some(cfg) = file_cfg.as_ref() {
+        validate(cfg)?;
+    }
     let env = EnvSnapshot::from_process();
+    validate_cli_env_enums(overrides, &env)?;
 
     Ok(render(
         overrides,
@@ -279,7 +283,69 @@ pub struct CheckSummary {
     pub sections_present: Vec<String>,
 }
 
-fn validate(cfg: &Config) -> Result<(), CheckError> {
+/// Reject invalid enum values supplied via CLI flags or env vars before
+/// they get silently demoted to `None` by `parse_label`. Without this
+/// guard a `--log-level typo` would fall through to the file/default
+/// layer and `lad config show` would mis-report the value as `# from
+/// default`, contradicting the documented "CLI > env > file > default"
+/// precedence. File-layer values cannot reach here: serde already
+/// validated the enum at parse time, so any TOML typo errored in
+/// [`Config::parse_str`].
+pub fn validate_cli_env_enums(
+    overrides: &CliOverrides,
+    env: &EnvSnapshot,
+) -> Result<(), CheckError> {
+    check_enum(
+        "--log-level",
+        overrides.log_level.as_deref(),
+        LogLevel::parse_label,
+    )?;
+    check_enum(
+        "LAZYAGENTS_LOG_LEVEL",
+        env.log_level.as_deref(),
+        LogLevel::parse_label,
+    )?;
+    check_enum(
+        "--log-format",
+        overrides.log_format.as_deref(),
+        LogFormat::parse_label,
+    )?;
+    check_enum(
+        "LAZYAGENTS_LOG_FORMAT",
+        env.log_format.as_deref(),
+        LogFormat::parse_label,
+    )?;
+    Ok(())
+}
+
+fn check_enum<T>(
+    source_label: &str,
+    raw: Option<&str>,
+    parse: fn(&str) -> Option<T>,
+) -> Result<(), CheckError> {
+    let Some(v) = raw else {
+        return Ok(());
+    };
+    if parse(v).is_some() {
+        return Ok(());
+    }
+    Err(CheckError::Validation(format!(
+        "{source_label} value {:?} is not recognised",
+        v
+    )))
+}
+
+/// Cross-field validation shared by `lad config check` and every
+/// runtime path that loads the config (`lad start / daemonize / metrics
+/// / doctor / backup`). Keeping the rule set in one place means a
+/// future `[daemon].listen_tcp = "..."` cannot pass `check` but get
+/// silently ignored by `start` — the reviewer-flagged
+/// "configured but nothing happened" hole.
+pub fn validate(cfg: &Config) -> Result<(), CheckError> {
+    validate_impl(cfg)
+}
+
+fn validate_impl(cfg: &Config) -> Result<(), CheckError> {
     if !cfg.daemon.listen_tcp.is_empty() {
         return Err(CheckError::Validation(format!(
             "[daemon].listen_tcp is set to {:?} but TCP listener is not supported in v1 (architecture §10.1). Leave the field empty.",
@@ -725,5 +791,48 @@ command = "gemini"
             rendered.contains("command = \"gemini\"  # from config"),
             "expected per-key config source label: {rendered}"
         );
+    }
+
+    #[test]
+    fn validate_cli_env_enums_rejects_invalid_cli_log_level() {
+        let overrides = CliOverrides {
+            log_level: Some("typo".into()),
+            ..Default::default()
+        };
+        let err = validate_cli_env_enums(&overrides, &EnvSnapshot::default()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--log-level") && msg.contains("typo"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_cli_env_enums_rejects_invalid_env_log_format() {
+        let env = EnvSnapshot {
+            log_format: Some("yaml".into()),
+            ..Default::default()
+        };
+        let err = validate_cli_env_enums(&CliOverrides::default(), &env).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LAZYAGENTS_LOG_FORMAT") && msg.contains("yaml"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_cli_env_enums_accepts_canonical_values() {
+        let overrides = CliOverrides {
+            log_level: Some("debug".into()),
+            log_format: Some("compact".into()),
+            ..Default::default()
+        };
+        let env = EnvSnapshot {
+            log_level: Some("WARN".into()),
+            log_format: Some("json".into()),
+            ..Default::default()
+        };
+        validate_cli_env_enums(&overrides, &env).unwrap();
     }
 }

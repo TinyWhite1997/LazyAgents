@@ -159,6 +159,53 @@ fn lazyagents_log_deprecation_prints_warning_to_stderr() {
     );
 }
 
+#[test]
+fn start_path_rejects_listen_tcp_config_value() {
+    // Reviewer round 2 blocker: `lad start --config bad.toml` with
+    // `listen_tcp = "..."` must NOT silently fall through — share the
+    // same validation as `lad config check`. Driving `start` would
+    // require a runtime, so exercise `metrics` instead, which also
+    // goes through `derive_runtime()` and is fast-exit.
+    let Some(lad) = lad_bin() else {
+        assert_skip("LAD_BIN unset; skipping start_path_rejects_listen_tcp");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("bad.toml");
+    std::fs::write(&cfg, "[daemon]\nlisten_tcp = \"0.0.0.0:7042\"\n").unwrap();
+    let out = run_lad(&lad, &["metrics", "--config", cfg.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; stderr={}",
+        out.stderr_str()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("listen_tcp") && stderr.contains("validation"),
+        "expected validation error mentioning listen_tcp; stderr={stderr}"
+    );
+}
+
+#[test]
+fn cli_log_level_typo_is_rejected_not_silently_demoted() {
+    let Some(lad) = lad_bin() else {
+        assert_skip("LAD_BIN unset; skipping cli_log_level_typo_rejected");
+        return;
+    };
+    let out = run_lad(&lad, &["config", "show", "--log-level", "typo"]);
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on bogus --log-level; stdout={} stderr={}",
+        out.stdout_str(),
+        out.stderr_str()
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("--log-level") && stderr.contains("typo"),
+        "expected error to name --log-level and the offending value; stderr={stderr}"
+    );
+}
+
 fn run_lad(lad: &Path, args: &[&str]) -> Out {
     let mut cmd = Command::new(lad);
     cmd.args(args);
