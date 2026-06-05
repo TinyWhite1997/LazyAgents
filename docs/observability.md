@@ -5,6 +5,14 @@ and recommended external collectors. Pairs with architecture §9.3 and the
 WEK-75 brief; future metric additions go through an ADR plus a row in the
 table below.
 
+> **Production deployment supplement.** This document is the runtime
+> diagnostics surface — what `lad metrics` exposes, what JSON log fields you
+> can rely on, what `trace_id` propagates where. For the install-time gate
+> (`lad doctor` + tier exit codes) and the recommended scrape wiring at
+> install time, see [`install.md`](install.md#verify-your-install). For the
+> upgrade workflow — including the "diff the metric surface across releases"
+> regression check — see [`upgrade.md`](upgrade.md#after-every-upgrade).
+
 The `lad_*` prefix is contract (Rev2 R4): every metric the daemon emits keeps
 it. Adding or renaming a metric without updating both this file and
 `la_observ::describe_metrics()` is a wire break.
