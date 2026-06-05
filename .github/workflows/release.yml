@@ -227,6 +227,16 @@ jobs:
         run: |
           set -euo pipefail
           ls -la target/distrib/
+      # `--artifacts=local` does NOT write dist-manifest.json (that's
+      # produced by `dist plan` / `dist build --artifacts=global`). The
+      # extraction steps below already fall back to a glob over
+      # target/distrib/ when the manifest is absent, but be explicit:
+      # generate the manifest now so the dry-run exercises the manifest
+      # parsing path the tag-driven flow uses.
+      - name: write dist-manifest.json
+        run: |
+          set -euo pipefail
+          dist plan --tag="${PR_DRYRUN_TAG}" --output-format=json > target/distrib/dist-manifest.json
           test -f target/distrib/dist-manifest.json
       # Exercise the same extraction + size measurement code paths the
       # tag-driven `build` job runs, so a typo in those shell blocks
