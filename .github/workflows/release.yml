@@ -166,25 +166,44 @@ jobs:
       - name: dist build x86_64-unknown-linux-gnu
         run: dist build --tag="${PR_DRYRUN_TAG}" --artifacts=local --target=x86_64-unknown-linux-gnu
       # Cross target: matches the release.yml `build` job's two-step
-      # shape (cargo-zigbuild compiles, `dist build` packs). Both
-      # cargo-zigbuild and the subsequent `dist build` invocation (which
-      # re-runs cargo workspace-wide for packing) need cc-rs to route
-      # through zig — otherwise build scripts like `zstd-sys` look for
-      # the non-existent `x86_64-linux-musl-gcc` toolchain.
-      #
-      # We install a tiny `zigcc` / `zigcxx` wrapper since cargo's
-      # `LINKER` env var doesn't accept arguments inline.
+      # shape (cargo-zigbuild compiles, `dist build` packs). cc-rs build
+      # scripts (zstd-sys etc.) need cc to route through zig. A naive
+      # `exec zig cc -target X "$@"` wrapper fails because cc-rs also
+      # prepends its own `--target=<rust-triple>` arg, which zig rejects
+      # ("UnknownOperatingSystem" on `x86_64-unknown-linux-musl`). The
+      # wrapper below strips any `--target=...` / `-target ...` from
+      # the inherited args before adding zig's own zig-triple `-target`.
       - name: install zigcc wrapper
         run: |
           set -euo pipefail
           mkdir -p "$HOME/bin"
           cat > "$HOME/bin/zigcc" <<'EOF'
           #!/usr/bin/env bash
-          exec zig cc -target x86_64-linux-musl "$@"
+          set -e
+          args=()
+          while (( "$#" )); do
+            case "$1" in
+              --target=*) shift ;;
+              --target) shift 2 ;;
+              -target)   shift 2 ;;
+              *) args+=("$1"); shift ;;
+            esac
+          done
+          exec zig cc -target x86_64-linux-musl "${args[@]}"
           EOF
           cat > "$HOME/bin/zigcxx" <<'EOF'
           #!/usr/bin/env bash
-          exec zig c++ -target x86_64-linux-musl "$@"
+          set -e
+          args=()
+          while (( "$#" )); do
+            case "$1" in
+              --target=*) shift ;;
+              --target) shift 2 ;;
+              -target)   shift 2 ;;
+              *) args+=("$1"); shift ;;
+            esac
+          done
+          exec zig c++ -target x86_64-linux-musl "${args[@]}"
           EOF
           chmod +x "$HOME/bin/zigcc" "$HOME/bin/zigcxx"
           echo "$HOME/bin" >> "$GITHUB_PATH"
@@ -400,13 +419,36 @@ jobs:
             x86_64-unknown-linux-musl)  zig_target=x86_64-linux-musl ;;
             *) echo "unhandled cross target ${{ matrix.target }}"; exit 1 ;;
           esac
+          # Strip any --target=<rust-triple> that cc-rs prepends — zig
+          # rejects the rust triple ("UnknownOperatingSystem") and needs
+          # its own zig-triple form via `-target`.
           cat > "$HOME/bin/zigcc" <<EOF
           #!/usr/bin/env bash
-          exec zig cc -target $zig_target "\$@"
+          set -e
+          args=()
+          while (( "\$#" )); do
+            case "\$1" in
+              --target=*) shift ;;
+              --target) shift 2 ;;
+              -target)   shift 2 ;;
+              *) args+=("\$1"); shift ;;
+            esac
+          done
+          exec zig cc -target $zig_target "\${args[@]}"
           EOF
           cat > "$HOME/bin/zigcxx" <<EOF
           #!/usr/bin/env bash
-          exec zig c++ -target $zig_target "\$@"
+          set -e
+          args=()
+          while (( "\$#" )); do
+            case "\$1" in
+              --target=*) shift ;;
+              --target) shift 2 ;;
+              -target)   shift 2 ;;
+              *) args+=("\$1"); shift ;;
+            esac
+          done
+          exec zig c++ -target $zig_target "\${args[@]}"
           EOF
           chmod +x "$HOME/bin/zigcc" "$HOME/bin/zigcxx"
           echo "$HOME/bin" >> "$GITHUB_PATH"
