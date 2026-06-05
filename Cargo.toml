@@ -23,76 +23,116 @@ rust-version = "1.75"
 license = "MIT"
 repository = "https://github.com/TinyWhite1997/LazyAgents"
 
-# WEK-41 / M4.2 — release profile consumed by cargo-dist.
+# WEK-76 / M4.3 — release profile applied to *both* `release` and `dist`.
 #
-# Architecture §13: `lad` 与 `la` 单二进制 + lto=thin + strip 目标 < 30 MiB。
-# cargo-dist builds the `dist` profile (inherited from release) rather than
-# `release` itself, so tweaking this does not break a developer's local
-# `cargo build --release` workflow.
-[profile.dist]
-inherits = "release"
+# Architecture §13: `lad` 与 `la` 单二进制 + lto=thin + strip; size target
+# < 30 MiB is now a WARN-only goal (A5.1) rather than a hard CI gate, so the
+# only thing this profile has to deliver is the optimization shape the tag
+# build expects.
+#
+# Previously these knobs lived only on `[profile.dist]` to avoid surprising
+# a contributor running `cargo build --release` locally. WEK-76 brief §"构
+# 建标志" pins them on `[profile.release]` directly: M4 ships a single
+# binary shape, and the only place a stripped/LTO-thin local build hurts is
+# debugger ergonomics on `cargo build --release`, which devs should hit with
+# the un-stripped `dev`/`debug` profile anyway. `[profile.dist]` inherits
+# from `release`, so cargo-dist's tag pipeline picks these up automatically.
+[profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
 debug = false
 opt-level = 3
-panic = "abort"
+
+# `dist` is the profile cargo-dist actually builds (see `dist-profile-name`
+# default). Inheriting `release` keeps the LTO/strip/codegen settings above
+# without re-declaring them, and leaves room for future dist-only knobs
+# (e.g. PGO, frame-pointer) without poking the developer-facing profile.
+[profile.dist]
+inherits = "release"
 
 # Config for 'dist' (formerly cargo-dist).
 #
-# Acceptance (WEK-41):
-# Acceptance (WEK-41):
-#   • 5-platform release artifact (linux x64/arm64, macos arm64/x64,
-#     windows x64) — see `targets` below. The task spec called these
-#     "6 platforms" but x64+arm64×{linux,macos} + windows x64 is 5;
-#     `aarch64-pc-windows-msvc` (Windows ARM) is intentionally OUT of
-#     scope for v1 because no contributor runs it for daily dogfood
-#     and GitHub's Windows ARM runners are still preview. Revisit at
-#     M5 if user demand surfaces.
-#   • tar/zip + install.sh — `shell` + `powershell` + `homebrew` installers
-#     emit the platform-correct archive + bootstrapper
+# Acceptance (WEK-76 / M4.3, supersedes WEK-41 acceptance):
+#   • 6-target release matrix per v1.1 addendum §A5.2 / A5.3:
+#       linux  x86_64-gnu / aarch64-gnu / x86_64-musl  (3)
+#       macos  x86_64 / aarch64                        (2)
+#       windows x86_64-msvc                            (1)
+#     `aarch64-unknown-linux-musl` is *intentionally* deferred to v1.x —
+#     tracked as follow-up issue WEK-80, reachable from the M4 epic
+#     WEK-63 — because the cargo-zigbuild + bundled-sqlite cross link is
+#     too expensive to land inside the M4 timebox while x86_64-musl
+#     already covers the alpine / glibc-less audience.
+#     `aarch64-pc-windows-msvc` (Windows-on-ARM) also
+#     stays out of v1: no contributor dogfoods it and GitHub's Windows-ARM
+#     runners are still preview.
+#   • A5.3: runner pinning lives in `.github/workflows/release.yml` (the
+#     custom workflow), NOT in `dist.github-custom-runners`, because that
+#     setting only kicks in when dist generates the workflow itself. The
+#     `*-latest` labels are banned across both ci.yml and release.yml; if
+#     GitHub deprecates a pinned image, a follow-up issue flips the pin to
+#     the next fixed image rather than reverting to `*-latest`.
+#   • R2: this `[workspace.metadata.dist]` block IS the `cargo dist init`
+#     output, hand-curated. `cargo-dist-version` is pinned to a specific
+#     release (never `latest`) so a tag we cut six months from now produces
+#     the same artifact shape.
+#   • R5: `include` ships the hand-written systemd / launchd / Windows task
+#     templates from `crates/la-daemon/templates/`. cargo-dist's auto
+#     systemd/launchd generator is intentionally NOT used — it cannot
+#     express the hardening options (`UMask=0077`, `RuntimeDirectoryMode=
+#     0700`, plist `RunAtLoad=false`, Scheduled Task `RunLevel=
+#     LeastPrivilege`) that M4.1 already committed to. The bundled
+#     templates remain the single source of truth; copies inside the
+#     release archive are read by humans only — `lad install --service ...`
+#     still renders them from the embedded copy in la-daemon.
+#   • A5.1: stripped-binary size is a WARN-only soft goal. The Cargo
+#     `[profile.release]` block above does the strip+LTO work; the size
+#     check itself runs in release.yml (annotation + release notes
+#     table). A hard size gate waits on the v1.x debug-symbol audit.
 #   • cosign-equivalent binary signing — GitHub Artifact Attestations
-#     (sigstore-backed) replace standalone cosign for keyless signing in CI.
-#     This is what `dist` ships natively as of 0.32; rolling our own `cosign
-#     sign-blob` would re-duplicate the same Fulcio/Rekor pipeline.
+#     (sigstore-backed) replace standalone cosign for keyless signing in
+#     CI. This is what `dist` ships natively as of 0.32; rolling our own
+#     `cosign sign-blob` would re-duplicate the same Fulcio/Rekor
+#     pipeline. macOS notarization / Windows Authenticode stay as
+#     `if: false` step placeholders in release.yml until a signing
+#     identity is provisioned (M4 brief §3.3 "codesigning 占位").
 #   • Homebrew tap — `tap` points at `TinyWhite1997/homebrew-tap`. The
 #     repo must exist before the first publish; until then `publish-jobs`
 #     stays commented out so a tag push plans+builds+hosts without
 #     erroring on the missing tap.
-#   • Scoop bucket — DEFERRED to a follow-up (see issue comment thread on
-#     WEK-41). cargo-dist 0.32 ships native installer support only for
-#     `shell` / `powershell` / `npm` / `homebrew` / `msi`; there is no
-#     first-party Scoop installer and no `scoop-tap` field. Shipping a
-#     Scoop manifest cleanly requires either (a) a custom `publish-jobs`
-#     script that consumes `dist-manifest.json` and writes the bucket
-#     repo, or (b) a third-party generator like `scoop-bucket-helper`.
-#     Either path is wider than the WEK-5 Linux-only acceptance bar, so
-#     it is tracked as a follow-up rather than forced into this issue.
-#
-# WEK-5 scope: Linux-only validation. macOS/Windows targets remain in this
-# list so the GHA matrix is wired and ready; cross-platform smoke is a
-# follow-up before GA tagging.
+#   • Scoop bucket — DEFERRED to follow-up WEK-64 (M4 brief out-of-scope).
 [workspace.metadata.dist]
-# Pinned to the latest stable release; bump in sync with the installer
-# `dist init` would regenerate.
+# Pinned to a specific stable release per R2: never track `latest`. Bump in
+# lock-step with the installer URLs in `.github/workflows/release.yml`.
 cargo-dist-version = "0.32.0"
 ci = "github"
 installers = ["shell", "powershell", "homebrew"]
-# Five v1 release targets per task spec (originally written as "6
-# platforms" but x64+arm64×{linux,macos} + windows x64 = 5; Windows
-# ARM excluded — see acceptance comment above).
+# A5.2 / A5.3 — 6-target release matrix. Order matches the addendum table
+# so the release-notes size table renders in a stable, reviewable order.
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
 ]
-# Archives: tar.xz on unix, zip on windows (dist defaults). Keep explicit
-# so the install.sh shipped by the `shell` installer can locate the right
-# asset.
+# Archives: tar.xz on unix, zip on windows (dist defaults made explicit so
+# the post-install hook in install.sh / install.ps1 can locate the right
+# asset by extension).
 unix-archive = ".tar.xz"
 windows-archive = ".zip"
+# R5: ship the hand-written service unit templates alongside the binaries.
+# Paths are relative to this Cargo.toml. Globs are NOT supported by dist's
+# `include` setting, so each file is listed explicitly. Keep in sync with
+# crates/la-daemon/templates/ — if a template is added there, add it here
+# and to the M4 brief §R5 contract.
+include = [
+    "crates/la-daemon/templates/lad.service",
+    "crates/la-daemon/templates/dev.lazyagents.lad.plist",
+    "crates/la-daemon/templates/lad-task.xml",
+    "crates/la-daemon/templates/config.example.toml",
+]
 # GitHub Artifact Attestations = sigstore (Fulcio + Rekor) keyless signing.
 # Equivalent to `cosign sign-blob --identity-token <oidc>` per artifact;
 # verifiable with `gh attestation verify <file> --repo TinyWhite1997/LazyAgents`.
@@ -100,11 +140,20 @@ github-attestations = true
 # Homebrew tap (must exist as TinyWhite1997/homebrew-tap before tagging).
 tap = "TinyWhite1997/homebrew-tap"
 # Publisher stays disabled until `TinyWhite1997/homebrew-tap` exists — flip
-# this on in the M4 RC follow-up. Building + hosting still happens without
-# it. (Scoop is intentionally NOT listed — see comment above.)
+# this on in the M4 RC follow-up (see WEK-65). Building + hosting still
+# happens without it.
 # publish-jobs = ["homebrew"]
 pr-run-mode = "plan"
 install-updater = false
+# R3: install.ps1 + install.sh must surface "LazyAgents only runs while you
+# are logged in" up front, so a user installing on Windows knows the
+# Scheduled Task drops them when they log out. cargo-dist's
+# `install-success-msg` is a single string consumed by both the shell and
+# powershell installers — that is fine here because the user-logon
+# constraint applies on every platform (`lad install --service ...` writes
+# user-scope units on systemd / launchd too), and Windows just happens to
+# be the place where it surprises people most.
+install-success-msg = "LazyAgents installed. Note: `lad` runs as a user-mode daemon. On Windows the Scheduled Task only runs while you are logged in; on systemd / launchd the service is installed under the user agent. See: https://github.com/TinyWhite1997/LazyAgents/blob/main/docs/install.md"
 
 [workspace.dependencies]
 async-trait = "0.1"
