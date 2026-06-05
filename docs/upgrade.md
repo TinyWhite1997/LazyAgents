@@ -70,9 +70,10 @@ The plan, when that day comes, is a dedicated `[migration]` section in `config.t
 
 ```toml
 # config.toml — example shape under the v2 [migration] section.
-# Reserved for v2. v1.x daemons accept the section as a no-op so a v1
-# config tree that has been migration-stamped in preparation for v2 does
-# not regress when read by the still-running v1 daemon.
+# Reserved for v2; do NOT add this to a v1 config. The root v1 `Config`
+# struct (crates/la-config/src/schema.rs) uses
+# `#[serde(deny_unknown_fields)]`, so `lad config check` will reject any
+# `[migration]` block today. Wait for v2 to ship the schema bump.
 [migration]
 schema_version = 2          # advertised by the daemon that wrote this file
 from_version  = 1           # the schema this file was migrated *from*

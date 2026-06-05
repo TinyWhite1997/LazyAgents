@@ -38,9 +38,24 @@ Then launch the TUI — you should land on the **Crons** tab (M3 scheduler), and
 la
 ```
 
-![la TUI Crons tab](docs/book/en/src/img/la-crons.png)
+The Crons tab is the production reference UI for v1; on a fresh install with no crons yet it renders like this:
 
-> If the screenshot is missing on a fresh clone, run `la` and confirm the Crons tab renders — that is the production reference UI for v1.
+```text
+┌─ LazyAgents ──────────────────────────────────────────────────────────────┐
+│  Projects   Sessions   [ Crons ]   Worktree                               │
+├───────────────────────────────────────────────────────────────────────────┤
+│  ENABLED  NAME              SCHEDULE            TZ              NEXT FIRE │
+│  ─────────────────────────────────────────────────────────────────────────│
+│           (no crons yet — press `n` to create one)                        │
+│                                                                           │
+│                                                                           │
+├───────────────────────────────────────────────────────────────────────────┤
+│  n new   e edit   ␣ enable/disable   d delete   r run-now   ? help        │
+│  daemon @ /run/user/1000/lazyagents/lad-1.sock                            │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+A full-fidelity screenshot of the same tab once the New-session form lands is tracked as a v1 GA polish item.
 
 Full install path, including service install (`systemd` / `launchd` / Windows Scheduled Task) and the macOS configuration fallback chain, is in [`docs/install.md`](docs/install.md). Already on LazyAgents and bumping to a new release? See [`docs/upgrade.md`](docs/upgrade.md).
 
