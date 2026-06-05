@@ -57,7 +57,7 @@ Pinned contract. Additions go through an ADR; renames are wire breaks.
 | `lad_rpc_duration_seconds` | histogram | `method` | Per-RPC handler latency. No `result` label — keeps cardinality bounded. |
 | `lad_session_active` | gauge | `backend` | Currently active sessions known to the daemon. |
 | `lad_session_output_bytes_total` | counter | `backend` | Session output bytes delivered to attached clients. |
-| `lad_cron_runs_total` | counter | `status` | Cron run **terminal-status** counter (`ok` / `error` / `timeout` / `budget_rejected` — the start pulse is not counted here). |
+| `lad_cron_runs_total` | counter | `status` | Cron run **terminal-status** counter. Raw `runs.status` values (`completed` / `failed` / `timed_out` / `cancelled` / `budget_exceeded`) are mapped to the four canonical contract values at the emit boundary (`la_storage::repos::cron_status_label`): `ok` / `error` / `timeout` / `budget_rejected`. The start pulse is intentionally NOT counted here. |
 | `lad_cron_missed_total` | counter | `mode` | Catch-up disposition (`skip` / `coalesce` / `replay`). |
 | `lad_cron_throttled_seconds_total` | counter | — | Cumulative seconds the scheduler delayed a fire due to loadavg throttle. |
 | `lad_pty_spawn_duration_seconds` | histogram | `backend` | PTY/session spawn duration. |

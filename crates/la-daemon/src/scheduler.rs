@@ -1333,8 +1333,14 @@ async fn publish_scheduler_health(cfg: &SchedulerHealthLoopConfig) {
         next_fire,
     };
     metrics::gauge!("lad_scheduler_queue_depth").set(queue_depth as f64);
-    metrics::gauge!("lad_scheduler_running_global").set(running_global as f64);
-    metrics::gauge!("lad_scheduler_errors_last_5m").set(errors_last_5m as f64);
+    // A9 (M4.5 / WEK-75): `lad_scheduler_running_global` and
+    // `lad_scheduler_errors_last_5m` are NOT in the pinned A9 naming
+    // table; they used to be emitted here as un-described gauges, which
+    // broke OpenMetrics shape and the "metric additions go through an
+    // ADR" rule. Both values already ride on the `scheduler.health`
+    // notification (`running_global` / `errors_last_5m` fields of
+    // `SchedulerHealthParams`), so deleting the gauge does not hide
+    // them from the TUI; it removes the unsanctioned scrape surface.
     cfg.bus.publish(BusEvent::SchedulerHealth(params));
 }
 

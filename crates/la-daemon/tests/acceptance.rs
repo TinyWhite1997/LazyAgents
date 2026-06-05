@@ -117,6 +117,13 @@ struct TestDaemon {
 }
 
 async fn bootstrap_daemon(script: &str) -> TestDaemon {
+    bootstrap_daemon_with(script, |_| {}).await
+}
+
+async fn bootstrap_daemon_with(
+    script: &str,
+    customize: impl FnOnce(&mut DaemonConfig),
+) -> TestDaemon {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let runtime_dir = tempdir.path().join("runtime");
     let state_dir = tempdir.path().join("state");
@@ -130,12 +137,13 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
     let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
     adapters.insert("shtest".to_string(), adapter);
 
-    let config = DaemonConfig {
+    let mut config = DaemonConfig {
         state_dir,
         socket_discovery: SocketDiscovery::with_override(socket.clone()),
         adapters,
         ..DaemonConfig::default()
     };
+    customize(&mut config);
     let daemon = Daemon::bind(config).await.expect("bind daemon");
     let bus = daemon.manager.bus();
     let storage = daemon.manager.storage().clone();
@@ -199,18 +207,25 @@ async fn metrics_socket_uses_owner_only_permissions() {
 /// the test pins the parts that the CLI is responsible for:
 ///
 /// 1. The RPC body has the `# TYPE` / `# HELP` preamble shape required of
-///    a Prometheus text-exposition payload, and exposes at least one
-///    counter + gauge + histogram from the pinned A9 naming table.
-/// 2. The CLI body has the SAME `# TYPE` and `# HELP` line set as the RPC
-///    body. These lines are static for a given describe set, so any
+///    a Prometheus text-exposition payload.
+/// 2. Every A9 metric naming-table entry appears in a `# TYPE` line of
+///    the body (so a silent drop of a `describe_*!` call in la-observ
+///    trips the test).
+/// 3. Every A9 metric that this test can drive in-process (sessions.list
+///    bumps the RPC counters, the scheduler-health loop publishes the
+///    queue gauge, storage writes record their latency histogram) has at
+///    least one sample line in the body (so a `describe`-without-`emit`
+///    drift trips the test).
+/// 4. The CLI body has the SAME `# TYPE` and `# HELP` line set as the
+///    RPC body. These lines are static for a given describe set, so any
 ///    rewriting in the CLI (a stray `print!("metrics: ...")`, an
 ///    extension-handler scrub, a `\n`-stripping `write_str`, …) would
 ///    show up here even with the metric-value noise.
-/// 3. Every metric name present in one body is present in the other.
+/// 5. Every metric name present in one body is present in the other.
 ///
 /// The literal byte-equality property (CLI doesn't mutate the body) is
-/// covered by `cli_passes_through_rpc_body_unchanged_unit` below; this
-/// integration test exists to prove the wire path itself works.
+/// guaranteed by `print!("{text}")` in `lad metrics`; assertions 4 and 5
+/// detect any divergence introduced by an accidental rewriter.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
@@ -218,7 +233,12 @@ async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
         MetricsScrape, MetricsScrapeParams, MetricsScrapeResult, Method,
     };
 
-    let daemon = bootstrap_daemon("sleep 5").await;
+    let daemon = bootstrap_daemon_with("sleep 5", |cfg| {
+        // Force the scheduler-health loop to tick fast so the test
+        // doesn't wait the prod default (5s) for the gauge to land.
+        cfg.scheduler.scheduler_health_interval = Duration::from_millis(20);
+    })
+    .await;
 
     // In-process daemons skip the binary's `init_observability` shim, so
     // the global metrics recorder is `None` until we install it here.
@@ -240,11 +260,13 @@ async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
         let _ = recv_response_for(&mut conn, 100).await;
     }
 
-    // Give the scheduler's 5s health loop one tick to publish
-    // `lad_scheduler_queue_depth`. The loop ticks much faster in tests,
-    // but allow up to ~500ms before failing the gauge assertion.
+    // Wait for the scheduler-health loop to publish at least one
+    // `lad_scheduler_queue_depth` SAMPLE line (not just the `# TYPE`
+    // preamble, which `describe_metrics` writes synchronously at
+    // recorder install time). The bootstrap above shrinks the
+    // interval to 20ms, so this normally lands in the first iteration.
     let mut rpc_body = String::new();
-    for _ in 0..20 {
+    for _ in 0..200 {
         let mut conn = client(&daemon.socket).await;
         let req = la_proto::jsonrpc::Request::new(
             1i64,
@@ -258,7 +280,12 @@ async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
         let v = recv_response_for(&mut conn, 1).await;
         let r: MetricsScrapeResult = serde_json::from_value(v).expect("decode");
         rpc_body = r.body;
-        if rpc_body.contains("lad_scheduler_queue_depth") {
+        let has_queue_sample = rpc_body.lines().any(|line| {
+            !line.starts_with('#')
+                && (line.starts_with("lad_scheduler_queue_depth ")
+                    || line.starts_with("lad_scheduler_queue_depth{"))
+        });
+        if has_queue_sample {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -278,21 +305,83 @@ async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
         rpc_body
     );
 
-    // (b) one counter + one gauge + one histogram from the A9 table.
-    assert!(
-        rpc_body.contains("lad_rpc_requests_total"),
-        "missing counter lad_rpc_requests_total in body:\n{rpc_body}"
-    );
-    assert!(
-        rpc_body.contains("lad_session_active") || rpc_body.contains("lad_scheduler_queue_depth"),
-        "missing any of the A9 gauges (lad_session_active / lad_scheduler_queue_depth) in body:\n{rpc_body}"
-    );
-    assert!(
-        rpc_body.contains("lad_rpc_duration_seconds")
-            || rpc_body.contains("lad_storage_write_latency_seconds")
-            || rpc_body.contains("lad_pty_spawn_duration_seconds"),
-        "missing any of the A9 histograms in body:\n{rpc_body}"
-    );
+    // (b) A9 metric naming table — every entry MUST appear in a
+    // `# TYPE` line of the rendered body. `describe_metrics` writing
+    // them out is what guarantees they show up here; a silent drop
+    // (someone deletes the `metrics::describe_counter!(...)` call
+    // alongside removing the prod emit) would trip this assertion.
+    //
+    // Keep this list in sync with `la_observ::describe_metrics()` and
+    // the table in `docs/observability.md`. Additions / renames go
+    // through an ADR per Rev2 R4.
+    const A9_METRICS: &[&str] = &[
+        "lad_rpc_requests_total",
+        "lad_rpc_duration_seconds",
+        "lad_session_active",
+        "lad_session_output_bytes_total",
+        "lad_cron_runs_total",
+        "lad_cron_missed_total",
+        "lad_cron_throttled_seconds_total",
+        "lad_pty_spawn_duration_seconds",
+        "lad_storage_write_latency_seconds",
+        "lad_runs_archive_pruned_total",
+        "lad_scheduler_queue_depth",
+        "lad_scheduler_clock_skew_seconds",
+        "lad_adapter_drift_total",
+    ];
+    for name in A9_METRICS {
+        let type_line = format!("# TYPE {name} ");
+        assert!(
+            rpc_body.contains(&type_line),
+            "A9 metric {name} missing `# TYPE` line — describe_metrics out of sync with A9 table"
+        );
+    }
+
+    // (b.2) For every A9 metric that we can plausibly drive from this
+    // test (sessions.list is a single RPC and the scheduler-health
+    // loop publishes the queue gauge automatically), assert at least
+    // one sample line — i.e. a non-`#`-prefixed line whose first
+    // token is the metric name (optionally followed by `_bucket` /
+    // `_sum` / `_count` for histograms, or by `{` for a label set).
+    //
+    // The remaining A9 metrics (cron_* counters, adapter_drift,
+    // runs_archive_pruned, clock_skew, storage_write_latency) fire
+    // only on real cron / archive / clock-jump / SQLite-write events
+    // that this in-process test cannot synthesise without a much
+    // larger fixture; their `# TYPE` line above already pins the
+    // contract. Per-emit-site coverage lives in the unit test
+    // wek57_scheduler.rs and the runtime tests in la-daemon.
+    const SAMPLE_DRIVEABLE: &[&str] = &[
+        "lad_rpc_requests_total",
+        "lad_rpc_duration_seconds",
+        "lad_session_active",
+        "lad_scheduler_queue_depth",
+    ];
+    for name in SAMPLE_DRIVEABLE {
+        let has_sample = rpc_body.lines().any(|line| {
+            if line.starts_with('#') || line.is_empty() {
+                return false;
+            }
+            // Sample lines for `name` look like:
+            //   <name> <value>
+            //   <name>{...labels...} <value>
+            //   <name>_bucket{...} <value>      (histogram)
+            //   <name>_sum / <name>_count        (histogram)
+            // We check the line starts with `<name>` followed by one
+            // of `{ ` `_`, which covers all four shapes without
+            // false-positives against a longer metric name that
+            // happens to share the prefix.
+            if let Some(rest) = line.strip_prefix(name) {
+                matches!(rest.chars().next(), Some(' ') | Some('{') | Some('_'))
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_sample,
+            "A9 metric {name} declared but no sample line in body — emit path likely missing"
+        );
+    }
 
     // (c) CLI stdout is byte-identical to the RPC body.
     let lad_bin = env!("CARGO_BIN_EXE_lad");
