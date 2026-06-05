@@ -10,7 +10,7 @@ publish = false
 # assertions. Every test in `tests/` is cfg-gated on
 # `cfg(target_os = "macos")` so the crate compiles into a no-op on
 # Linux/Windows but the PR-level CI matrix can run the real assertions
-# on the `macos-14` / `macos-13` runners.
+# on the `macos-14` / `macos-15-intel` runners.
 
 [dev-dependencies]
 la-proto = { path = "../../crates/la-proto" }

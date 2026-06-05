@@ -185,7 +185,7 @@ async fn a6_non_owner_dial_is_refused() {
              A6 §3 is a hard DoD line; refusing to skip silently. If this is \
              a developer machine without NOPASSWD sudo, run the test under \
              `sudo cargo test ...` or fix the sudoers config; CI macOS-14 / \
-             macos-13 hosted runners ship NOPASSWD sudo by default.",
+             macos-15-intel hosted runners ship NOPASSWD sudo by default.",
             probe.as_ref().map(|out| {
                 format!(
                     "status={:?} stderr={:?}",

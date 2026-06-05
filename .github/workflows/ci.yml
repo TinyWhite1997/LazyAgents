@@ -11,10 +11,10 @@ name: ci
 # A5.3 runner pin table (do NOT use `*-latest` — release.yml shares this
 # mapping and tag-cut reproducibility depends on the pin):
 #
-#   ubuntu-22.04   → x86_64-unknown-linux-gnu
-#   macos-14       → aarch64-apple-darwin
-#   macos-13       → x86_64-apple-darwin
-#   windows-2022   → x86_64-pc-windows-msvc
+#   ubuntu-22.04    → x86_64-unknown-linux-gnu
+#   macos-14        → aarch64-apple-darwin
+#   macos-15-intel  → x86_64-apple-darwin (was macos-13; retired 2025-12-04)
+#   windows-2022    → x86_64-pc-windows-msvc
 
 on:
   workflow_dispatch:
@@ -33,7 +33,7 @@ jobs:
         os:
           - ubuntu-22.04
           - macos-14
-          - macos-13
+          - macos-15-intel
           - windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -93,7 +93,7 @@ jobs:
           cargo run -q -p la-daemon --bin lad -- uninstall --service systemd --dry-run
 
       - name: lad install --dry-run (launchd)
-        if: matrix.os == 'macos-14' || matrix.os == 'macos-13'
+        if: matrix.os == 'macos-14' || matrix.os == 'macos-15-intel'
         shell: bash
         run: |
           cargo run -q -p la-daemon --bin lad -- install --service launchd --dry-run

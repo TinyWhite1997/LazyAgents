@@ -147,8 +147,23 @@ jobs:
     #   aarch64-unknown-linux-gnu  → ubuntu-22.04 + zigbuild     (cross)
     #   x86_64-unknown-linux-musl  → ubuntu-22.04 + zigbuild     (cross)
     #   aarch64-apple-darwin       → macos-14                    (native)
-    #   x86_64-apple-darwin        → macos-13                    (native)
+    #   x86_64-apple-darwin        → macos-15-intel              (native)
     #   x86_64-pc-windows-msvc     → windows-2022                (native)
+    #
+    # `macos-15-intel` (NOT the brief's `macos-13`): GitHub retired the
+    # `macos-13` hosted runner image on 2025-12-04 — see
+    # https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/
+    # On a workflow that still references `macos-13` the job queues
+    # forever with `runner_name: ""` (verified on PR #60 first run; CI
+    # check `ci / macos-13` stayed pending indefinitely). The replacement
+    # for an Intel macOS pin is `macos-15-intel`, the last x86_64 image
+    # GitHub will offer until Fall 2027. This is the "现实修正" the
+    # macOS reviewer explicitly authorized; brief's `macos-13` was
+    # written pre-retirement. ci.yml is updated in lock-step in the
+    # same commit so the runner-pin table stays consistent across both
+    # CI and release. When `macos-15-intel` itself retires, follow the
+    # same pattern: pin the next fixed Intel image, never revert to
+    # `macos-latest` or `macos-*-latest`.
     name: build (${{ matrix.target }})
     needs: plan
     strategy:
@@ -168,7 +183,7 @@ jobs:
             runner: macos-14
             cross: false
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
             cross: false
           - target: x86_64-pc-windows-msvc
             runner: windows-2022
@@ -377,15 +392,24 @@ jobs:
       # macOS notarization stays as an `if: false` placeholder until a
       # Developer ID + notarization key is provisioned. Wiring is in
       # tree so the eventual flip is a one-line `if:` change. Keys live
-      # in repo secrets when ready; never log them.
+      # in repo secrets when ready; never log them. Secret names are
+      # spelled out per Apple's notarytool / App Store Connect API
+      # nomenclature so the operator wiring them up cannot confuse the
+      # .p8 private key file with a keychain item or app-specific
+      # password:
+      #   - MACOS_DEVELOPER_ID_CERT_P12      Developer ID Application cert export (.p12 base64)
+      #   - MACOS_DEVELOPER_ID_CERT_PASSWORD password for the .p12 above
+      #   - MACOS_NOTARY_KEY_P8              App Store Connect API key (.p8) contents, base64
+      #   - MACOS_NOTARY_KEY_ID              the Key ID shown in App Store Connect (e.g. ABCD1234EF)
+      #   - MACOS_NOTARY_ISSUER_ID           the Issuer ID UUID shown next to the key
       - name: macOS codesign + notarize (placeholder)
-        if: false  # codesigning 占位 — flip when MACOS_NOTARY_KEY exists
+        if: false  # codesigning 占位 — flip when MACOS_NOTARY_KEY_P8 exists
         env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_DEVELOPER_ID_CERT_P12: ${{ secrets.MACOS_DEVELOPER_ID_CERT_P12 }}
+          MACOS_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERT_PASSWORD }}
+          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: |
           echo "macOS codesign + notarize: not yet provisioned. cosign-equivalent for binaries is handled by the sigstore attest job."
 
@@ -393,10 +417,10 @@ jobs:
       # cosign 同步推 v1.x (M4 brief §3.3) — keyless sigstore stays as the
       # v1 baseline through actions/attest-build-provenance.
       - name: Windows Authenticode sign (placeholder)
-        if: false  # codesigning 占位 — flip when WINDOWS_CERT_PFX exists
+        if: false  # codesigning 占位 — flip when WINDOWS_AUTHENTICODE_CERT_PFX exists
         env:
-          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
-          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          WINDOWS_AUTHENTICODE_CERT_PFX: ${{ secrets.WINDOWS_AUTHENTICODE_CERT_PFX }}
+          WINDOWS_AUTHENTICODE_CERT_PASSWORD: ${{ secrets.WINDOWS_AUTHENTICODE_CERT_PASSWORD }}
         run: |
           echo "Windows Authenticode signing: not yet provisioned."
 
@@ -468,7 +492,14 @@ jobs:
     # A5.1: assemble the release-notes size table from per-target
     # `sizes-*` fragments. Runs even on `workflow_dispatch` (no upload)
     # so a dry-run plan can eyeball the table before tagging.
-    name: assemble size table (A5.1 release notes)
+    #
+    # A5.2: also emit the musl extension declaration block — the brief
+    # requires this declaration land in the release-notes TEMPLATE
+    # (what users read in the GitHub Release), not just in workflow /
+    # Cargo.toml comments. The block is concatenated ahead of the size
+    # table so the `host` job can append the combined notes-extra.md
+    # in a single edit.
+    name: assemble release notes extras (A5.1 size table + A5.2 musl declaration)
     needs: [plan, build]
     runs-on: ubuntu-22.04
     steps:
@@ -478,11 +509,17 @@ jobs:
           pattern: sizes-*
           path: sizes
           merge-multiple: true
-      - name: render markdown table
+      - name: render release-notes extras
         shell: bash
         run: |
           set -euo pipefail
           {
+            echo "## Linux musl artifact (A5.2)"
+            echo
+            echo "This release ships a statically-linked \`x86_64-unknown-linux-musl\` artifact alongside the GNU Linux targets, per v1.1 扩展架构 §13. Suitable for Alpine / glibc-less environments."
+            echo
+            echo "\`aarch64-unknown-linux-musl\` is **not** in this release; it is tracked for v1.x via [WEK-80](https://github.com/TinyWhite1997/LazyAgents/issues) (推 v1.x)."
+            echo
             echo "## Artifact sizes (stripped, soft goal: < 30 MiB — A5.1 WARN-only)"
             echo
             echo "| target | binary | size |"
@@ -499,12 +536,12 @@ jobs:
             done
             echo
             echo "> A5.1 soft goal — over-budget rows emit a CI warning but do NOT block release. Hard size gate lands with the v1.x debug-symbol audit."
-          } > size-table.md
-          cat size-table.md
+          } > notes-extra.md
+          cat notes-extra.md
       - uses: actions/upload-artifact@v4
         with:
-          name: release-notes-size-table
-          path: size-table.md
+          name: release-notes-extra
+          path: notes-extra.md
 
   host:
     name: host (github release)
@@ -527,10 +564,10 @@ jobs:
           pattern: artifacts-*
           path: target/distrib
           merge-multiple: true
-      - name: download size table
+      - name: download release notes extras
         uses: actions/download-artifact@v4
         with:
-          name: release-notes-size-table
+          name: release-notes-extra
           path: target/notes
       - name: upload to github release
         env:
@@ -539,11 +576,14 @@ jobs:
           set -euo pipefail
           dist host --tag="${RELEASE_TAG}" --steps=upload
           dist host --tag="${RELEASE_TAG}" --steps=announce
-          if [[ -f target/notes/size-table.md ]]; then
+          # Append the A5.2 musl declaration + A5.1 size table on top of
+          # whatever cargo-dist's `announce` step wrote, preserving the
+          # existing body.
+          if [[ -f target/notes/notes-extra.md ]]; then
             existing=$(gh release view "${RELEASE_TAG}" --json body --jq .body || true)
             {
               [[ -n "$existing" ]] && printf '%s\n\n' "$existing"
-              cat target/notes/size-table.md
+              cat target/notes/notes-extra.md
             } > /tmp/release-notes.md
             gh release edit "${RELEASE_TAG}" --notes-file /tmp/release-notes.md
           fi
