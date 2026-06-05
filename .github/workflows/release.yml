@@ -245,43 +245,40 @@ jobs:
           test -s target/distrib/dist-manifest.json
       # Exercise the same extraction + size measurement code paths the
       # tag-driven `build` job runs, so a typo in those shell blocks
-      # surfaces on PR instead of at tag-cut time.
-      - name: extract dist archive + verify (gnu)
+      # surfaces on PR instead of at tag-cut time. cargo-dist emits
+      # ONE archive per binary (la-daemon-<triple>.tar.xz, la-tui-...,
+      # la-ipc-..., etc.); for the dry-run we extract all archives for
+      # the target so the ldd / size checks see both `lad` and `la`.
+      - name: extract dist archives + verify (gnu)
         run: |
           set -euo pipefail
           mkdir -p target/distrib/_extracted/x86_64-unknown-linux-gnu
-          archive=$(python3 - <<'PY'
-          import json
-          with open("target/distrib/dist-manifest.json") as f:
-              m = json.load(f)
-          for name, art in m.get("artifacts", {}).items():
-              if art.get("kind") == "executable-zip" and "x86_64-unknown-linux-gnu" in art.get("target_triples", []):
-                  print(name)
-                  break
-          PY
-          )
-          [[ -n "$archive" && -f "target/distrib/$archive" ]] || { echo "::error::gnu archive missing"; exit 1; }
-          tar -xJf "target/distrib/$archive" -C target/distrib/_extracted/x86_64-unknown-linux-gnu
+          shopt -s nullglob
+          archives=(target/distrib/*x86_64-unknown-linux-gnu*.tar.xz)
+          [[ ${#archives[@]} -gt 0 ]] || { echo "::error::no gnu archive in target/distrib/"; ls -la target/distrib/; exit 1; }
+          for a in "${archives[@]}"; do
+            echo "extracting $a"
+            tar -xJf "$a" -C target/distrib/_extracted/x86_64-unknown-linux-gnu
+          done
           find target/distrib/_extracted/x86_64-unknown-linux-gnu -type f -printf '%p (%s bytes)\n'
-      - name: extract dist archive + ldd assert static (musl)
+      - name: extract dist archives + ldd assert static (musl)
         run: |
           set -euo pipefail
           mkdir -p target/distrib/_extracted/x86_64-unknown-linux-musl
-          archive=$(python3 - <<'PY'
-          import json
-          with open("target/distrib/dist-manifest.json") as f:
-              m = json.load(f)
-          for name, art in m.get("artifacts", {}).items():
-              if art.get("kind") == "executable-zip" and "x86_64-unknown-linux-musl" in art.get("target_triples", []):
-                  print(name)
-                  break
-          PY
-          )
-          [[ -n "$archive" && -f "target/distrib/$archive" ]] || { echo "::error::musl archive missing"; exit 1; }
-          tar -xJf "target/distrib/$archive" -C target/distrib/_extracted/x86_64-unknown-linux-musl
+          shopt -s nullglob
+          archives=(target/distrib/*x86_64-unknown-linux-musl*.tar.xz)
+          [[ ${#archives[@]} -gt 0 ]] || { echo "::error::no musl archive in target/distrib/"; ls -la target/distrib/; exit 1; }
+          for a in "${archives[@]}"; do
+            echo "extracting $a"
+            tar -xJf "$a" -C target/distrib/_extracted/x86_64-unknown-linux-musl
+          done
           # Same A5.2 assertion the tag-driven build runs.
-          mapfile -t bins < <(find target/distrib/_extracted/x86_64-unknown-linux-musl -type f \( -name lad -o -name la \) -perm -u+x)
-          [[ ${#bins[@]} -gt 0 ]] || { echo "::error::no lad/la in musl archive"; exit 1; }
+          mapfile -t bins < <(find target/distrib/_extracted/x86_64-unknown-linux-musl -type f \( -name lad -o -name la \))
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "::error::no lad/la in musl archives"
+            find target/distrib/_extracted/x86_64-unknown-linux-musl -type f -printf '  %p\n'
+            exit 1
+          fi
           fail=0
           for bin in "${bins[@]}"; do
             out=$(ldd "$bin" 2>&1 || true)
@@ -511,46 +508,33 @@ jobs:
       # we use it to locate the per-target artifacts so this step
       # doesn't have to guess the archive filename. Falls back to a glob
       # for forward-compat if the manifest schema shifts.
-      - name: extract dist archive for inspection
+      # cargo-dist 0.32 emits ONE archive per workspace binary (la-daemon,
+      # la-tui, la-ipc, la-adapter, la-proto) per target, so we extract
+      # ALL archives matching the target triple — picking just the first
+      # one would miss `lad` (it lives in the la-daemon archive while
+      # the alphabetically-first archive is la-adapter, which contains
+      # `mock-cli`). The A5.1/A5.2 assertions below then walk the
+      # combined extraction tree.
+      - name: extract dist archives for inspection
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/distrib/_extracted/${{ matrix.target }}
-          archive=""
-          if [[ -f target/distrib/dist-manifest.json ]]; then
-            archive=$(python3 - "${{ matrix.target }}" <<'PY'
-          import json, sys
-          target = sys.argv[1]
-          with open("target/distrib/dist-manifest.json") as f:
-              m = json.load(f)
-          for name, art in m.get("artifacts", {}).items():
-              if art.get("kind") != "executable-zip":
-                  continue
-              if target in art.get("target_triples", []):
-                  print(name)
-                  break
-          PY
-          )
-          fi
-          if [[ -z "$archive" ]]; then
-            # Manifest absent or schema shifted — fall back to a glob.
-            shopt -s nullglob
-            for candidate in target/distrib/*${{ matrix.target }}*.tar.xz target/distrib/*${{ matrix.target }}*.zip; do
-              archive=$(basename "$candidate")
-              break
-            done
-          fi
-          if [[ -z "$archive" || ! -f "target/distrib/$archive" ]]; then
-            echo "::error::could not locate dist archive for ${{ matrix.target }} under target/distrib/"
+          mkdir -p "target/distrib/_extracted/${{ matrix.target }}"
+          shopt -s nullglob
+          archives=(target/distrib/*${{ matrix.target }}*.tar.xz target/distrib/*${{ matrix.target }}*.zip)
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "::error::no dist archive for ${{ matrix.target }} under target/distrib/"
             ls -la target/distrib/ || true
             exit 1
           fi
-          echo "Inspecting archive: $archive"
-          case "$archive" in
-            *.tar.xz) tar -xJf "target/distrib/$archive" -C "target/distrib/_extracted/${{ matrix.target }}" ;;
-            *.zip)    unzip -q "target/distrib/$archive" -d "target/distrib/_extracted/${{ matrix.target }}" ;;
-            *) echo "::error::unknown archive type: $archive"; exit 1 ;;
-          esac
+          for archive in "${archives[@]}"; do
+            echo "Inspecting archive: $archive"
+            case "$archive" in
+              *.tar.xz) tar -xJf "$archive" -C "target/distrib/_extracted/${{ matrix.target }}" ;;
+              *.zip)    unzip -qo "$archive" -d "target/distrib/_extracted/${{ matrix.target }}" ;;
+              *) echo "::error::unknown archive type: $archive"; exit 1 ;;
+            esac
+          done
           echo "Extracted contents:"
           find "target/distrib/_extracted/${{ matrix.target }}" -type f -printf '%p (%s bytes)\n'
 
@@ -565,7 +549,7 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          mapfile -t bins < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la \) -perm -u+x)
+          mapfile -t bins < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la \))
           if [[ ${#bins[@]} -eq 0 ]]; then
             echo "::error::no lad/la binary found in extracted musl archive"
             find "target/distrib/_extracted/${{ matrix.target }}" -type f -printf '  %p\n'
