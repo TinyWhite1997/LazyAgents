@@ -42,7 +42,9 @@ async fn same_user_roundtrip() {
         s.read_exact(&mut body).await.unwrap();
         assert_eq!(&body, br#"{"jsonrpc":"2.0","method":"ping","id":1}"#);
         let pong = br#"{"jsonrpc":"2.0","result":"pong","id":1}"#;
-        s.write_all(&(pong.len() as u32).to_be_bytes()).await.unwrap();
+        s.write_all(&(pong.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
         s.write_all(pong).await.unwrap();
         s.shutdown().await.unwrap();
     });
@@ -51,7 +53,9 @@ async fn same_user_roundtrip() {
         .await
         .expect("client connect");
     let req = br#"{"jsonrpc":"2.0","method":"ping","id":1}"#;
-    c.write_all(&(req.len() as u32).to_be_bytes()).await.unwrap();
+    c.write_all(&(req.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
     c.write_all(req).await.unwrap();
 
     let mut len_buf = [0u8; 4];
