@@ -16,10 +16,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use la_proto::methods::{
-    AdaptersDiscover, EventsSubscribe, Initialize, Method, SessionsArchive, SessionsAttach,
-    SessionsCreate, SessionsDelete, SessionsDetach, SessionsImport, SessionsList, SessionsReplay,
-    SessionsResize, SessionsSignal, SessionsWrite, Shutdown, WorktreeCommit, WorktreeDiff,
-    WorktreeDiscard, WorktreeOpenInEditor, WorktreeStage, WorktreeStatus, WorktreeUnstage,
+    AdaptersDiscover, EventsSubscribe, Initialize, Method, MetricsScrape, SessionsArchive,
+    SessionsAttach, SessionsCreate, SessionsDelete, SessionsDetach, SessionsImport, SessionsList,
+    SessionsReplay, SessionsResize, SessionsSignal, SessionsWrite, Shutdown, WorktreeCommit,
+    WorktreeDiff, WorktreeDiscard, WorktreeOpenInEditor, WorktreeStage, WorktreeStatus,
+    WorktreeUnstage,
 };
 use la_proto::notifications::{
     CronFired, DaemonHealth, NotificationMethod, SchedulerHealth, SessionGap, SessionOutput,
@@ -58,6 +59,10 @@ fn main() {
     write_method::<WorktreeDiscard>(&out_dir);
     write_method::<WorktreeCommit>(&out_dir);
     write_method::<WorktreeOpenInEditor>(&out_dir);
+    // M4.5 / WEK-75: observability scrape RPC. Schema is part of the same
+    // golden set so a metric-naming refactor that drifts the param/result
+    // shape (e.g. adding `format: "openmetrics" | "text"`) trips CI.
+    write_method::<MetricsScrape>(&out_dir);
 
     // Notifications: only params have a schema.
     write_notification::<SessionOutput>(&out_dir);

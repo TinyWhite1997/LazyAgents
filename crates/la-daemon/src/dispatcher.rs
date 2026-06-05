@@ -257,6 +257,11 @@ struct TopicSet {
 struct AttachmentSlot {
     sub: Option<Subscription>,
     sub_id: SubId,
+    /// Backend id (`claude`, `codex`, ...) attached to this session. Used
+    /// to label `lad_session_output_bytes_total{backend}` so the gauge
+    /// matches the A9 metric naming table. Looked up from storage at
+    /// `sessions.attach` time and cached for the life of the attachment.
+    backend: String,
 }
 
 impl ConnState {
@@ -305,10 +310,10 @@ async fn run_writer(state: ConnState, ctx: ConnectionContext) {
             _ = shutdown.notified() => { break; },
             _ = attach_changed.notified() => {
                 let new = collect_new_subs(&state, &mut active).await;
-                for (id, sub) in new {
+                for (id, sub, backend) in new {
                     let send = state.send.clone();
                     sub_tasks.spawn(async move {
-                        drain_subscription(id, sub, send).await;
+                        drain_subscription(id, backend, sub, send).await;
                     });
                 }
             },
@@ -331,7 +336,7 @@ async fn run_writer(state: ConnState, ctx: ConnectionContext) {
 async fn collect_new_subs(
     state: &ConnState,
     active: &mut HashMap<SessionId, ()>,
-) -> Vec<(SessionId, Subscription)> {
+) -> Vec<(SessionId, Subscription, String)> {
     let mut new = Vec::new();
     let mut attachments = state.attachments.write().await;
     for (id, slot) in attachments.iter_mut() {
@@ -340,19 +345,27 @@ async fn collect_new_subs(
         }
         if let Some(sub) = slot.sub.take() {
             active.insert(id.clone(), ());
-            new.push((id.clone(), sub));
+            new.push((id.clone(), sub, slot.backend.clone()));
         }
     }
     new
 }
 
-async fn drain_subscription(_id: SessionId, mut sub: Subscription, send: Arc<dyn MessageSink>) {
+async fn drain_subscription(
+    _id: SessionId,
+    backend: String,
+    mut sub: Subscription,
+    send: Arc<dyn MessageSink>,
+) {
     while let Some(event) = sub.recv().await {
         let result = match event {
             HubEvent::Output(p) => {
                 if let Ok(bytes) = p.data_bytes() {
-                    metrics::counter!("lad_session_output_bytes_total")
-                        .increment(bytes.len() as u64);
+                    metrics::counter!(
+                        "lad_session_output_bytes_total",
+                        "backend" => backend.clone(),
+                    )
+                    .increment(bytes.len() as u64);
                 }
                 Notification::new(SessionOutput::NAME, &*p)
             }
@@ -418,14 +431,22 @@ async fn handle_request(req: Request, state: &ConnState, ctx: &ConnectionContext
     let method = req.method.clone();
     let trace_id = la_observ::new_trace_id();
     let span = tracing::info_span!("rpc", trace_id = %trace_id, method = %method);
+    let started = std::time::Instant::now();
     let result = dispatch(req, state, ctx).instrument(span).await;
+    let elapsed = started.elapsed().as_secs_f64();
     let result_label = if result.is_ok() { "ok" } else { "error" };
+    // M4.5 / WEK-75 — A9 metric naming table: every RPC call emits
+    // `lad_rpc_requests_total{method,result}` + a `lad_rpc_duration_seconds`
+    // histogram observation, labelled by method (no `result` label on the
+    // histogram — keeping cardinality bounded matters more than slicing
+    // success/error latency, which the dispatcher logs already carry).
     metrics::counter!(
         "lad_rpc_requests_total",
         "method" => method.clone(),
         "result" => result_label,
     )
     .increment(1);
+    metrics::histogram!("lad_rpc_duration_seconds", "method" => method.clone()).record(elapsed);
     match result {
         Ok(value) => Response {
             jsonrpc: la_proto::jsonrpc::Version,
@@ -565,6 +586,18 @@ async fn dispatch(
         la_proto::methods::RunsGet::NAME => {
             let params: la_proto::methods::RunsGetParams = decode_params(req)?;
             handle_runs_get(state, params).await
+        }
+        la_proto::methods::MetricsScrape::NAME => {
+            // M4.5 / WEK-75 — A9 metrics.scrape 三层一致性 (daemon RPC handler
+            // 层): render the in-process `metrics-exporter`-style recorder
+            // straight from `la-observ`. The body is whatever
+            // `render_prometheus` produces, unmodified — the CLI then
+            // prints it byte-identical so `lad metrics` and a future
+            // direct RPC client agree on the exposition text.
+            let _params: la_proto::methods::MetricsScrapeParams = decode_params(req)?;
+            ok(la_proto::methods::MetricsScrapeResult {
+                body: la_observ::render_prometheus(),
+            })
         }
         "shutdown" => ok(la_proto::methods::ShutdownResult {}),
         other => Err(RpcError::method_not_found(other)),
@@ -773,8 +806,11 @@ async fn handle_sessions_create(
         .spawn_with_options(&*adapter, project_id, req, worktree_opts)
         .await
         .map_err(core_to_rpc)?;
-    metrics::histogram!("lad_pty_spawn_duration_seconds")
-        .record(spawn_started.elapsed().as_secs_f64());
+    metrics::histogram!(
+        "lad_pty_spawn_duration_seconds",
+        "backend" => params.backend.clone(),
+    )
+    .record(spawn_started.elapsed().as_secs_f64());
 
     let initial_pty = ProtoPtySize {
         rows: 32,
@@ -839,6 +875,23 @@ async fn handle_sessions_attach(
         .await
         .map_err(core_to_rpc)?;
 
+    // A9 (M4.5 / WEK-75): cache the session's backend so
+    // `drain_subscription` can label `lad_session_output_bytes_total{backend}`
+    // without re-querying storage on every chunk. Missing row falls back to
+    // `"unknown"` rather than refusing the attach — losing per-backend
+    // attribution on a half-state row is preferable to dropping the
+    // attachment.
+    let backend = state
+        .manager
+        .storage()
+        .sessions()
+        .get(&params.session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.backend_id)
+        .unwrap_or_else(|| "unknown".to_string());
+
     let sub_id = outcome.subscription.id();
     {
         let mut attachments = state.attachments.write().await;
@@ -847,6 +900,7 @@ async fn handle_sessions_attach(
             AttachmentSlot {
                 sub: Some(outcome.subscription),
                 sub_id,
+                backend,
             },
         );
     }

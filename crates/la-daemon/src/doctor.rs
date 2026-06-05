@@ -135,7 +135,6 @@ pub struct DoctorAdapter {
 /// from live process state, or by tests from a fixture.
 pub struct DoctorInputs {
     pub socket_path: PathBuf,
-    pub metrics_socket_path: PathBuf,
     pub state_dir: PathBuf,
     pub server_version: String,
     /// The version reported by the running daemon over `initialize` (if
@@ -614,7 +613,6 @@ mod tests {
     fn baseline_inputs(state_dir: PathBuf) -> DoctorInputs {
         DoctorInputs {
             socket_path: state_dir.join("lad-1.sock"),
-            metrics_socket_path: state_dir.join("lad-1.metrics.sock"),
             state_dir: state_dir.clone(),
             server_version: "1.0.0".into(),
             running_daemon_version: Some("1.0.0".into()),

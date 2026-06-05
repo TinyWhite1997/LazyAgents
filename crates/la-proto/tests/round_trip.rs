@@ -22,15 +22,15 @@ use la_proto::jsonrpc::{Message, Notification, Request, RequestId, Response, Rpc
 use la_proto::methods::{
     AdaptersDiscover, AdaptersDiscoverParams, AdaptersDiscoverResult, DiscoveredSession,
     EventTopic, EventsSubscribe, EventsSubscribeParams, EventsSubscribeResult, ImportedSession,
-    Initialize, InitializeParams, InitializeResult, Method, PtySize, ServerCapabilities,
-    SessionSignal, SessionState, SessionSummary, SessionsArchive, SessionsArchiveParams,
-    SessionsAttach, SessionsAttachParams, SessionsAttachResult, SessionsCreate,
-    SessionsCreateParams, SessionsCreateResult, SessionsDelete, SessionsDeleteParams,
-    SessionsDetach, SessionsDetachParams, SessionsImport, SessionsImportParams,
-    SessionsImportResult, SessionsList, SessionsListParams, SessionsListResult, SessionsReplay,
-    SessionsReplayParams, SessionsReplayResult, SessionsResize, SessionsResizeParams,
-    SessionsSignal, SessionsSignalParams, SessionsWrite, SessionsWriteParams, SessionsWriteResult,
-    Shutdown, ShutdownParams, ShutdownResult,
+    Initialize, InitializeParams, InitializeResult, Method, MetricsScrape, MetricsScrapeParams,
+    MetricsScrapeResult, PtySize, ServerCapabilities, SessionSignal, SessionState, SessionSummary,
+    SessionsArchive, SessionsArchiveParams, SessionsAttach, SessionsAttachParams,
+    SessionsAttachResult, SessionsCreate, SessionsCreateParams, SessionsCreateResult,
+    SessionsDelete, SessionsDeleteParams, SessionsDetach, SessionsDetachParams, SessionsImport,
+    SessionsImportParams, SessionsImportResult, SessionsList, SessionsListParams,
+    SessionsListResult, SessionsReplay, SessionsReplayParams, SessionsReplayResult, SessionsResize,
+    SessionsResizeParams, SessionsSignal, SessionsSignalParams, SessionsWrite, SessionsWriteParams,
+    SessionsWriteResult, Shutdown, ShutdownParams, ShutdownResult,
 };
 use la_proto::notifications::{
     CronFired, CronFiredParams, DaemonHealth, DaemonHealthParams, NotificationMethod,
@@ -713,6 +713,19 @@ fn m1_envelope_round_trip_for_every_method() {
             },
         );
     }
+
+    // M4.5 / WEK-75 — A9 三层一致性: `metrics.scrape` is empty-params,
+    // string-body result; round-tripping it here protects the wire
+    // contract independently of the schema golden.
+    roundtrip::<MetricsScrape>(
+        &MetricsScrapeParams::default(),
+        &MetricsScrapeResult {
+            body: "# HELP lad_rpc_requests_total Total JSON-RPC requests.\n\
+                   # TYPE lad_rpc_requests_total counter\n\
+                   lad_rpc_requests_total{method=\"sessions.list\",result=\"ok\"} 1\n"
+                .into(),
+        },
+    );
 }
 
 #[test]
@@ -1193,6 +1206,7 @@ fn schema_files_match_generated_output() {
     add_method!(la_proto::methods::WorktreeDiscard);
     add_method!(la_proto::methods::WorktreeCommit);
     add_method!(la_proto::methods::WorktreeOpenInEditor);
+    add_method!(la_proto::methods::MetricsScrape);
 
     add_notif!(SessionOutput);
     add_notif!(SessionStateNotice);

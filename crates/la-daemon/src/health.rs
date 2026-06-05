@@ -244,7 +244,25 @@ async fn probe_once_and_broadcast(cfg: &ProbeLoopConfig) {
     wire_entries.sort_by(|a, b| a.id.cmp(&b.id));
 
     let running = cfg.manager.active_count().await as u32;
-    metrics::gauge!("lad_session_active").set(running as f64);
+    // A9 (M4.5 / WEK-75): per-backend gauge. Always publish one sample per
+    // registered backend so a backend that has transitioned to zero
+    // sessions overwrites its previous non-zero value instead of leaving
+    // stale data in the recorder.
+    {
+        use std::collections::HashMap;
+        let mut by_backend: HashMap<String, u64> = HashMap::new();
+        for (id, _) in &cfg.adapters {
+            by_backend.insert(id.clone(), 0);
+        }
+        if let Ok(rows) = cfg.storage.sessions().list_active().await {
+            for row in rows {
+                *by_backend.entry(row.backend_id).or_insert(0) += 1;
+            }
+        }
+        for (backend, count) in by_backend {
+            metrics::gauge!("lad_session_active", "backend" => backend).set(count as f64);
+        }
+    }
     let params = DaemonHealthParams {
         // M3 will populate this when the scheduler lands; until then we
         // honestly report zero. Keeping the field on the wire shape
@@ -284,8 +302,16 @@ async fn probe_one(id: &str, adapter: &dyn AgentAdapter) -> BackendHealthEntry {
     // `AdapterError::ProtocolDrift` (we surface that variant via the
     // `Error { detail }` path; see `looks_like_drift`) and any
     // `Error { detail }` whose detail self-identifies as drift.
+    //
+    // M4.5 / WEK-75 — A9: the canonical surface is now the
+    // `lad_adapter_drift_total{backend}` counter (architecture §9.3
+    // pinned metric naming table). The structured log on
+    // `target = "adapter_drift"` is preserved so existing log-side
+    // collectors (Loki dashboards, the WEK-29 acceptance test) keep
+    // working — it is no longer the only surface.
     if let ProbeResult::Error { detail } = &probe {
         if looks_like_drift(detail) {
+            metrics::counter!("lad_adapter_drift_total", "backend" => id.to_string()).increment(1);
             // High-priority, machine-parseable record. The `target`
             // is the metric name per task description.
             tracing::error!(

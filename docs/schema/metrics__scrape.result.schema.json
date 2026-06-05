@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MetricsScrapeResult",
+  "type": "object",
+  "required": [
+    "body"
+  ],
+  "properties": {
+    "body": {
+      "description": "Prometheus text-exposition body. Empty only if the recorder has not been installed (production daemons always install it).",
+      "type": "string"
+    }
+  }
+}

@@ -16,6 +16,37 @@ use crate::models::{
 };
 use crate::{Result, Storage, StorageError};
 
+/// Map a raw `runs.status` value (`completed` / `failed` / `timed_out` /
+/// `cancelled` / `budget_exceeded` / ...) onto the four canonical label
+/// values pinned by the A9 metric naming table for
+/// `lad_cron_runs_total{status}` (`ok` / `error` / `timeout` /
+/// `budget_rejected`).
+///
+/// Architecture §9.3 (M4.5 / WEK-75): the metric is a contract surface
+/// — dashboard panels and Prometheus alert rules slice on these four
+/// values. The raw schema enum is intentionally wider (it carries the
+/// audit detail needed for `lad runs get`), so the mapping happens at
+/// the emit boundary instead of leaking schema vocabulary outward.
+///
+/// Anything we don't recognise falls back to `error` rather than the
+/// silently-inserted unknown label that would otherwise stretch the
+/// metric's cardinality forever.
+pub(crate) fn cron_status_label(raw: &str) -> &'static str {
+    match raw {
+        "completed" => "ok",
+        "timed_out" => "timeout",
+        // Budget rejection carries either the legacy `budget_exceeded`
+        // or any future `*_rejected` flavour; map both to the
+        // contract's `budget_rejected`.
+        "budget_exceeded" => "budget_rejected",
+        s if s.ends_with("_rejected") => "budget_rejected",
+        // `failed` / `cancelled` and anything else terminal-but-bad
+        // collapses to the `error` bucket per the A9 table; the
+        // detailed reason still rides on `runs.error_kind`.
+        _ => "error",
+    }
+}
+
 pub struct BackendsRepo<'a> {
     storage: &'a Storage,
 }
@@ -473,8 +504,11 @@ impl<'a> RunsRepo<'a> {
         .await?;
         metrics::histogram!("lad_storage_write_latency_seconds", "op" => "runs.create_rejected")
             .record(started.elapsed().as_secs_f64());
-        metrics::counter!("lad_cron_runs_total", "status" => rejected.status.to_string())
-            .increment(1);
+        metrics::counter!(
+            "lad_cron_runs_total",
+            "status" => cron_status_label(rejected.status),
+        )
+        .increment(1);
         self.get(rejected.id)
             .await?
             .ok_or_else(|| StorageError::MissingRun(rejected.id.to_string()))
@@ -731,8 +765,11 @@ impl<'a> RunsRepo<'a> {
         metrics::histogram!("lad_storage_write_latency_seconds", "op" => "runs.finish")
             .record(started.elapsed().as_secs_f64());
         if result.rows_affected() > 0 {
-            metrics::counter!("lad_cron_runs_total", "status" => finish.status.clone())
-                .increment(1);
+            metrics::counter!(
+                "lad_cron_runs_total",
+                "status" => cron_status_label(&finish.status),
+            )
+            .increment(1);
             return Ok(true);
         }
 

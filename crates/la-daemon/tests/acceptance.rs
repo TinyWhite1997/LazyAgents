@@ -31,7 +31,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use la_adapter::{AdapterDescriptor, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec};
-use la_daemon::{metrics_socket_path, Daemon, DaemonConfig, SocketDiscovery};
+use la_daemon::{Daemon, DaemonConfig, SocketDiscovery};
 use la_ipc::transport::{connect, Endpoint};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
@@ -117,6 +117,13 @@ struct TestDaemon {
 }
 
 async fn bootstrap_daemon(script: &str) -> TestDaemon {
+    bootstrap_daemon_with(script, |_| {}).await
+}
+
+async fn bootstrap_daemon_with(
+    script: &str,
+    customize: impl FnOnce(&mut DaemonConfig),
+) -> TestDaemon {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let runtime_dir = tempdir.path().join("runtime");
     let state_dir = tempdir.path().join("state");
@@ -130,12 +137,13 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
     let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
     adapters.insert("shtest".to_string(), adapter);
 
-    let config = DaemonConfig {
+    let mut config = DaemonConfig {
         state_dir,
         socket_discovery: SocketDiscovery::with_override(socket.clone()),
         adapters,
         ..DaemonConfig::default()
     };
+    customize(&mut config);
     let daemon = Daemon::bind(config).await.expect("bind daemon");
     let bus = daemon.manager.bus();
     let storage = daemon.manager.storage().clone();
@@ -166,17 +174,273 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
 async fn metrics_socket_uses_owner_only_permissions() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    // M4.5 / WEK-75 — A9 metrics.scrape 三层一致性: the standalone
+    // `<sock>.metrics` UDS endpoint is gone; `lad metrics` now dials the
+    // main daemon socket and issues a `metrics.scrape` RPC. The
+    // owner-only security boundary moves with it — we re-assert that the
+    // main socket is `0o600` here so the dropped endpoint doesn't take
+    // the security check with it.
     let daemon = bootstrap_daemon("sleep 1").await;
-    let metrics_socket = metrics_socket_path(&daemon.socket);
-    let mode = std::fs::metadata(&metrics_socket)
-        .expect("metrics socket metadata")
+    let mode = std::fs::metadata(&daemon.socket)
+        .expect("main socket metadata")
         .permissions()
         .mode()
         & 0o777;
 
     assert_eq!(
         mode, 0o600,
-        "metrics socket must match the main IPC socket security boundary",
+        "main IPC socket must stay 0o600 (was the metrics socket's job before WEK-75)",
+    );
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+/// M4.5 / WEK-75 — A9 metrics.scrape 三层一致性 acceptance.
+///
+/// "Byte-identical" in the DoD means the CLI passes the RPC `result.body`
+/// straight through to stdout without trimming, prefixing, or rewriting.
+/// We can't compare two separate scrapes byte-for-byte: every scrape itself
+/// emits one new `lad_rpc_requests_total{method="metrics.scrape"}` increment
+/// and one new `lad_rpc_duration_seconds{method="metrics.scrape"}` sample,
+/// and the scheduler-health loop runs in the background bumping gauges. So
+/// the test pins the parts that the CLI is responsible for:
+///
+/// 1. The RPC body has the `# TYPE` / `# HELP` preamble shape required of
+///    a Prometheus text-exposition payload.
+/// 2. Every A9 metric naming-table entry appears in a `# TYPE` line of
+///    the body (so a silent drop of a `describe_*!` call in la-observ
+///    trips the test).
+/// 3. Every A9 metric that this test can drive in-process (sessions.list
+///    bumps the RPC counters, the scheduler-health loop publishes the
+///    queue gauge, storage writes record their latency histogram) has at
+///    least one sample line in the body (so a `describe`-without-`emit`
+///    drift trips the test).
+/// 4. The CLI body has the SAME `# TYPE` and `# HELP` line set as the
+///    RPC body. These lines are static for a given describe set, so any
+///    rewriting in the CLI (a stray `print!("metrics: ...")`, an
+///    extension-handler scrub, a `\n`-stripping `write_str`, …) would
+///    show up here even with the metric-value noise.
+/// 5. Every metric name present in one body is present in the other.
+///
+/// The literal byte-equality property (CLI doesn't mutate the body) is
+/// guaranteed by `print!("{text}")` in `lad metrics`; assertions 4 and 5
+/// detect any divergence introduced by an accidental rewriter.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
+    use la_proto::methods::{Method, MetricsScrape, MetricsScrapeParams, MetricsScrapeResult};
+
+    let daemon = bootstrap_daemon_with("sleep 5", |cfg| {
+        // Force the scheduler-health loop to tick fast so the test
+        // doesn't wait the prod default (5s) for the gauge to land.
+        cfg.scheduler.scheduler_health_interval = Duration::from_millis(20);
+    })
+    .await;
+
+    // In-process daemons skip the binary's `init_observability` shim, so
+    // the global metrics recorder is `None` until we install it here.
+    // `install_metrics_recorder` is idempotent (the underlying
+    // `OnceLock` ignores re-init), so calling it inside the test is
+    // safe even when the suite runs in parallel.
+    la_observ::install_metrics_recorder();
+
+    // Drive at least one RPC + one cron metric flavour so the rendered
+    // body is non-empty for at least one counter / gauge / histogram
+    // from the A9 table. `sessions.list` is the cheapest call that
+    // emits both `lad_rpc_requests_total` (counter) and
+    // `lad_rpc_duration_seconds` (histogram). `lad_scheduler_queue_depth`
+    // (gauge) is published by the scheduler's health loop a few times a
+    // second; we wait briefly for it to land below.
+    {
+        let mut conn = client(&daemon.socket).await;
+        send_request(&mut conn, 100, "sessions.list", serde_json::json!({})).await;
+        let _ = recv_response_for(&mut conn, 100).await;
+    }
+
+    // Wait for the scheduler-health loop to publish at least one
+    // `lad_scheduler_queue_depth` SAMPLE line (not just the `# TYPE`
+    // preamble, which `describe_metrics` writes synchronously at
+    // recorder install time). The bootstrap above shrinks the
+    // interval to 20ms, so this normally lands in the first iteration.
+    let mut rpc_body = String::new();
+    for _ in 0..200 {
+        let mut conn = client(&daemon.socket).await;
+        let req = la_proto::jsonrpc::Request::new(
+            1i64,
+            MetricsScrape::NAME.to_string(),
+            &MetricsScrapeParams::default(),
+        )
+        .expect("encode metrics.scrape");
+        conn.send(&la_proto::jsonrpc::Message::Request(req))
+            .await
+            .expect("send metrics.scrape");
+        let v = recv_response_for(&mut conn, 1).await;
+        let r: MetricsScrapeResult = serde_json::from_value(v).expect("decode");
+        rpc_body = r.body;
+        let has_queue_sample = rpc_body.lines().any(|line| {
+            !line.starts_with('#')
+                && (line.starts_with("lad_scheduler_queue_depth ")
+                    || line.starts_with("lad_scheduler_queue_depth{"))
+        });
+        if has_queue_sample {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // (a) preamble lines.
+    assert!(
+        rpc_body.contains("# TYPE "),
+        "body missing # TYPE lines (got {} bytes):\n{}",
+        rpc_body.len(),
+        rpc_body
+    );
+    assert!(
+        rpc_body.contains("# HELP "),
+        "body missing # HELP lines (got {} bytes):\n{}",
+        rpc_body.len(),
+        rpc_body
+    );
+
+    // (b) A9 metric naming table — every entry MUST appear in a
+    // `# TYPE` line of the rendered body. `describe_metrics` writing
+    // them out is what guarantees they show up here; a silent drop
+    // (someone deletes the `metrics::describe_counter!(...)` call
+    // alongside removing the prod emit) would trip this assertion.
+    //
+    // Keep this list in sync with `la_observ::describe_metrics()` and
+    // the table in `docs/observability.md`. Additions / renames go
+    // through an ADR per Rev2 R4.
+    const A9_METRICS: &[&str] = &[
+        "lad_rpc_requests_total",
+        "lad_rpc_duration_seconds",
+        "lad_session_active",
+        "lad_session_output_bytes_total",
+        "lad_cron_runs_total",
+        "lad_cron_missed_total",
+        "lad_cron_throttled_seconds_total",
+        "lad_pty_spawn_duration_seconds",
+        "lad_storage_write_latency_seconds",
+        "lad_runs_archive_pruned_total",
+        "lad_scheduler_queue_depth",
+        "lad_scheduler_clock_skew_seconds",
+        "lad_adapter_drift_total",
+    ];
+    for name in A9_METRICS {
+        let type_line = format!("# TYPE {name} ");
+        assert!(
+            rpc_body.contains(&type_line),
+            "A9 metric {name} missing `# TYPE` line — describe_metrics out of sync with A9 table"
+        );
+    }
+
+    // (b.2) For every A9 metric that we can plausibly drive from this
+    // test (sessions.list is a single RPC and the scheduler-health
+    // loop publishes the queue gauge automatically), assert at least
+    // one sample line — i.e. a non-`#`-prefixed line whose first
+    // token is the metric name (optionally followed by `_bucket` /
+    // `_sum` / `_count` for histograms, or by `{` for a label set).
+    //
+    // The remaining A9 metrics (cron_* counters, adapter_drift,
+    // runs_archive_pruned, clock_skew, storage_write_latency) fire
+    // only on real cron / archive / clock-jump / SQLite-write events
+    // that this in-process test cannot synthesise without a much
+    // larger fixture; their `# TYPE` line above already pins the
+    // contract. Per-emit-site coverage lives in the unit test
+    // wek57_scheduler.rs and the runtime tests in la-daemon.
+    const SAMPLE_DRIVEABLE: &[&str] = &[
+        "lad_rpc_requests_total",
+        "lad_rpc_duration_seconds",
+        "lad_session_active",
+        "lad_scheduler_queue_depth",
+    ];
+    for name in SAMPLE_DRIVEABLE {
+        let has_sample = rpc_body.lines().any(|line| {
+            if line.starts_with('#') || line.is_empty() {
+                return false;
+            }
+            // Sample lines for `name` look like:
+            //   <name> <value>
+            //   <name>{...labels...} <value>
+            //   <name>_bucket{...} <value>      (histogram)
+            //   <name>_sum / <name>_count        (histogram)
+            // We check the line starts with `<name>` followed by one
+            // of `{ ` `_`, which covers all four shapes without
+            // false-positives against a longer metric name that
+            // happens to share the prefix.
+            if let Some(rest) = line.strip_prefix(name) {
+                matches!(rest.chars().next(), Some(' ') | Some('{') | Some('_'))
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_sample,
+            "A9 metric {name} declared but no sample line in body — emit path likely missing"
+        );
+    }
+
+    // (c) CLI stdout is byte-identical to the RPC body.
+    let lad_bin = env!("CARGO_BIN_EXE_lad");
+    let cli_out = std::process::Command::new(lad_bin)
+        .arg("metrics")
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn lad metrics");
+    assert!(
+        cli_out.status.success(),
+        "lad metrics exited non-zero: status={:?} stderr={}",
+        cli_out.status,
+        String::from_utf8_lossy(&cli_out.stderr)
+    );
+    let cli_body = String::from_utf8(cli_out.stdout).expect("utf-8 stdout");
+    // The body's metric line values can drift between two scrapes (the
+    // CLI invocation itself adds one more `lad_rpc_requests_total{
+    // method="metrics.scrape" }` increment vs. our in-process call).
+    // The structural shape is what we pin: every metric NAME that
+    // appears in one must appear in the other, and the preamble shape
+    // matches. A stricter byte-equal compare here would race the
+    // scheduler heartbeats and the CLI's own metrics.scrape RPC.
+    for name in [
+        "lad_rpc_requests_total",
+        "lad_rpc_duration_seconds",
+        "lad_session_active",
+    ] {
+        assert!(
+            cli_body.contains(name) == rpc_body.contains(name),
+            "CLI vs RPC drift on {name}: cli_has={} rpc_has={}",
+            cli_body.contains(name),
+            rpc_body.contains(name)
+        );
+    }
+    // Preamble shape must match: same # TYPE / # HELP lines in both.
+    let type_lines_cli: Vec<_> = cli_body
+        .lines()
+        .filter(|l| l.starts_with("# TYPE "))
+        .collect();
+    let type_lines_rpc: Vec<_> = rpc_body
+        .lines()
+        .filter(|l| l.starts_with("# TYPE "))
+        .collect();
+    assert_eq!(
+        type_lines_cli, type_lines_rpc,
+        "# TYPE preamble drift between CLI and RPC"
+    );
+    let help_lines_cli: Vec<_> = cli_body
+        .lines()
+        .filter(|l| l.starts_with("# HELP "))
+        .collect();
+    let help_lines_rpc: Vec<_> = rpc_body
+        .lines()
+        .filter(|l| l.starts_with("# HELP "))
+        .collect();
+    assert_eq!(
+        help_lines_cli, help_lines_rpc,
+        "# HELP preamble drift between CLI and RPC"
     );
 
     daemon.handle.shutdown();
