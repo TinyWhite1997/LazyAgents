@@ -28,7 +28,7 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -287,6 +287,14 @@ except OSError as e:
 async fn a6_launchd_short_circuit_does_not_spawn_second_lad() {
     let (_dir, socket, _handle, _join) = bring_up().await;
 
+    // Serialize with the sibling happy-path test: cargo runs tests in
+    // the same process and `std::env::set_var` is process-global, so
+    // without this lock the happy-path test can read MANAGED_BY=launchd
+    // we just installed and fail with "expected AlreadyUp, got
+    // ManagedBy". The lock spans set-var → bootstrap → restore-var so
+    // a sibling test starting mid-flight sees one consistent state.
+    let _env_guard = env_serialization_lock().lock().expect("env mutex poisoned");
+
     let before = count_lad_processes();
 
     // Force the launchd code path. Save the prior values so we can
@@ -364,6 +372,10 @@ async fn a6_launchd_short_circuit_does_not_spawn_second_lad() {
 async fn a6_bootstrap_with_reachable_socket_and_no_env_reports_already_up() {
     let (_dir, socket, _handle, _join) = bring_up().await;
 
+    // Serialize with the sibling launchd short-circuit test — see the
+    // comment on `env_serialization_lock` for the rationale.
+    let _env_guard = env_serialization_lock().lock().expect("env mutex poisoned");
+
     let before = count_lad_processes();
     // Be defensive: a developer machine that has the var set in its
     // shell would otherwise poison this test. We save / restore.
@@ -399,6 +411,19 @@ async fn a6_bootstrap_with_reachable_socket_and_no_env_reports_already_up() {
         after, before,
         "AlreadyUp must short-circuit before any spawn; observed lad count {before} → {after}",
     );
+}
+
+fn env_serialization_lock() -> &'static Mutex<()> {
+    // Cargo runs every #[test] in this file in the same process, and
+    // `std::env::set_var` / `std::env::remove_var` mutate process-wide
+    // state. The two A6 §4 tests both mutate `LAZYAGENTS_MANAGED_BY` /
+    // `LAZYAGENTS_NO_AUTODAEMON` around their `bootstrap_daemon()`
+    // call, so without a shared mutex around the set → bootstrap →
+    // restore sequence the sibling test sees the other's mid-flight
+    // env and asserts the wrong branch. Serialize them through this
+    // lock; tests that don't touch env are unaffected.
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn count_lad_processes() -> usize {
