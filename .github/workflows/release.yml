@@ -133,10 +133,14 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-22.04
     env:
-      # PR-only stand-in for the resolved tag — `dist build` rejects
-      # an empty/branch-name RELEASE_TAG, so synthesize a SemVer-shaped
-      # placeholder. Never published; only used by `dist build --tag=`.
-      PR_DRYRUN_TAG: "v0.0.0-pr-dryrun"
+      # PR-only stand-in for the resolved tag. `dist build` requires the
+      # tag's version to match the workspace's actual published version
+      # (currently 0.1.0 — see crates/la-daemon/Cargo.toml). Bump this
+      # in lock-step with `[package] version` if the workspace version
+      # changes; otherwise `dist build` errors with "This workspace
+      # doesn't have anything for dist to Release". Never pushed; only
+      # used by `dist build --tag=`.
+      PR_DRYRUN_TAG: "v0.1.0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -228,11 +232,11 @@ jobs:
           for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
             out="target/sizes/$target.json"
             : > "$out"
-            for bin in $(find "target/distrib/_extracted/$target" -type f \( -name lad -o -name la \)); do
+            while IFS= read -r -d '' bin; do
               size=$(wc -c < "$bin")
               human=$(awk -v s="$size" 'BEGIN{printf "%.1f MiB", s/1024/1024}')
               echo "{\"target\":\"$target\",\"binary\":\"$(basename "$bin")\",\"bytes\":$size,\"human\":\"$human\"}" >> "$out"
-            done
+            done < <(find "target/distrib/_extracted/$target" -type f \( -name lad -o -name la \) -print0)
             cat "$out"
           done
 
