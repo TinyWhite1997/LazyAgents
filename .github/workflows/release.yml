@@ -85,14 +85,23 @@ jobs:
       # installer list without burning a build slot per target.
       - name: cargo dist plan (dry-run)
         run: |
+          set -euo pipefail
           dist plan --output-format=json > pr-dist-manifest.json
-          jq '.releases[0].artifacts | length' pr-dist-manifest.json
-          # Sanity: 6 targets must appear in the manifest's
-          # `artifacts` list (per target tarball/zip + installers).
-          targets=$(jq -r '[.releases[0].artifacts[] | .target_triples[]?] | unique | length' pr-dist-manifest.json)
-          echo "distinct target triples in manifest: $targets"
-          if [[ "$targets" -lt 6 ]]; then
-            echo "::error::dist plan produced fewer than 6 distinct targets — A5.3 matrix regression"
+          # cargo-dist 0.32 emits `artifacts` as a `Map<name, artifact>` at
+          # the top of the manifest; iterate the values, not `.releases[0]`
+          # (that's the per-release summary which excludes installers).
+          # Each per-target archive entry carries `target_triples`.
+          targets=$(jq -r '[.artifacts[] | select(.kind=="executable-zip") | .target_triples[]?] | unique | .[]' pr-dist-manifest.json)
+          echo "distinct target triples in manifest:"
+          echo "$targets"
+          count=$(printf '%s\n' "$targets" | grep -c .)
+          if [[ "$count" -lt 6 ]]; then
+            echo "::error::dist plan produced fewer than 6 distinct targets — A5.3 matrix regression (got $count)"
+            exit 1
+          fi
+          # A5.2 spot-check: musl artifact must be in the plan.
+          if ! printf '%s\n' "$targets" | grep -qx 'x86_64-unknown-linux-musl'; then
+            echo "::error::x86_64-unknown-linux-musl missing from dist plan — A5.2 regression"
             exit 1
           fi
       - name: install actionlint
