@@ -119,7 +119,6 @@ jobs:
 
   plan:
     name: plan
-    needs: []
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     outputs:
@@ -138,7 +137,7 @@ jobs:
         run: |
           dist plan --tag="${RELEASE_TAG}" --output-format=json > dist-manifest.json
           cat dist-manifest.json
-          echo "manifest=$(cat dist-manifest.json | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "manifest=$(base64 -w0 < dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
   build:
     # A5.3 runner pin table (do NOT use *-latest — ci.yml shares this
