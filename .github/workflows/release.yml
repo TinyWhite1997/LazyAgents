@@ -17,6 +17,16 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+*"
+  pull_request:
+    # M4.3 brief §测试: this workflow itself must dry-run on every PR
+    # that touches release config. Only the `pr_validate` job below runs
+    # on pull_request — `build` / `global` / `attest` / `host` are still
+    # gated to tag pushes via `needs:` and `if:` to keep PR CI cheap.
+    paths:
+      - "Cargo.toml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/ci.yml"
+      - "crates/la-daemon/templates/**"
   workflow_dispatch:
     inputs:
       tag:
@@ -49,8 +59,59 @@ env:
   RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
 
 jobs:
+  pr_validate:
+    # M4.3 brief §测试: PR-level dry-run + lint. Runs on every PR that
+    # touches release config (workflow paths filter above). This job is
+    # the green-check evidence that `cargo dist plan` and the workflow
+    # YAML are both valid; the heavy tag-driven jobs below stay off on
+    # PRs. Job name is stable so M4.6 can pin it as a required check on
+    # `main` alongside the ci.yml three-OS matrix.
+    name: pr validate (cargo dist plan + actionlint)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install dist
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/${CARGO_DIST_VERSION}/cargo-dist-installer.sh" \
+            | sh
+      # `dist plan` on the PR HEAD: no tag, so dist uses a placeholder
+      # version derived from Cargo.toml. We only need the planner to
+      # parse `[workspace.metadata.dist]` end-to-end and emit a valid
+      # manifest — that exercises the include list, target list, and
+      # installer list without burning a build slot per target.
+      - name: cargo dist plan (dry-run)
+        run: |
+          dist plan --output-format=json > pr-dist-manifest.json
+          jq '.releases[0].artifacts | length' pr-dist-manifest.json
+          # Sanity: 6 targets must appear in the manifest's
+          # `artifacts` list (per target tarball/zip + installers).
+          targets=$(jq -r '[.releases[0].artifacts[] | .target_triples[]?] | unique | length' pr-dist-manifest.json)
+          echo "distinct target triples in manifest: $targets"
+          if [[ "$targets" -lt 6 ]]; then
+            echo "::error::dist plan produced fewer than 6 distinct targets — A5.3 matrix regression"
+            exit 1
+          fi
+      - name: install actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.7
+          sudo mv actionlint /usr/local/bin/actionlint
+      - name: actionlint
+        run: actionlint -color .github/workflows/*.yml
+      - name: yamllint
+        run: |
+          python3 -m pip install --user yamllint==1.35.1
+          # Relax line-length + truthy-string lint to GHA-friendly
+          # defaults; everything else stays strict.
+          ~/.local/bin/yamllint -d '{extends: default, rules: {line-length: disable, truthy: disable, document-start: disable, comments: {min-spaces-from-content: 1}, comments-indentation: disable, indentation: {indent-sequences: consistent}}}' .github/workflows/
+
   plan:
     name: plan
+    needs: []
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     outputs:
       dist-manifest: ${{ steps.plan.outputs.manifest }}
@@ -163,22 +224,79 @@ jobs:
         shell: bash
         run: dist build --tag="${RELEASE_TAG}" --artifacts=local --target=${{ matrix.target }}
 
-      # A5.2: musl artifact must be statically linked. `ldd` on a static
-      # binary prints either "statically linked" (GNU ldd) or "not a
-      # dynamic executable" (musl ldd). Either is acceptance; any other
-      # output (a .so dependency line) fails the build.
+      # A5.1 + A5.2 verification operates on the binaries that
+      # cargo-dist actually shipped (the archives in `target/distrib/`),
+      # NOT the pre-pack `target/<triple>/release/` outputs. Pre-pack
+      # binaries are useful debug intermediates but they aren't what
+      # users download — for the static-linking and size guarantees to
+      # mean something, we have to crack the artifact and inspect what
+      # ends up in the tarball / zip.
+      #
+      # cargo-dist 0.32 emits `dist-manifest.json` next to the archives;
+      # we use it to locate the per-target artifacts so this step
+      # doesn't have to guess the archive filename. Falls back to a glob
+      # for forward-compat if the manifest schema shifts.
+      - name: extract dist archive for inspection
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/distrib/_extracted/${{ matrix.target }}
+          archive=""
+          if [[ -f target/distrib/dist-manifest.json ]]; then
+            archive=$(python3 - "${{ matrix.target }}" <<'PY'
+          import json, sys
+          target = sys.argv[1]
+          with open("target/distrib/dist-manifest.json") as f:
+              m = json.load(f)
+          for name, art in m.get("artifacts", {}).items():
+              if art.get("kind") != "executable-zip":
+                  continue
+              if target in art.get("target_triples", []):
+                  print(name)
+                  break
+          PY
+          )
+          fi
+          if [[ -z "$archive" ]]; then
+            # Manifest absent or schema shifted — fall back to a glob.
+            shopt -s nullglob
+            for candidate in target/distrib/*${{ matrix.target }}*.tar.xz target/distrib/*${{ matrix.target }}*.zip; do
+              archive=$(basename "$candidate")
+              break
+            done
+          fi
+          if [[ -z "$archive" || ! -f "target/distrib/$archive" ]]; then
+            echo "::error::could not locate dist archive for ${{ matrix.target }} under target/distrib/"
+            ls -la target/distrib/ || true
+            exit 1
+          fi
+          echo "Inspecting archive: $archive"
+          case "$archive" in
+            *.tar.xz) tar -xJf "target/distrib/$archive" -C "target/distrib/_extracted/${{ matrix.target }}" ;;
+            *.zip)    unzip -q "target/distrib/$archive" -d "target/distrib/_extracted/${{ matrix.target }}" ;;
+            *) echo "::error::unknown archive type: $archive"; exit 1 ;;
+          esac
+          echo "Extracted contents:"
+          find "target/distrib/_extracted/${{ matrix.target }}" -type f -printf '%p (%s bytes)\n'
+
+      # A5.2: musl artifact must be statically linked. We now ldd the
+      # binaries unpacked from the SHIPPED archive (above) — the actual
+      # bytes a user downloads. `ldd` on a static binary prints either
+      # "statically linked" (GNU ldd) or "not a dynamic executable"
+      # (musl ldd); any .so dependency line fails the build.
       - name: assert musl artifact is static (ldd)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         shell: bash
         run: |
           set -euo pipefail
           fail=0
-          for bin in target/${{ matrix.target }}/release/lad target/${{ matrix.target }}/release/la; do
-            if [[ ! -f "$bin" ]]; then
-              echo "::error::expected musl binary $bin missing"
-              fail=1
-              continue
-            fi
+          mapfile -t bins < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la \) -perm -u+x)
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "::error::no lad/la binary found in extracted musl archive"
+            find "target/distrib/_extracted/${{ matrix.target }}" -type f -printf '  %p\n'
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
             out=$(ldd "$bin" 2>&1 || true)
             echo "ldd $bin -> $out"
             case "$out" in
@@ -193,24 +311,26 @@ jobs:
           exit "$fail"
 
       # A5.1: stripped-binary size is a WARN-only soft goal (NOT a hard
-      # release gate — 硬门等 v1.x debug-symbol audit). Emit a GHA
-      # warning annotation when over 30 MiB and a per-target size JSON
-      # fragment for the release-notes table assembled in `notes`.
+      # release gate — 硬门等 v1.x debug-symbol audit). Measures the
+      # binaries inside the SHIPPED archive — the bytes a user actually
+      # downloads — and emits a per-target JSON fragment for the
+      # release-notes table assembled in `notes`. JSON lands outside
+      # `target/distrib/` so the artifact upload below doesn't bundle
+      # it into the release.
       - name: measure stripped artifact size (A5.1 WARN-only)
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/distrib/_size
-          out="target/distrib/_size/${{ matrix.target }}.json"
+          mkdir -p target/sizes
+          out="target/sizes/${{ matrix.target }}.json"
           threshold=$((30 * 1024 * 1024))
           : > "$out.tmp"
-          shopt -s nullglob
-          for bin in \
-            target/${{ matrix.target }}/release/lad \
-            target/${{ matrix.target }}/release/la \
-            target/${{ matrix.target }}/release/lad.exe \
-            target/${{ matrix.target }}/release/la.exe; do
-            [[ -f "$bin" ]] || continue
+          mapfile -t bins < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la -o -name lad.exe -o -name la.exe \))
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "::error::no la/lad binary inside the extracted dist archive for ${{ matrix.target }}"
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
             name=$(basename "$bin")
             size=$(wc -c < "$bin")
             human=$(awk -v s="$size" 'BEGIN{printf "%.1f MiB", s/1024/1024}')
@@ -222,6 +342,12 @@ jobs:
           mv "$out.tmp" "$out"
           cat "$out"
 
+      # Clean up the inspection scratch dir so it can't be uploaded into
+      # the release artifact bundle below.
+      - name: drop inspection scratch dir
+        shell: bash
+        run: rm -rf target/distrib/_extracted
+
       - name: upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -229,12 +355,14 @@ jobs:
           path: |
             target/distrib/*
             !target/distrib/*.txt
+            !target/distrib/_extracted/**
+            !target/distrib/_size/**
 
       - name: upload size fragment
         uses: actions/upload-artifact@v4
         with:
           name: sizes-${{ matrix.target }}
-          path: target/distrib/_size/*.json
+          path: target/sizes/*.json
           if-no-files-found: error
 
       # --- codesigning 占位 (M4 brief §3.3) ---
