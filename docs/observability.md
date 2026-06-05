@@ -41,11 +41,16 @@ $ lad metrics > /tmp/lad.prom    # then ingest via node_exporter textfile, etc.
 ```
 
 The acceptance test at `crates/la-daemon/tests/acceptance.rs ::
-metrics_scrape_rpc_matches_cli_stdout_bytewise` pins three properties:
-(1) `# TYPE` / `# HELP` preamble shape matches between CLI and RPC,
-(2) at least one counter + gauge + histogram from the A9 naming table
-appears, (3) every metric name present in the CLI body is also present in
-the RPC body and vice versa.
+metrics_scrape_rpc_and_cli_expose_same_a9_surface` pins five properties:
+(1) the RPC body has the `# TYPE` / `# HELP` preamble shape,
+(2) every entry in the A9 naming table appears in a `# TYPE` line of the
+body (silent drop of a `describe_*!` call trips the test),
+(3) every A9 metric the test can drive in-process
+(`lad_rpc_requests_total`, `lad_rpc_duration_seconds`, `lad_session_active`,
+`lad_scheduler_queue_depth`) has at least one sample line
+(`describe`-without-`emit` drift trips the test),
+(4) `# TYPE` / `# HELP` preamble shape matches between CLI and RPC,
+(5) every metric name present in one body is present in the other.
 
 ## A9 metric naming table
 
