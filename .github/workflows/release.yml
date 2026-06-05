@@ -852,27 +852,70 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # WEK-78 hotfix #3: cargo-dist 0.32's `dist host` pipeline is
-          # `create → upload → announce`. The prior wiring jumped
-          # straight to `upload`, which silently no-ops when no release
-          # object exists yet (the `dist host` invocations exit 0); the
-          # subsequent shell `gh release view`/`edit` then fails with
-          # `release not found` and the job exits 1. Add the create
-          # step so we land an empty draft release first, then upload
-          # artifacts onto it, then announce. Witnessed in run
-          # 27037307951 / host (github release) after the v0.1.0-rc.1
-          # third force-move.
-          dist host --tag="${RELEASE_TAG}" --steps=create
-          dist host --tag="${RELEASE_TAG}" --steps=upload
-          dist host --tag="${RELEASE_TAG}" --steps=announce
-          # Append the A5.2 musl declaration + A5.1 size table on top of
-          # whatever cargo-dist's `announce` step wrote, preserving the
-          # existing body.
-          if [[ -f target/notes/notes-extra.md ]]; then
-            existing=$(gh release view "${RELEASE_TAG}" --json body --jq .body || true)
-            {
-              [[ -n "$existing" ]] && printf '%s\n\n' "$existing"
-              cat target/notes/notes-extra.md
-            } > /tmp/release-notes.md
-            gh release edit "${RELEASE_TAG}" --notes-file /tmp/release-notes.md
+          # WEK-78 hotfix #4: the prior `dist host --steps=create/upload/
+          # announce` chain is a no-op for GitHub Release creation —
+          # those cargo-dist 0.32 steps only emit manifest intent. The
+          # actual `gh release create` lives in cargo-dist's
+          # publish_github.yml.j2 partial that we don't include (this
+          # release.yml is hand-curated with `allow-dirty = ["ci"]`).
+          # Runs 27037307951 + 27040073359 both showed `dist host`
+          # silently completing then the post-create shell `gh release
+          # view/edit` failing with "release not found" — proof no
+          # release object ever lands.
+          #
+          # Fix: assemble the full notes body up front (cargo-dist's
+          # auto body via `dist manifest --announce` + our A5.1/A5.2
+          # extras), then create the release in a single `gh release
+          # create` with --generate-notes for cargo-dist's auto-content
+          # fallback and --prerelease for the rc.1 tag, attaching all 6
+          # target archives + .sha256 + global installers as assets.
+          # Idempotent across reruns via `--clobber` on edit if the
+          # release already exists.
+          assets=()
+          while IFS= read -r f; do
+            assets+=("$f")
+          done < <(find target/distrib -maxdepth 1 -type f \( -name '*.tar.xz' -o -name '*.zip' -o -name '*.sha256' -o -name 'sha256.sum' -o -name '*.sh' -o -name '*.ps1' -o -name '*.rb' \))
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "::error::no release assets found under target/distrib/"
+            ls -la target/distrib/ || true
+            exit 1
           fi
+          echo "Found ${#assets[@]} release asset(s):"
+          for a in "${assets[@]}"; do echo "  $a"; done
+
+          # Compose notes body: A5.2 musl declaration + A5.1 size table.
+          # cargo-dist's auto body is not available without the
+          # publish_github partial, so the notes-extra file IS the body
+          # for this rc.1; future tags can switch to `gh release create
+          # --generate-notes` if/when the auto-body becomes desirable.
+          notes_path=""
+          if [[ -f target/notes/notes-extra.md ]]; then
+            notes_path="target/notes/notes-extra.md"
+          fi
+
+          prerelease_flag=""
+          case "${RELEASE_TAG}" in
+            *-rc*|*-alpha*|*-beta*|*-pre*) prerelease_flag="--prerelease" ;;
+          esac
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "release ${RELEASE_TAG} already exists; uploading assets with --clobber"
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
+            if [[ -n "$notes_path" ]]; then
+              gh release edit "${RELEASE_TAG}" --notes-file "$notes_path" ${prerelease_flag}
+            fi
+          else
+            echo "creating release ${RELEASE_TAG} ${prerelease_flag}"
+            if [[ -n "$notes_path" ]]; then
+              gh release create "${RELEASE_TAG}" "${assets[@]}" \
+                --title "${RELEASE_TAG}" \
+                --notes-file "$notes_path" \
+                ${prerelease_flag}
+            else
+              gh release create "${RELEASE_TAG}" "${assets[@]}" \
+                --title "${RELEASE_TAG}" \
+                --generate-notes \
+                ${prerelease_flag}
+            fi
+          fi
+          echo "release published: $(gh release view "${RELEASE_TAG}" --json url --jq .url)"
