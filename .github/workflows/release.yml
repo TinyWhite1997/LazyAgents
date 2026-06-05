@@ -1,21 +1,32 @@
 name: release
 
-# WEK-41 / M4.2 — multi-platform release pipeline driven by cargo-dist.
+# WEK-76 / M4.3 — multi-platform release pipeline driven by cargo-dist.
 #
 # Triggered by a SemVer tag (`v0.1.0`, `v0.2.0-rc.1`, ...). The job uses
-# the same `cargo-dist` config in workspace `Cargo.toml` for the build
-# matrix, installers, archive shape, and signing. `pr-run-mode = "plan"`
-# keeps PRs on a lightweight "would this release?" check; only tag pushes
-# produce binaries / upload artifacts.
+# the same cargo-dist config in workspace `Cargo.toml` for the artifact
+# shape, installers, and signing. `pr-run-mode = "plan"` keeps PRs on a
+# lightweight "would this release?" check; only tag pushes produce
+# binaries / upload artifacts. Real tag-cut + branch-protection flip
+# happens in WEK-78 / M4.6 — this workflow only has to be syntactically
+# valid and `cargo dist plan` clean for M4.3 acceptance.
 #
-# Scope note (WEK-5): v1 ships Linux-only validation. The other targets
-# are wired so the GHA matrix is ready when M4 RC begins macOS/Windows
-# smoke testing.
+# v1.1 扩展架构 §13 支持 x86_64-unknown-linux-musl 作为静态 Linux artifact
+# （A5.2）；aarch64-unknown-linux-musl 推 v1.x（追踪 issue: WEK-80）。
 
 on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+*"
+  pull_request:
+    # M4.3 brief §测试: this workflow itself must dry-run on every PR
+    # that touches release config. Only the `pr_validate` job below runs
+    # on pull_request — `build` / `global` / `attest` / `host` are still
+    # gated to tag pushes via `needs:` and `if:` to keep PR CI cheap.
+    paths:
+      - "Cargo.toml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/ci.yml"
+      - "crates/la-daemon/templates/**"
   workflow_dispatch:
     inputs:
       tag:
@@ -25,34 +36,280 @@ on:
 
 permissions:
   contents: write
-  # Required by `cargo-dist`'s github-attestations: it calls the
-  # `actions/attest-build-provenance` flow which needs `id-token` (for
-  # the Fulcio OIDC handshake) and `attestations` (to register them).
+  # Required by cargo-dist's github-attestations: the
+  # actions/attest-build-provenance flow needs `id-token` (Fulcio OIDC
+  # handshake) and `attestations` (Rekor registration).
   id-token: write
   attestations: write
 
 env:
-  # Pin cargo-dist so a tag we cut six months from now produces the
-  # same shape of artifacts the workspace metadata expects.
+  # Pin cargo-dist so a tag we cut six months from now produces the same
+  # artifact shape (R2: never track latest).
   CARGO_DIST_VERSION: "v0.32.0"
-  # Speed up CI by skipping unused cargo features.
+  # Pinned cross toolchain for aarch64-gnu + x86_64-musl Linux builds
+  # (brief A5.3: cargo-zigbuild, NOT cross-rs).
+  CARGO_ZIGBUILD_VERSION: "0.19.8"
+  ZIG_VERSION: "0.13.0"
   CARGO_TERM_COLOR: always
   # Resolve once: workflow_dispatch lets the operator pass an explicit
-  # `tag` input (e.g. "v0.2.0-rc.1") for a dry-run plan; tag pushes set
-  # `github.ref_name` to the tag automatically. Falling back to `ref_name`
-  # when the input is blank means a manual run from a branch (the default
-  # workflow_dispatch shape) plans for HEAD's branch name — which `dist
-  # plan` rejects with a clear error, exactly what we want instead of
-  # silently planning the wrong release.
+  # `tag` (e.g. "v0.2.0-rc.1") for a dry-run plan; tag pushes set
+  # `github.ref_name` automatically. A manual run from a branch falls
+  # back to the branch name, which `dist plan` rejects with a clear
+  # error — exactly what we want vs. silently planning the wrong release.
   RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
 
 jobs:
+  pr_validate:
+    # M4.3 brief §测试: PR-level dry-run + lint. Runs on every PR that
+    # touches release config (workflow paths filter above). This job is
+    # the green-check evidence that `cargo dist plan` and the workflow
+    # YAML are both valid; the heavy tag-driven jobs below stay off on
+    # PRs. Job name is stable so M4.6 can pin it as a required check on
+    # `main` alongside the ci.yml three-OS matrix.
+    name: pr validate (cargo dist plan + actionlint)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install dist
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/${CARGO_DIST_VERSION}/cargo-dist-installer.sh" \
+            | sh
+      # `dist plan` on the PR HEAD: no tag, so dist uses a placeholder
+      # version derived from Cargo.toml. We only need the planner to
+      # parse `[workspace.metadata.dist]` end-to-end and emit a valid
+      # manifest — that exercises the include list, target list, and
+      # installer list without burning a build slot per target.
+      - name: cargo dist plan (dry-run)
+        run: |
+          set -euo pipefail
+          dist plan --output-format=json > pr-dist-manifest.json
+          # cargo-dist 0.32 emits `artifacts` as a `Map<name, artifact>` at
+          # the top of the manifest; iterate the values, not `.releases[0]`
+          # (that's the per-release summary which excludes installers).
+          # Each per-target archive entry carries `target_triples`.
+          targets=$(jq -r '[.artifacts[] | select(.kind=="executable-zip") | .target_triples[]?] | unique | .[]' pr-dist-manifest.json)
+          echo "distinct target triples in manifest:"
+          echo "$targets"
+          count=$(printf '%s\n' "$targets" | grep -c .)
+          if [[ "$count" -lt 6 ]]; then
+            echo "::error::dist plan produced fewer than 6 distinct targets — A5.3 matrix regression (got $count)"
+            exit 1
+          fi
+          # A5.2 spot-check: musl artifact must be in the plan.
+          if ! printf '%s\n' "$targets" | grep -qx 'x86_64-unknown-linux-musl'; then
+            echo "::error::x86_64-unknown-linux-musl missing from dist plan — A5.2 regression"
+            exit 1
+          fi
+      - name: install actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.7
+          sudo mv actionlint /usr/local/bin/actionlint
+      - name: actionlint
+        run: actionlint -color .github/workflows/*.yml
+      - name: yamllint
+        run: |
+          python3 -m pip install --user yamllint==1.35.1
+          # Relax line-length + truthy-string lint to GHA-friendly
+          # defaults; everything else stays strict.
+          ~/.local/bin/yamllint -d '{extends: default, rules: {line-length: disable, truthy: disable, document-start: disable, comments: {min-spaces-from-content: 1}, comments-indentation: disable, indentation: {indent-sequences: consistent}}}' .github/workflows/
+
+  pr_build_dryrun:
+    # M4.3 brief §测试: `cargo dist build --target ...` dry-run. The
+    # full 6-target tag build is too heavy for PRs (~30+ min on the
+    # cross targets alone), so we exercise the release path on the
+    # single cheapest native target — `x86_64-unknown-linux-gnu` — and
+    # also opportunistically build the musl cross target so A5.2's
+    # static-link assertion runs against a real archive on every PR
+    # that touches release config. The other four targets (aarch64-gnu,
+    # both macOS, windows-msvc) are still exercised by the existing
+    # tag-driven `build` matrix; this job's value is catching
+    # release.yml structural bugs (archive extraction shell, jq paths,
+    # size-fragment plumbing) BEFORE tag-cut, not full coverage.
+    name: pr build dry-run (x86_64-linux-gnu + musl)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    env:
+      # PR-only stand-in for the resolved tag. `dist build` requires the
+      # tag's version to match the workspace's actual published version
+      # (currently 0.1.0 — see crates/la-daemon/Cargo.toml). Bump this
+      # in lock-step with `[package] version` if the workspace version
+      # changes; otherwise `dist build` errors with "This workspace
+      # doesn't have anything for dist to Release". Never pushed; only
+      # used by `dist build --tag=`.
+      PR_DRYRUN_TAG: "v0.1.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr-dryrun-x86_64-linux
+      - name: install zig (musl cross)
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}"
+      - name: install dist
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/${CARGO_DIST_VERSION}/cargo-dist-installer.sh" \
+            | sh
+      # Native target: cargo-dist owns the whole build + pack.
+      - name: dist build x86_64-unknown-linux-gnu
+        run: dist build --tag="${PR_DRYRUN_TAG}" --artifacts=local --target=x86_64-unknown-linux-gnu
+      # Cross target: matches the release.yml `build` job's two-step
+      # shape (cargo-zigbuild compiles, `dist build` packs). cc-rs build
+      # scripts (zstd-sys etc.) need cc to route through zig. A naive
+      # `exec zig cc -target X "$@"` wrapper fails because cc-rs also
+      # prepends its own `--target=<rust-triple>` arg, which zig rejects
+      # ("UnknownOperatingSystem" on `x86_64-unknown-linux-musl`). The
+      # wrapper below strips any `--target=...` / `-target ...` from
+      # the inherited args before adding zig's own zig-triple `-target`.
+      - name: install zigcc wrapper
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          cat > "$HOME/bin/zigcc" <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          args=()
+          while (( "$#" )); do
+            case "$1" in
+              --target=*) shift ;;
+              --target) shift 2 ;;
+              -target)   shift 2 ;;
+              *) args+=("$1"); shift ;;
+            esac
+          done
+          exec zig cc -target x86_64-linux-musl "${args[@]}"
+          EOF
+          cat > "$HOME/bin/zigcxx" <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          args=()
+          while (( "$#" )); do
+            case "$1" in
+              --target=*) shift ;;
+              --target) shift 2 ;;
+              -target)   shift 2 ;;
+              *) args+=("$1"); shift ;;
+            esac
+          done
+          exec zig c++ -target x86_64-linux-musl "${args[@]}"
+          EOF
+          chmod +x "$HOME/bin/zigcc" "$HOME/bin/zigcxx"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: dist build x86_64-unknown-linux-musl (cross)
+        env:
+          # CC/CXX route build-script cc-rs through zigcc so zstd-sys
+          # etc. can find a working musl cross-compiler. The LINKER env
+          # is deliberately NOT set: cargo-zigbuild installs its own
+          # linker shim and adding another wrapper there causes
+          # duplicate-symbol errors against rustc's musl self-contained
+          # crt files (_start / _init / _fini). For the subsequent
+          # `dist build` pack step, cargo will fall back to rust's
+          # default musl linker setup, which is fine because all C deps
+          # were already built in the zigbuild step above.
+          CC_x86_64_unknown_linux_musl: zigcc
+          CXX_x86_64_unknown_linux_musl: zigcxx
+        run: |
+          cargo zigbuild --release --target=x86_64-unknown-linux-musl -p la-daemon -p la-tui
+          dist build --tag="${PR_DRYRUN_TAG}" --artifacts=local --target=x86_64-unknown-linux-musl
+      - name: list distrib output
+        run: |
+          set -euo pipefail
+          ls -la target/distrib/
+      # `--artifacts=local` does NOT write dist-manifest.json (that's
+      # produced by `dist plan` / `dist build --artifacts=global`). The
+      # extraction steps below already fall back to a glob over
+      # target/distrib/ when the manifest is absent, but be explicit:
+      # generate the manifest now so the dry-run exercises the manifest
+      # parsing path the tag-driven flow uses.
+      - name: write dist-manifest.json
+        run: |
+          set -euo pipefail
+          # Write to a sibling path first then move into place. Some
+          # cargo-dist code paths read an existing dist-manifest.json
+          # before overwriting it; piping `>` truncates that file to 0
+          # bytes mid-read, producing "EOF while parsing JSON" errors.
+          dist plan --tag="${PR_DRYRUN_TAG}" --output-format=json > /tmp/dist-manifest.json
+          mv /tmp/dist-manifest.json target/distrib/dist-manifest.json
+          test -s target/distrib/dist-manifest.json
+      # Exercise the same extraction + size measurement code paths the
+      # tag-driven `build` job runs, so a typo in those shell blocks
+      # surfaces on PR instead of at tag-cut time. cargo-dist emits
+      # ONE archive per binary (la-daemon-<triple>.tar.xz, la-tui-...,
+      # la-ipc-..., etc.); for the dry-run we extract all archives for
+      # the target so the ldd / size checks see both `lad` and `la`.
+      - name: extract dist archives + verify (gnu)
+        run: |
+          set -euo pipefail
+          mkdir -p target/distrib/_extracted/x86_64-unknown-linux-gnu
+          shopt -s nullglob
+          archives=(target/distrib/*x86_64-unknown-linux-gnu*.tar.xz)
+          [[ ${#archives[@]} -gt 0 ]] || { echo "::error::no gnu archive in target/distrib/"; ls -la target/distrib/; exit 1; }
+          for a in "${archives[@]}"; do
+            echo "extracting $a"
+            tar -xJf "$a" -C target/distrib/_extracted/x86_64-unknown-linux-gnu
+          done
+          find target/distrib/_extracted/x86_64-unknown-linux-gnu -type f -printf '%p (%s bytes)\n'
+      - name: extract dist archives + ldd assert static (musl)
+        run: |
+          set -euo pipefail
+          mkdir -p target/distrib/_extracted/x86_64-unknown-linux-musl
+          shopt -s nullglob
+          archives=(target/distrib/*x86_64-unknown-linux-musl*.tar.xz)
+          [[ ${#archives[@]} -gt 0 ]] || { echo "::error::no musl archive in target/distrib/"; ls -la target/distrib/; exit 1; }
+          for a in "${archives[@]}"; do
+            echo "extracting $a"
+            tar -xJf "$a" -C target/distrib/_extracted/x86_64-unknown-linux-musl
+          done
+          # Same A5.2 assertion the tag-driven build runs.
+          mapfile -t bins < <(find target/distrib/_extracted/x86_64-unknown-linux-musl -type f \( -name lad -o -name la \))
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "::error::no lad/la in musl archives"
+            find target/distrib/_extracted/x86_64-unknown-linux-musl -type f -printf '  %p\n'
+            exit 1
+          fi
+          fail=0
+          for bin in "${bins[@]}"; do
+            out=$(ldd "$bin" 2>&1 || true)
+            echo "ldd $bin -> $out"
+            case "$out" in
+              *"statically linked"*|*"not a dynamic executable"*) ;;
+              *) echo "::error::$bin not static"; fail=1 ;;
+            esac
+          done
+          exit "$fail"
+      - name: size measurement smoke (A5.1)
+        run: |
+          set -euo pipefail
+          mkdir -p target/sizes
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
+            out="target/sizes/$target.json"
+            : > "$out"
+            while IFS= read -r -d '' bin; do
+              size=$(wc -c < "$bin")
+              human=$(awk -v s="$size" 'BEGIN{printf "%.1f MiB", s/1024/1024}')
+              echo "{\"target\":\"$target\",\"binary\":\"$(basename "$bin")\",\"bytes\":$size,\"human\":\"$human\"}" >> "$out"
+            done < <(find "target/distrib/_extracted/$target" -type f \( -name lad -o -name la \) -print0)
+            cat "$out"
+          done
+
   plan:
     name: plan
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
     outputs:
       dist-manifest: ${{ steps.plan.outputs.manifest }}
-      val: ${{ steps.plan.outputs.val }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,9 +324,33 @@ jobs:
         run: |
           dist plan --tag="${RELEASE_TAG}" --output-format=json > dist-manifest.json
           cat dist-manifest.json
-          echo "manifest=$(cat dist-manifest.json | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "manifest=$(base64 -w0 < dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
   build:
+    # A5.3 runner pin table (do NOT use *-latest — ci.yml shares this
+    # mapping and tag-cut reproducibility depends on the pin):
+    #
+    #   x86_64-unknown-linux-gnu   → ubuntu-22.04                (native)
+    #   aarch64-unknown-linux-gnu  → ubuntu-22.04 + zigbuild     (cross)
+    #   x86_64-unknown-linux-musl  → ubuntu-22.04 + zigbuild     (cross)
+    #   aarch64-apple-darwin       → macos-14                    (native)
+    #   x86_64-apple-darwin        → macos-15-intel              (native)
+    #   x86_64-pc-windows-msvc     → windows-2022                (native)
+    #
+    # `macos-15-intel` (NOT the brief's `macos-13`): GitHub retired the
+    # `macos-13` hosted runner image on 2025-12-04 — see
+    # https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/
+    # On a workflow that still references `macos-13` the job queues
+    # forever with `runner_name: ""` (verified on PR #60 first run; CI
+    # check `ci / macos-13` stayed pending indefinitely). The replacement
+    # for an Intel macOS pin is `macos-15-intel`, the last x86_64 image
+    # GitHub will offer until Fall 2027. This is the "现实修正" the
+    # macOS reviewer explicitly authorized; brief's `macos-13` was
+    # written pre-retirement. ci.yml is updated in lock-step in the
+    # same commit so the runner-pin table stays consistent across both
+    # CI and release. When `macos-15-intel` itself retires, follow the
+    # same pattern: pin the next fixed Intel image, never revert to
+    # `macos-latest` or `macos-*-latest`.
     name: build (${{ matrix.target }})
     needs: plan
     strategy:
@@ -78,19 +359,49 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
+            cross: false
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04-arm
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: ubuntu-22.04
+            cross: true
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            cross: true
           - target: aarch64-apple-darwin
             runner: macos-14
+            cross: false
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            cross: false
           - target: x86_64-pc-windows-msvc
             runner: windows-2022
+            cross: false
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dist-${{ matrix.target }}
+
+      # cargo-zigbuild + zig deliver the cross Linux targets (A5.3).
+      # cross-rs is intentionally NOT used: zigbuild is the path brief
+      # A5.3 locked in, and switching toolchains mid-stream costs us
+      # reproducibility (linker, libc shim, sysroot all change).
+      - name: install zig (cross linux)
+        if: matrix.cross == true
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: install cargo-zigbuild (cross linux)
+        if: matrix.cross == true
+        run: cargo install --locked cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}"
+
       - name: install dist (unix)
         if: runner.os != 'Windows'
         run: |
@@ -102,15 +413,200 @@ jobs:
         shell: pwsh
         run: |
           irm "https://github.com/axodotdev/cargo-dist/releases/download/${{ env.CARGO_DIST_VERSION }}/cargo-dist-installer.ps1" | iex
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: dist-${{ matrix.target }}
-      # `dist build` builds the binaries + tarballs/zips for this host's
-      # target. The `dist` profile (Cargo.toml) drives lto/strip; the
-      # workspace metadata picks installers + target list.
-      - name: build local artifacts
-        run: dist build --tag="${RELEASE_TAG}" --artifacts=local --target=${{ matrix.target }}
+
+      # Native targets go through `dist build` (uses [profile.dist] from
+      # Cargo.toml; reads workspace.metadata.dist for installers).
+      - name: build local artifacts (native)
+        if: matrix.cross == false
         shell: bash
+        run: dist build --tag="${RELEASE_TAG}" --artifacts=local --target=${{ matrix.target }}
+
+      # Cross targets (aarch64-gnu, x86_64-musl): cargo-zigbuild builds
+      # the binaries first, then `dist build` packs the archives off
+      # the already-populated target dir.
+      #
+      # The `dist build` pack step re-invokes cargo workspace-wide, so
+      # cc-rs build scripts (zstd-sys, etc.) need the same zig-as-cc
+      # routing cargo-zigbuild itself uses — install a tiny wrapper.
+      - name: install zigcc wrapper (cross)
+        if: matrix.cross == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)  zig_target=aarch64-linux-gnu ;;
+            x86_64-unknown-linux-musl)  zig_target=x86_64-linux-musl ;;
+            *) echo "unhandled cross target ${{ matrix.target }}"; exit 1 ;;
+          esac
+          # Strip any --target=<rust-triple> that cc-rs prepends — zig
+          # rejects the rust triple ("UnknownOperatingSystem") and needs
+          # its own zig-triple form via `-target`.
+          cat > "$HOME/bin/zigcc" <<EOF
+          #!/usr/bin/env bash
+          set -e
+          args=()
+          while (( "\$#" )); do
+            case "\$1" in
+              --target=*) shift ;;
+              --target) shift 2 ;;
+              -target)   shift 2 ;;
+              *) args+=("\$1"); shift ;;
+            esac
+          done
+          exec zig cc -target $zig_target "\${args[@]}"
+          EOF
+          cat > "$HOME/bin/zigcxx" <<EOF
+          #!/usr/bin/env bash
+          set -e
+          args=()
+          while (( "\$#" )); do
+            case "\$1" in
+              --target=*) shift ;;
+              --target) shift 2 ;;
+              -target)   shift 2 ;;
+              *) args+=("\$1"); shift ;;
+            esac
+          done
+          exec zig c++ -target $zig_target "\${args[@]}"
+          EOF
+          chmod +x "$HOME/bin/zigcc" "$HOME/bin/zigcxx"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: build binaries (cross)
+        if: matrix.cross == true
+        shell: bash
+        env:
+          # CC_<triple> / CXX_<triple> only — NOT the LINKER env var.
+          # cargo-zigbuild installs its own linker shim; piling our
+          # zigcc on top causes duplicate-symbol errors against rustc's
+          # musl self-contained crt files (_start / _init / _fini).
+          CC_aarch64_unknown_linux_gnu: zigcc
+          CXX_aarch64_unknown_linux_gnu: zigcxx
+          CC_x86_64_unknown_linux_musl: zigcc
+          CXX_x86_64_unknown_linux_musl: zigcxx
+        run: |
+          cargo zigbuild --release --target=${{ matrix.target }} -p la-daemon -p la-tui
+      - name: pack archives (cross)
+        if: matrix.cross == true
+        shell: bash
+        env:
+          CC_aarch64_unknown_linux_gnu: zigcc
+          CXX_aarch64_unknown_linux_gnu: zigcxx
+          CC_x86_64_unknown_linux_musl: zigcc
+          CXX_x86_64_unknown_linux_musl: zigcxx
+        run: dist build --tag="${RELEASE_TAG}" --artifacts=local --target=${{ matrix.target }}
+
+      # A5.1 + A5.2 verification operates on the binaries that
+      # cargo-dist actually shipped (the archives in `target/distrib/`),
+      # NOT the pre-pack `target/<triple>/release/` outputs. Pre-pack
+      # binaries are useful debug intermediates but they aren't what
+      # users download — for the static-linking and size guarantees to
+      # mean something, we have to crack the artifact and inspect what
+      # ends up in the tarball / zip.
+      #
+      # cargo-dist 0.32 emits `dist-manifest.json` next to the archives;
+      # we use it to locate the per-target artifacts so this step
+      # doesn't have to guess the archive filename. Falls back to a glob
+      # for forward-compat if the manifest schema shifts.
+      # cargo-dist 0.32 emits ONE archive per workspace binary (la-daemon,
+      # la-tui, la-ipc, la-adapter, la-proto) per target, so we extract
+      # ALL archives matching the target triple — picking just the first
+      # one would miss `lad` (it lives in the la-daemon archive while
+      # the alphabetically-first archive is la-adapter, which contains
+      # `mock-cli`). The A5.1/A5.2 assertions below then walk the
+      # combined extraction tree.
+      - name: extract dist archives for inspection
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "target/distrib/_extracted/${{ matrix.target }}"
+          shopt -s nullglob
+          archives=(target/distrib/*${{ matrix.target }}*.tar.xz target/distrib/*${{ matrix.target }}*.zip)
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "::error::no dist archive for ${{ matrix.target }} under target/distrib/"
+            ls -la target/distrib/ || true
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            echo "Inspecting archive: $archive"
+            case "$archive" in
+              *.tar.xz) tar -xJf "$archive" -C "target/distrib/_extracted/${{ matrix.target }}" ;;
+              *.zip)    unzip -qo "$archive" -d "target/distrib/_extracted/${{ matrix.target }}" ;;
+              *) echo "::error::unknown archive type: $archive"; exit 1 ;;
+            esac
+          done
+          echo "Extracted contents:"
+          find "target/distrib/_extracted/${{ matrix.target }}" -type f -printf '%p (%s bytes)\n'
+
+      # A5.2: musl artifact must be statically linked. We now ldd the
+      # binaries unpacked from the SHIPPED archive (above) — the actual
+      # bytes a user downloads. `ldd` on a static binary prints either
+      # "statically linked" (GNU ldd) or "not a dynamic executable"
+      # (musl ldd); any .so dependency line fails the build.
+      - name: assert musl artifact is static (ldd)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          mapfile -t bins < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la \))
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "::error::no lad/la binary found in extracted musl archive"
+            find "target/distrib/_extracted/${{ matrix.target }}" -type f -printf '  %p\n'
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
+            out=$(ldd "$bin" 2>&1 || true)
+            echo "ldd $bin -> $out"
+            case "$out" in
+              *"statically linked"*|*"not a dynamic executable"*)
+                ;;
+              *)
+                echo "::error::$bin is NOT statically linked (ldd: $out)"
+                fail=1
+                ;;
+            esac
+          done
+          exit "$fail"
+
+      # A5.1: stripped-binary size is a WARN-only soft goal (NOT a hard
+      # release gate — 硬门等 v1.x debug-symbol audit). Measures the
+      # binaries inside the SHIPPED archive — the bytes a user actually
+      # downloads — and emits a per-target JSON fragment for the
+      # release-notes table assembled in `notes`. JSON lands outside
+      # `target/distrib/` so the artifact upload below doesn't bundle
+      # it into the release.
+      - name: measure stripped artifact size (A5.1 WARN-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/sizes
+          out="target/sizes/${{ matrix.target }}.json"
+          threshold=$((30 * 1024 * 1024))
+          : > "$out.tmp"
+          mapfile -t bins < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la -o -name lad.exe -o -name la.exe \))
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "::error::no la/lad binary inside the extracted dist archive for ${{ matrix.target }}"
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
+            name=$(basename "$bin")
+            size=$(wc -c < "$bin")
+            human=$(awk -v s="$size" 'BEGIN{printf "%.1f MiB", s/1024/1024}')
+            echo "{\"target\":\"${{ matrix.target }}\",\"binary\":\"$name\",\"bytes\":$size,\"human\":\"$human\"}" >> "$out.tmp"
+            if (( size > threshold )); then
+              echo "::warning title=Size budget (A5.1 soft)::${{ matrix.target }}/$name = $human > 30 MiB soft goal — does NOT fail release; tracked in v1.x debug-symbol audit"
+            fi
+          done
+          mv "$out.tmp" "$out"
+          cat "$out"
+
+      # Clean up the inspection scratch dir so it can't be uploaded into
+      # the release artifact bundle below.
+      - name: drop inspection scratch dir
+        shell: bash
+        run: rm -rf target/distrib/_extracted
+
       - name: upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -118,11 +614,56 @@ jobs:
           path: |
             target/distrib/*
             !target/distrib/*.txt
+            !target/distrib/_extracted/**
+            !target/distrib/_size/**
+
+      - name: upload size fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: sizes-${{ matrix.target }}
+          path: target/sizes/*.json
+          if-no-files-found: error
+
+      # --- codesigning 占位 (M4 brief §3.3) ---
+      # macOS notarization stays as an `if: false` placeholder until a
+      # Developer ID + notarization key is provisioned. Wiring is in
+      # tree so the eventual flip is a one-line `if:` change. Keys live
+      # in repo secrets when ready; never log them. Secret names are
+      # spelled out per Apple's notarytool / App Store Connect API
+      # nomenclature so the operator wiring them up cannot confuse the
+      # .p8 private key file with a keychain item or app-specific
+      # password:
+      #   - MACOS_DEVELOPER_ID_CERT_P12      Developer ID Application cert export (.p12 base64)
+      #   - MACOS_DEVELOPER_ID_CERT_PASSWORD password for the .p12 above
+      #   - MACOS_NOTARY_KEY_P8              App Store Connect API key (.p8) contents, base64
+      #   - MACOS_NOTARY_KEY_ID              the Key ID shown in App Store Connect (e.g. ABCD1234EF)
+      #   - MACOS_NOTARY_ISSUER_ID           the Issuer ID UUID shown next to the key
+      - name: macOS codesign + notarize (placeholder)
+        if: false  # codesigning 占位 — flip when MACOS_NOTARY_KEY_P8 exists
+        env:
+          MACOS_DEVELOPER_ID_CERT_P12: ${{ secrets.MACOS_DEVELOPER_ID_CERT_P12 }}
+          MACOS_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERT_PASSWORD }}
+          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          echo "macOS codesign + notarize: not yet provisioned. cosign-equivalent for binaries is handled by the sigstore attest job."
+
+      # Windows Authenticode signing follows the same placeholder pattern.
+      # cosign 同步推 v1.x (M4 brief §3.3) — keyless sigstore stays as the
+      # v1 baseline through actions/attest-build-provenance.
+      - name: Windows Authenticode sign (placeholder)
+        if: false  # codesigning 占位 — flip when WINDOWS_AUTHENTICODE_CERT_PFX exists
+        env:
+          WINDOWS_AUTHENTICODE_CERT_PFX: ${{ secrets.WINDOWS_AUTHENTICODE_CERT_PFX }}
+          WINDOWS_AUTHENTICODE_CERT_PASSWORD: ${{ secrets.WINDOWS_AUTHENTICODE_CERT_PASSWORD }}
+        run: |
+          echo "Windows Authenticode signing: not yet provisioned."
 
   global:
     name: global installers (shell / powershell / homebrew)
     needs: [plan, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -139,10 +680,10 @@ jobs:
           path: target/distrib
           merge-multiple: true
       # `dist build --artifacts=global` produces install.sh, install.ps1,
-      # and the Homebrew formula. They are anchored at the planned
-      # download URLs and reference each per-target checksum. (Scoop
-      # manifest is intentionally NOT generated — see Cargo.toml dist
-      # metadata comment for why it's a follow-up.)
+      # and the Homebrew formula. R3: install.ps1 / install.sh print the
+      # "lad runs only while you are logged in" line via Cargo.toml's
+      # `install-success-msg`. Scoop manifest is NOT generated — see
+      # WEK-64 follow-up.
       - name: build global installers
         run: dist build --tag="${RELEASE_TAG}" --artifacts=global
       - name: upload global artifacts
@@ -154,7 +695,7 @@ jobs:
   attest:
     name: sigstore attestations
     needs: [plan, build, global]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: download all artifacts
         uses: actions/download-artifact@v4
@@ -163,14 +704,13 @@ jobs:
           path: artifacts
           merge-multiple: true
       # Keyless sigstore signing via Fulcio OIDC (functionally equivalent
-      # to `cosign sign-blob` on every release artifact). Replaces the
-      # task spec's "cosign 二进制签名" item with GitHub's first-party
-      # sigstore-backed attestation flow — same trust root, less infra.
+      # to `cosign sign-blob` per release artifact). Replaces standalone
+      # cosign with GitHub's first-party attestation flow — same trust
+      # root, less infra. cosign itself stays deferred to v1.x.
       #
-      # The binary globs are deliberately exhaustive instead of
-      # `artifacts/**/la*` because `la*` would also pick up `lad`, and
-      # double-attesting the same blob just burns Rekor log entries
-      # without adding signal. List each filename explicitly.
+      # Binary globs are exhaustive instead of `artifacts/**/la*`
+      # because `la*` would double-attest `lad`, burning Rekor log
+      # entries without adding signal.
       - name: sigstore attest-build-provenance
         uses: actions/attest-build-provenance@v4
         with:
@@ -184,10 +724,65 @@ jobs:
             artifacts/**/*.sh
             artifacts/**/*.ps1
 
+  notes:
+    # A5.1: assemble the release-notes size table from per-target
+    # `sizes-*` fragments. Runs even on `workflow_dispatch` (no upload)
+    # so a dry-run plan can eyeball the table before tagging.
+    #
+    # A5.2: also emit the musl extension declaration block — the brief
+    # requires this declaration land in the release-notes TEMPLATE
+    # (what users read in the GitHub Release), not just in workflow /
+    # Cargo.toml comments. The block is concatenated ahead of the size
+    # table so the `host` job can append the combined notes-extra.md
+    # in a single edit.
+    name: assemble release notes extras (A5.1 size table + A5.2 musl declaration)
+    needs: [plan, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: download size fragments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sizes-*
+          path: sizes
+          merge-multiple: true
+      - name: render release-notes extras
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Linux musl artifact (A5.2)"
+            echo
+            echo "This release ships a statically-linked \`x86_64-unknown-linux-musl\` artifact alongside the GNU Linux targets, per v1.1 扩展架构 §13. Suitable for Alpine / glibc-less environments."
+            echo
+            echo "\`aarch64-unknown-linux-musl\` is **not** in this release; it is tracked for v1.x via [WEK-80](https://github.com/TinyWhite1997/LazyAgents/issues) (推 v1.x)."
+            echo
+            echo "## Artifact sizes (stripped, soft goal: < 30 MiB — A5.1 WARN-only)"
+            echo
+            echo "| target | binary | size |"
+            echo "|---|---|---|"
+            for f in sizes/*.json; do
+              [[ -f "$f" ]] || continue
+              while IFS= read -r line; do
+                [[ -n "$line" ]] || continue
+                target=$(printf '%s' "$line" | sed -n 's/.*"target":"\([^"]*\)".*/\1/p')
+                binary=$(printf '%s' "$line" | sed -n 's/.*"binary":"\([^"]*\)".*/\1/p')
+                human=$(printf '%s' "$line" | sed -n 's/.*"human":"\([^"]*\)".*/\1/p')
+                echo "| \`$target\` | \`$binary\` | $human |"
+              done < "$f"
+            done
+            echo
+            echo "> A5.1 soft goal — over-budget rows emit a CI warning but do NOT block release. Hard size gate lands with the v1.x debug-symbol audit."
+          } > notes-extra.md
+          cat notes-extra.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes-extra
+          path: notes-extra.md
+
   host:
     name: host (github release)
-    needs: [plan, build, global, attest]
-    runs-on: ubuntu-latest
+    needs: [plan, build, global, attest, notes]
+    runs-on: ubuntu-22.04
     # Only real tag pushes upload; manual workflow_dispatch stays a dry run.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -205,9 +800,26 @@ jobs:
           pattern: artifacts-*
           path: target/distrib
           merge-multiple: true
+      - name: download release notes extras
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes-extra
+          path: target/notes
       - name: upload to github release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           dist host --tag="${RELEASE_TAG}" --steps=upload
           dist host --tag="${RELEASE_TAG}" --steps=announce
+          # Append the A5.2 musl declaration + A5.1 size table on top of
+          # whatever cargo-dist's `announce` step wrote, preserving the
+          # existing body.
+          if [[ -f target/notes/notes-extra.md ]]; then
+            existing=$(gh release view "${RELEASE_TAG}" --json body --jq .body || true)
+            {
+              [[ -n "$existing" ]] && printf '%s\n\n' "$existing"
+              cat target/notes/notes-extra.md
+            } > /tmp/release-notes.md
+            gh release edit "${RELEASE_TAG}" --notes-file /tmp/release-notes.md
+          fi
