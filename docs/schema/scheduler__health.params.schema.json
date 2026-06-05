@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SchedulerHealthParams",
+  "type": "object",
+  "required": [
+    "errors_last_5m",
+    "queue_depth",
+    "running_global",
+    "running_per_cron",
+    "throttled_by_loadavg"
+  ],
+  "properties": {
+    "queue_depth": {
+      "description": "Number of fires currently buffered between the heap and the run executor (excluding the run that is mid-admission). A spike here means the heap is producing fires faster than the executor can drain them — usually because the global concurrency cap is saturated.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "running_global": {
+      "description": "Live count of cron-spawned runs in the `running` state. Mirrors the gate the admission rail uses for `global_max_concurrent_runs` — *not* the count of all sessions (interactive ones don't count).",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "running_per_cron": {
+      "description": "Per-cron live running count. Only crons with `> 0` running runs are listed; an empty map means everything that fired is currently idle. Keyed by `cron_id`.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0.0
+      }
+    },
+    "throttled_by_loadavg": {
+      "description": "`true` when the last admission decision deferred a fire because the 1-min loadavg sample exceeded the configured `cpu_load_throttle` threshold (§5.4 / §11.1). `false` when loadavg is fine or the platform has no loadavg surface (Windows).",
+      "type": "boolean"
+    },
+    "errors_last_5m": {
+      "description": "Terminal run failures observed in the last 5 minutes (any cron). The TUI status bar uses this to flip the queue indicator dot from green to amber/red without a separate `runs.list` round-trip.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "next_fire": {
+      "description": "Next scheduled fire across all enabled crons. `None` when the heap is empty.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SchedulerHealthNextFire"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "SchedulerHealthNextFire": {
+      "description": "Next-fire hint embedded in [`SchedulerHealthParams`]. Carries enough to render the status-bar \"next ↻\" indicator without a `crons.list` round-trip.",
+      "type": "object",
+      "required": [
+        "at",
+        "cron_id"
+      ],
+      "properties": {
+        "cron_id": {
+          "type": "string"
+        },
+        "at": {
+          "description": "RFC3339 wall-clock time the cron will fire next, after backoff flooring has been applied.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

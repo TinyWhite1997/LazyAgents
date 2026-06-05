@@ -365,36 +365,40 @@ fn run(p: Parsed) -> ExitCode {
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
             let metrics_socket = la_daemon::metrics_socket_path(&loc.socket_path);
-            println!("socket path:    {}", loc.socket_path.display());
-            println!("metrics socket: {}", metrics_socket.display());
-            println!("runtime dir:    {}", loc.runtime_dir.display());
-            println!("state dir:      {}", state_dir.display());
-            println!("server version: {SERVER_VERSION}");
-            println!(
-                "runtime writable: {}",
-                check_writable_dir(&loc.runtime_dir)
-                    .map(|_| "ok".to_string())
-                    .unwrap_or_else(|e| format!("failed ({e})"))
-            );
-            println!(
-                "state writable:   {}",
-                check_writable_dir(&state_dir)
-                    .map(|_| "ok".to_string())
-                    .unwrap_or_else(|e| format!("failed ({e})"))
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::net::UnixStream;
-                match UnixStream::connect(&loc.socket_path) {
-                    Ok(_) => println!("status:         a daemon is already listening"),
-                    Err(_) => println!("status:         no daemon listening"),
-                }
-            }
-            println!("adapters:");
-            for (id, result) in probe_adapters() {
-                println!("  {id}: {}", render_probe(&result));
-            }
-            ExitCode::SUCCESS
+            let adapter_pairs: Vec<(&'static str, std::sync::Arc<dyn AgentAdapter>)> = vec![
+                ("claude", std::sync::Arc::new(ClaudeAdapter::new())),
+                ("codex", std::sync::Arc::new(CodexAdapter::new())),
+                ("opencode", std::sync::Arc::new(OpencodeAdapter::new())),
+            ];
+            let doctor_adapters: Vec<la_daemon::doctor::DoctorAdapter> = adapter_pairs
+                .into_iter()
+                .map(|(id, a)| la_daemon::doctor::DoctorAdapter {
+                    id: id.to_string(),
+                    adapter: a,
+                    // The CLI runs out-of-process from the daemon; we
+                    // don't have the daemon's HealthRegistry on hand,
+                    // so we leave the "last probe N ago" cell blank.
+                    // The probe below is fresh by definition, so the
+                    // user still sees current state.
+                    last_probe_age: None,
+                })
+                .collect();
+            let adapter_probes = la_daemon::doctor::probe_adapters_sync(&doctor_adapters);
+            let inputs = la_daemon::doctor::DoctorInputs {
+                socket_path: loc.socket_path.clone(),
+                metrics_socket_path: metrics_socket,
+                state_dir: state_dir.clone(),
+                server_version: SERVER_VERSION.to_string(),
+                running_daemon_version: query_running_daemon_version(&loc.socket_path),
+                state_dir_free_bytes: la_daemon::doctor::detect_state_dir_free_bytes(&state_dir),
+                adapters: doctor_adapters,
+                git_version: la_daemon::doctor::detect_git_version(),
+                daemon_reachable: la_daemon::doctor::probe_daemon_reachable(&loc.socket_path),
+                adapter_probes,
+            };
+            let report = la_daemon::doctor::run_with_inputs(&inputs);
+            print!("{}", report.render());
+            ExitCode::from(report.tier.code())
         }
         Command::Backup { output } => {
             let output = output.clone();
@@ -721,45 +725,53 @@ fn run_backup(
     })
 }
 
-fn check_writable_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let probe = dir.join(".lazyagents-write-probe");
-    std::fs::write(&probe, b"ok")?;
-    std::fs::remove_file(probe)?;
-    Ok(())
-}
+/// Best-effort fetch of the running daemon's reported version, used by
+/// the doctor "daemon version" check. Returns `None` when the daemon
+/// isn't reachable or the initialize handshake doesn't complete inside
+/// the timeout — both cases collapse to "skip the match" in
+/// `doctor::check_daemon_version_match`.
+fn query_running_daemon_version(socket: &std::path::Path) -> Option<String> {
+    use la_ipc::connection::Connection;
+    use la_ipc::handshake::client_handshake;
+    use la_ipc::transport::{connect, Endpoint};
 
-fn probe_adapters() -> Vec<(&'static str, ProbeResult)> {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
         .build()
-    {
-        Ok(rt) => rt,
-        Err(err) => {
-            return vec![(
-                "all",
-                ProbeResult::Error {
-                    detail: format!("tokio runtime build failed: {err}"),
-                },
-            )]
-        }
-    };
-    runtime.block_on(async {
-        vec![
-            ("claude", ClaudeAdapter::new().probe().await),
-            ("codex", CodexAdapter::new().probe().await),
-            ("opencode", OpencodeAdapter::new().probe().await),
-        ]
+        .ok()?;
+    rt.block_on(async {
+        let endpoint = match () {
+            #[cfg(unix)]
+            () => Endpoint::uds(socket),
+            #[cfg(not(unix))]
+            () => Endpoint::named_pipe(format!(
+                r"\\.\pipe\lazyagents-{}",
+                socket.file_stem().and_then(|s| s.to_str()).unwrap_or("lad")
+            )),
+        };
+        let stream = tokio::time::timeout(Duration::from_millis(500), connect(&endpoint))
+            .await
+            .ok()?
+            .ok()?;
+        // The transport returns a concrete `tokio::net::UnixStream` /
+        // `NamedPipeClient`; wrap it into the framed `Connection` so
+        // `client_handshake` can drive the JSON-RPC exchange.
+        let mut conn = Connection::new(stream);
+        let info = tokio::time::timeout(
+            Duration::from_millis(500),
+            client_handshake(
+                &mut conn,
+                "lad-doctor",
+                SERVER_VERSION,
+                &[la_proto::PROTOCOL_VERSION],
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        Some(info.server_version)
     })
-}
-
-fn render_probe(result: &ProbeResult) -> String {
-    match result {
-        ProbeResult::Available { version } => format!("available version={version}"),
-        ProbeResult::NotInstalled { hint } => format!("not_installed hint={hint}"),
-        ProbeResult::Unauthenticated { docs_url } => format!("unauthenticated docs={docs_url}"),
-        ProbeResult::Error { detail } => format!("error detail={detail}"),
-    }
 }
 
 fn run_foreground(

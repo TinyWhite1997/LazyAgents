@@ -33,8 +33,9 @@ use la_proto::methods::{
     Shutdown, ShutdownParams, ShutdownResult,
 };
 use la_proto::notifications::{
-    CronFired, CronFiredParams, DaemonHealth, DaemonHealthParams, NotificationMethod, SessionGap,
-    SessionGapParams, SessionOutput, SessionOutputParams, SessionStateNotice, SessionStateParams,
+    CronFired, CronFiredParams, DaemonHealth, DaemonHealthParams, NotificationMethod,
+    SchedulerHealth, SchedulerHealthNextFire, SchedulerHealthParams, SessionGap, SessionGapParams,
+    SessionOutput, SessionOutputParams, SessionStateNotice, SessionStateParams,
 };
 use la_proto::{
     error_codes, to_rpc_error, ErrorKind, PROTOCOL_VERSION, SESSION_OUTPUT_CHUNK_BYTES,
@@ -899,6 +900,59 @@ fn daemon_health_backends_status_serializes_as_snake_case() {
     assert_eq!(back, health);
 }
 
+#[test]
+fn scheduler_health_notification_round_trip() {
+    let mut running_per_cron = std::collections::BTreeMap::new();
+    running_per_cron.insert("cron-a".to_string(), 1);
+    running_per_cron.insert("cron-b".to_string(), 2);
+    let params = SchedulerHealthParams {
+        queue_depth: 3,
+        running_global: 3,
+        running_per_cron,
+        throttled_by_loadavg: false,
+        errors_last_5m: 0,
+        next_fire: Some(SchedulerHealthNextFire {
+            cron_id: "cron-a".into(),
+            at: "2026-06-04T09:00:00Z".into(),
+        }),
+    };
+    let n = Notification::new(SchedulerHealth::NAME, &params).unwrap();
+    let back: SchedulerHealthParams =
+        match Message::from_slice(&serde_json::to_vec(&n).unwrap()).unwrap() {
+            Message::Notification(nn) => nn.params_as().unwrap(),
+            _ => panic!(),
+        };
+    assert_eq!(back, params);
+}
+
+#[test]
+fn scheduler_health_omits_next_fire_when_heap_is_empty() {
+    let params = SchedulerHealthParams {
+        queue_depth: 0,
+        running_global: 0,
+        running_per_cron: std::collections::BTreeMap::new(),
+        throttled_by_loadavg: false,
+        errors_last_5m: 0,
+        next_fire: None,
+    };
+    let s = serde_json::to_string(&params).unwrap();
+    assert!(
+        !s.contains("next_fire"),
+        "absent next_fire must be omitted, not null: {s}"
+    );
+    // Decoding without `next_fire` must also succeed (forward-compat for
+    // older daemons that never set the field).
+    let legacy_json = r#"{
+      "queue_depth": 0,
+      "running_global": 0,
+      "running_per_cron": {},
+      "throttled_by_loadavg": false,
+      "errors_last_5m": 0
+    }"#;
+    let back: SchedulerHealthParams = serde_json::from_str(legacy_json).unwrap();
+    assert!(back.next_fire.is_none());
+}
+
 // ----- Error-code mapping -----
 
 /// Pins the [`ErrorKind`] → numeric-code table. The numeric values are
@@ -1145,6 +1199,7 @@ fn schema_files_match_generated_output() {
     add_notif!(SessionGap);
     add_notif!(CronFired);
     add_notif!(DaemonHealth);
+    add_notif!(SchedulerHealth);
     add_notif!(la_proto::notifications::WorktreeChanged);
     add_notif!(la_proto::notifications::WorktreeCommitCreated);
 

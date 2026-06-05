@@ -46,8 +46,9 @@ use la_proto::methods::{
     WorktreeStatusParams, WorktreeStatusResult, WorktreeUnstage,
 };
 use la_proto::notifications::{
-    CronFired, DaemonHealth, NotificationMethod, SessionGap, SessionOutput, SessionStateNotice,
-    WorktreeChanged, WorktreeChangedParams, WorktreeCommitCreated, WorktreeCommitCreatedParams,
+    CronFired, DaemonHealth, NotificationMethod, SchedulerHealth, SessionGap, SessionOutput,
+    SessionStateNotice, WorktreeChanged, WorktreeChangedParams, WorktreeCommitCreated,
+    WorktreeCommitCreatedParams,
 };
 use la_proto::PROTOCOL_VERSION;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -247,6 +248,7 @@ struct ConnStateInner {
 struct TopicSet {
     session_state: bool,
     daemon_health: bool,
+    scheduler_health: bool,
     worktree_changed: bool,
     worktree_commit: bool,
     cron_fired: bool,
@@ -379,6 +381,9 @@ async fn deliver_bus_event(state: &ConnState, event: BusEvent) {
         }
         BusEvent::DaemonHealth(p) if topics.daemon_health => {
             Notification::new(DaemonHealth::NAME, &p)
+        }
+        BusEvent::SchedulerHealth(p) if topics.scheduler_health => {
+            Notification::new(SchedulerHealth::NAME, &p)
         }
         BusEvent::WorktreeChanged(p) if topics.worktree_changed => {
             Notification::new(WorktreeChanged::NAME, &p)
@@ -599,6 +604,16 @@ async fn handle_events_subscribe(
                         send_health_snapshot = true;
                     }
                     topics.daemon_health = true;
+                    effective.push(*t);
+                }
+                EventTopic::SchedulerHealth => {
+                    // No initial-snapshot replay here: the scheduler
+                    // health loop fires every 5 s by default, so the TUI
+                    // gets a fresh frame quickly. If we ever extend the
+                    // cadence past the user's tolerance (the original
+                    // ProbeLoopConfig hit this issue at 60 s), bring back
+                    // a snapshot path mirroring `send_health_snapshot`.
+                    topics.scheduler_health = true;
                     effective.push(*t);
                 }
                 EventTopic::WorktreeChanged => {

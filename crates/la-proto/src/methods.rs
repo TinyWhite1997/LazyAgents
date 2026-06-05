@@ -772,6 +772,11 @@ pub enum EventTopic {
     CronFired,
     /// Daemon health pulse for the status bar (`daemon.health`).
     DaemonHealth,
+    /// Scheduler-loop pulse for the status bar (`scheduler.health`). M4.4
+    /// (WEK-74). Distinct from [`Self::DaemonHealth`] — adapter probes
+    /// vs scheduler queue/run metrics — so clients can opt into either
+    /// surface independently.
+    SchedulerHealth,
     /// Per-worktree mutation notice (`worktree.changed`). Pushed after
     /// `worktree.stage` / `worktree.unstage` / `worktree.discard` /
     /// `worktree.commit` succeeds, so other clients attached to the same

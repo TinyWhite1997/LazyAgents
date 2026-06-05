@@ -22,8 +22,8 @@ use la_proto::methods::{
     WorktreeDiscard, WorktreeOpenInEditor, WorktreeStage, WorktreeStatus, WorktreeUnstage,
 };
 use la_proto::notifications::{
-    CronFired, DaemonHealth, NotificationMethod, SessionGap, SessionOutput, SessionStateNotice,
-    WorktreeChanged, WorktreeCommitCreated,
+    CronFired, DaemonHealth, NotificationMethod, SchedulerHealth, SessionGap, SessionOutput,
+    SessionStateNotice, WorktreeChanged, WorktreeCommitCreated,
 };
 use schemars::schema::RootSchema;
 use schemars::schema_for;
@@ -65,6 +65,7 @@ fn main() {
     write_notification::<SessionGap>(&out_dir);
     write_notification::<CronFired>(&out_dir);
     write_notification::<DaemonHealth>(&out_dir);
+    write_notification::<SchedulerHealth>(&out_dir);
     write_notification::<WorktreeChanged>(&out_dir);
     write_notification::<WorktreeCommitCreated>(&out_dir);
 

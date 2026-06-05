@@ -941,11 +941,15 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
         tokio::time::resume();
-        for _ in 0..20 {
+        // Slow Windows CI runners can take longer than the original
+        // 20×10ms = 200ms window to finish the archive I/O; bumped to
+        // 100×50ms = 5s so the test tolerates a slow runner without
+        // changing what it actually asserts.
+        for _ in 0..100 {
             if storage.runs().get("run-old").await.unwrap().is_none() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         assert!(storage.runs().get("run-old").await.unwrap().is_none());
@@ -972,11 +976,13 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
         tokio::time::resume();
-        for _ in 0..20 {
+        // Same widened window as the sibling test above — slow Windows
+        // CI runners need more headroom than the original 20×10ms.
+        for _ in 0..100 {
             if storage.runs().get("run-old").await.unwrap().is_none() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let archive = storage.data_dir().join("runs/archive/200001.jsonl.zst");
         let first_len = tokio::fs::metadata(&archive).await.unwrap().len();
