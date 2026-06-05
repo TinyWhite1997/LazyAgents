@@ -18,15 +18,16 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+*"
   pull_request:
-    # M4.3 brief §测试: this workflow itself must dry-run on every PR
-    # that touches release config. Only the `pr_validate` job below runs
-    # on pull_request — `build` / `global` / `attest` / `host` are still
-    # gated to tag pushes via `needs:` and `if:` to keep PR CI cheap.
-    paths:
-      - "Cargo.toml"
-      - ".github/workflows/release.yml"
-      - ".github/workflows/ci.yml"
-      - "crates/la-daemon/templates/**"
+    # WEK-78 / M4.6: removed the prior `paths:` filter so the two
+    # PR-eligible jobs (`pr_validate` + `pr_build_dryrun`) fire on
+    # EVERY PR to main. Branch protection requires checks to actually
+    # report a status; a `paths:` filter combined with a `required`
+    # rule would hang any PR that doesn't touch the listed paths
+    # waiting for a check that never runs. Cost: `pr_validate`
+    # (~30s actionlint + cargo dist plan) and `pr_build_dryrun`
+    # (~10 min musl + gnu dist build on ubuntu-22.04) now run on
+    # every PR. `build` / `global` / `attest` / `host` remain
+    # tag-gated via `needs:` + `if:` chains, so PR cost is bounded.
   workflow_dispatch:
     inputs:
       tag:
