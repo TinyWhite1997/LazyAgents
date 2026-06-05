@@ -229,9 +229,7 @@ async fn metrics_socket_uses_owner_only_permissions() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
-    use la_proto::methods::{
-        MetricsScrape, MetricsScrapeParams, MetricsScrapeResult, Method,
-    };
+    use la_proto::methods::{Method, MetricsScrape, MetricsScrapeParams, MetricsScrapeResult};
 
     let daemon = bootstrap_daemon_with("sleep 5", |cfg| {
         // Force the scheduler-health loop to tick fast so the test
@@ -420,14 +418,26 @@ async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
         );
     }
     // Preamble shape must match: same # TYPE / # HELP lines in both.
-    let type_lines_cli: Vec<_> = cli_body.lines().filter(|l| l.starts_with("# TYPE ")).collect();
-    let type_lines_rpc: Vec<_> = rpc_body.lines().filter(|l| l.starts_with("# TYPE ")).collect();
+    let type_lines_cli: Vec<_> = cli_body
+        .lines()
+        .filter(|l| l.starts_with("# TYPE "))
+        .collect();
+    let type_lines_rpc: Vec<_> = rpc_body
+        .lines()
+        .filter(|l| l.starts_with("# TYPE "))
+        .collect();
     assert_eq!(
         type_lines_cli, type_lines_rpc,
         "# TYPE preamble drift between CLI and RPC"
     );
-    let help_lines_cli: Vec<_> = cli_body.lines().filter(|l| l.starts_with("# HELP ")).collect();
-    let help_lines_rpc: Vec<_> = rpc_body.lines().filter(|l| l.starts_with("# HELP ")).collect();
+    let help_lines_cli: Vec<_> = cli_body
+        .lines()
+        .filter(|l| l.starts_with("# HELP "))
+        .collect();
+    let help_lines_rpc: Vec<_> = rpc_body
+        .lines()
+        .filter(|l| l.starts_with("# HELP "))
+        .collect();
     assert_eq!(
         help_lines_cli, help_lines_rpc,
         "# HELP preamble drift between CLI and RPC"

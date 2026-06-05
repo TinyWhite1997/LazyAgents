@@ -566,7 +566,6 @@ fn endpoint_for(path: &Path) -> Endpoint {
 // Named Pipe) and calls the `metrics.scrape` JSON-RPC method, so a
 // separate path is no longer needed by anything that matters.
 
-
 /// Refuse to start if a daemon is already listening on the same path.
 ///
 /// We attempt a connect on Unix: if it succeeds we assume someone else

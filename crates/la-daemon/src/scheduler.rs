@@ -658,10 +658,12 @@ async fn process_fire_inner(cfg: &ExecutorConfig, fire: FireEvent, trace_id: Str
     // way the gap we attribute here is the visible portion of the
     // throttle. Negative gaps (clock skew) clamp to zero.
     if loadavg_throttled {
-        let delay = (fire.fired_at - fire.scheduled_at).num_milliseconds().max(0) as f64 / 1000.0;
+        let delay = (fire.fired_at - fire.scheduled_at)
+            .num_milliseconds()
+            .max(0) as f64
+            / 1000.0;
         if delay > 0.0 {
-            metrics::counter!("lad_cron_throttled_seconds_total")
-                .increment(delay as u64);
+            metrics::counter!("lad_cron_throttled_seconds_total").increment(delay as u64);
         }
     }
 
@@ -885,7 +887,13 @@ async fn admit_and_spawn_with_id(
         }));
 
     // 8. Spawn the run-completion watcher.
-    spawn_run_watcher(cfg, run_id.clone(), spawned.id, cron.clone(), trace_id.clone());
+    spawn_run_watcher(
+        cfg,
+        run_id.clone(),
+        spawned.id,
+        cron.clone(),
+        trace_id.clone(),
+    );
 
     if let Some(holder) = out_run_id {
         *holder.lock().await = run_id.clone();
@@ -1102,7 +1110,9 @@ fn spawn_run_watcher(
             // leading `# trace_id=...` shape is what the WEK-44 tail-log
             // viewer already strips; existing readers ignore unknown
             // header lines.
-            tail_log: trace_id.as_ref().map(|tid| format!("# trace_id={tid}\n").into_bytes()),
+            tail_log: trace_id
+                .as_ref()
+                .map(|tid| format!("# trace_id={tid}\n").into_bytes()),
         };
         if let Err(err) = storage.runs().finish(&run_id, finish).await {
             tracing::warn!(%run_id, %err, "run finish persist failed");

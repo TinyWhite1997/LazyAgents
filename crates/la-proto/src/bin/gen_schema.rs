@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use la_proto::methods::{
-    AdaptersDiscover, EventsSubscribe, Initialize, MetricsScrape, Method, SessionsArchive,
+    AdaptersDiscover, EventsSubscribe, Initialize, Method, MetricsScrape, SessionsArchive,
     SessionsAttach, SessionsCreate, SessionsDelete, SessionsDetach, SessionsImport, SessionsList,
     SessionsReplay, SessionsResize, SessionsSignal, SessionsWrite, Shutdown, WorktreeCommit,
     WorktreeDiff, WorktreeDiscard, WorktreeOpenInEditor, WorktreeStage, WorktreeStatus,

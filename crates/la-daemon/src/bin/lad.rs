@@ -759,9 +759,7 @@ fn scrape_metrics(socket_path: &std::path::Path) -> std::io::Result<String> {
         loop {
             let msg = tokio::time::timeout(Duration::from_secs(5), conn.recv())
                 .await
-                .map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "response timeout")
-                })?
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "response timeout"))?
                 .map_err(|e| std::io::Error::other(format!("recv: {e}")))?
                 .ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "daemon closed")
@@ -776,9 +774,12 @@ fn scrape_metrics(socket_path: &std::path::Path) -> std::io::Result<String> {
                             .map_err(|e| std::io::Error::other(format!("decode result: {e}")))?;
                         Ok(body.body)
                     }
-                    la_proto::jsonrpc::ResponseOutcome::Error(err) => Err(std::io::Error::other(
-                        format!("metrics.scrape rpc error: code={} {}", err.code, err.message),
-                    )),
+                    la_proto::jsonrpc::ResponseOutcome::Error(err) => {
+                        Err(std::io::Error::other(format!(
+                            "metrics.scrape rpc error: code={} {}",
+                            err.code, err.message
+                        )))
+                    }
                 };
             }
         }
