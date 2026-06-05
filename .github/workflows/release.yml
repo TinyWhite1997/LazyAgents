@@ -117,6 +117,125 @@ jobs:
           # defaults; everything else stays strict.
           ~/.local/bin/yamllint -d '{extends: default, rules: {line-length: disable, truthy: disable, document-start: disable, comments: {min-spaces-from-content: 1}, comments-indentation: disable, indentation: {indent-sequences: consistent}}}' .github/workflows/
 
+  pr_build_dryrun:
+    # M4.3 brief §测试: `cargo dist build --target ...` dry-run. The
+    # full 6-target tag build is too heavy for PRs (~30+ min on the
+    # cross targets alone), so we exercise the release path on the
+    # single cheapest native target — `x86_64-unknown-linux-gnu` — and
+    # also opportunistically build the musl cross target so A5.2's
+    # static-link assertion runs against a real archive on every PR
+    # that touches release config. The other four targets (aarch64-gnu,
+    # both macOS, windows-msvc) are still exercised by the existing
+    # tag-driven `build` matrix; this job's value is catching
+    # release.yml structural bugs (archive extraction shell, jq paths,
+    # size-fragment plumbing) BEFORE tag-cut, not full coverage.
+    name: pr build dry-run (x86_64-linux-gnu + musl)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    env:
+      # PR-only stand-in for the resolved tag — `dist build` rejects
+      # an empty/branch-name RELEASE_TAG, so synthesize a SemVer-shaped
+      # placeholder. Never published; only used by `dist build --tag=`.
+      PR_DRYRUN_TAG: "v0.0.0-pr-dryrun"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr-dryrun-x86_64-linux
+      - name: install zig (musl cross)
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}"
+      - name: install dist
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/${CARGO_DIST_VERSION}/cargo-dist-installer.sh" \
+            | sh
+      # Native target: cargo-dist owns the whole build + pack.
+      - name: dist build x86_64-unknown-linux-gnu
+        run: dist build --tag="${PR_DRYRUN_TAG}" --artifacts=local --target=x86_64-unknown-linux-gnu
+      # Cross target: matches the release.yml `build` job's two-step
+      # shape (cargo-zigbuild compiles, `dist build` packs).
+      - name: dist build x86_64-unknown-linux-musl (cross)
+        run: |
+          cargo zigbuild --release --target=x86_64-unknown-linux-musl -p la-daemon -p la-tui
+          dist build --tag="${PR_DRYRUN_TAG}" --artifacts=local --target=x86_64-unknown-linux-musl
+      - name: list distrib output
+        run: |
+          set -euo pipefail
+          ls -la target/distrib/
+          test -f target/distrib/dist-manifest.json
+      # Exercise the same extraction + size measurement code paths the
+      # tag-driven `build` job runs, so a typo in those shell blocks
+      # surfaces on PR instead of at tag-cut time.
+      - name: extract dist archive + verify (gnu)
+        run: |
+          set -euo pipefail
+          mkdir -p target/distrib/_extracted/x86_64-unknown-linux-gnu
+          archive=$(python3 - <<'PY'
+          import json
+          with open("target/distrib/dist-manifest.json") as f:
+              m = json.load(f)
+          for name, art in m.get("artifacts", {}).items():
+              if art.get("kind") == "executable-zip" and "x86_64-unknown-linux-gnu" in art.get("target_triples", []):
+                  print(name)
+                  break
+          PY
+          )
+          [[ -n "$archive" && -f "target/distrib/$archive" ]] || { echo "::error::gnu archive missing"; exit 1; }
+          tar -xJf "target/distrib/$archive" -C target/distrib/_extracted/x86_64-unknown-linux-gnu
+          find target/distrib/_extracted/x86_64-unknown-linux-gnu -type f -printf '%p (%s bytes)\n'
+      - name: extract dist archive + ldd assert static (musl)
+        run: |
+          set -euo pipefail
+          mkdir -p target/distrib/_extracted/x86_64-unknown-linux-musl
+          archive=$(python3 - <<'PY'
+          import json
+          with open("target/distrib/dist-manifest.json") as f:
+              m = json.load(f)
+          for name, art in m.get("artifacts", {}).items():
+              if art.get("kind") == "executable-zip" and "x86_64-unknown-linux-musl" in art.get("target_triples", []):
+                  print(name)
+                  break
+          PY
+          )
+          [[ -n "$archive" && -f "target/distrib/$archive" ]] || { echo "::error::musl archive missing"; exit 1; }
+          tar -xJf "target/distrib/$archive" -C target/distrib/_extracted/x86_64-unknown-linux-musl
+          # Same A5.2 assertion the tag-driven build runs.
+          mapfile -t bins < <(find target/distrib/_extracted/x86_64-unknown-linux-musl -type f \( -name lad -o -name la \) -perm -u+x)
+          [[ ${#bins[@]} -gt 0 ]] || { echo "::error::no lad/la in musl archive"; exit 1; }
+          fail=0
+          for bin in "${bins[@]}"; do
+            out=$(ldd "$bin" 2>&1 || true)
+            echo "ldd $bin -> $out"
+            case "$out" in
+              *"statically linked"*|*"not a dynamic executable"*) ;;
+              *) echo "::error::$bin not static"; fail=1 ;;
+            esac
+          done
+          exit "$fail"
+      - name: size measurement smoke (A5.1)
+        run: |
+          set -euo pipefail
+          mkdir -p target/sizes
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
+            out="target/sizes/$target.json"
+            : > "$out"
+            for bin in $(find "target/distrib/_extracted/$target" -type f \( -name lad -o -name la \)); do
+              size=$(wc -c < "$bin")
+              human=$(awk -v s="$size" 'BEGIN{printf "%.1f MiB", s/1024/1024}')
+              echo "{\"target\":\"$target\",\"binary\":\"$(basename "$bin")\",\"bytes\":$size,\"human\":\"$human\"}" >> "$out"
+            done
+            cat "$out"
+          done
+
   plan:
     name: plan
     if: github.event_name != 'pull_request'
