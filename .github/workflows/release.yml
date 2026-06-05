@@ -274,11 +274,18 @@ jobs:
             echo "extracting $a"
             tar -xJf "$a" -C target/distrib/_extracted/x86_64-unknown-linux-musl
           done
-          # Same A5.2 assertion the tag-driven build runs.
-          mapfile -t bins < <(find target/distrib/_extracted/x86_64-unknown-linux-musl -type f \( -name lad -o -name la \))
+          # Same A5.2 assertion the tag-driven build runs. WEK-78 hotfix #2:
+          # normalize `mapfile` (bash 4+) to a bash 3 compatible while-read
+          # loop so this idiom is identical across all three call sites in
+          # release.yml (this PR-dryrun job runs on ubuntu, but the same
+          # snippet shape appears in the tag-driven matrix on macOS 3.2).
+          bins=()
+          while IFS= read -r line; do
+            bins+=("$line")
+          done < <(find target/distrib/_extracted/x86_64-unknown-linux-musl -type f \( -name lad -o -name la \))
           if [[ ${#bins[@]} -eq 0 ]]; then
             echo "::error::no lad/la in musl archives"
-            find target/distrib/_extracted/x86_64-unknown-linux-musl -type f -printf '  %p\n'
+            find target/distrib/_extracted/x86_64-unknown-linux-musl -type f -print | sed 's/^/  /'
             exit 1
           fi
           fail=0
@@ -561,7 +568,16 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          mapfile -t bins < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la \))
+          # WEK-78 hotfix #2: normalize `mapfile` (bash 4+) → bash 3
+          # compatible while-read loop. This step is gated to the musl
+          # leg (ubuntu-22.04, bash 5.x) so `mapfile` would actually
+          # work here, but keeping the call shape identical across all
+          # three `find ... -name lad/la` sites in this workflow
+          # prevents a future copy-paste from regressing the macOS legs.
+          bins=()
+          while IFS= read -r line; do
+            bins+=("$line")
+          done < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la \))
           if [[ ${#bins[@]} -eq 0 ]]; then
             echo "::error::no lad/la binary found in extracted musl archive"
             # WEK-78 hotfix: same `find -printf` GNU-extension fix as above.
@@ -601,7 +617,16 @@ jobs:
           out="target/sizes/${{ matrix.target }}.json"
           threshold=$((30 * 1024 * 1024))
           : > "$out.tmp"
-          mapfile -t bins < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la -o -name lad.exe -o -name la.exe \))
+          # WEK-78 hotfix #2: `mapfile` is a bash 4+ builtin; macOS
+          # hosted runners default `/bin/bash` to 3.2.57 (Apple's last
+          # GPLv2 ship), which makes `mapfile` "command not found" and
+          # exits 127 (run 27034645090 / build (aarch64-apple-darwin)
+          # tripped exactly that). Replace with a portable while-read
+          # loop that populates an indexed bash 3 array.
+          bins=()
+          while IFS= read -r line; do
+            bins+=("$line")
+          done < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la -o -name lad.exe -o -name la.exe \))
           if [[ ${#bins[@]} -eq 0 ]]; then
             echo "::error::no la/lad binary inside the extracted dist archive for ${{ matrix.target }}"
             exit 1
