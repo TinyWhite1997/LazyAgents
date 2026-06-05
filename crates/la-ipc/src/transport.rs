@@ -9,9 +9,13 @@
 //! Security note: Unix listeners bind under a temporary `umask(0o077)`, then
 //! chmod the socket file to 0600 and verify accepted peers with platform peer
 //! credentials (`SO_PEERCRED` on Linux/Android, `getpeereid` on BSD-family
-//! targets). Windows listeners reject remote clients; the current v1
-//! validation target is Linux, so Windows SID ACL hardening remains behind the
-//! platform gate.
+//! targets). Windows listeners (WEK-81) create every pipe instance with an
+//! owner-only DACL built from the current process's user SID (SDDL
+//! `D:P(A;;GA;;;<owner-sid>)(A;;GA;;;SY)`) so other local users in the same
+//! interactive session cannot open the pipe; they also call
+//! `reject_remote_clients(true)` to block SMB hops and re-verify the
+//! accepted peer's process-token SID against the daemon's cached owner SID
+//! as defense in depth.
 //!
 //! The `Endpoint` enum exists so the same code path can describe both a UDS
 //! path and a Named Pipe name without conditional compilation in callers.
@@ -246,14 +250,256 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
     use tokio::net::windows::named_pipe::{
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
     };
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        CopySid, EqualSid, GetLengthSid, GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR,
+        PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // ---------- RAII for HANDLEs and LocalAlloc'd buffers ----------
+
+    struct OwnedHandle(HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct LocalAllocPtr(*mut c_void);
+    impl Drop for LocalAllocPtr {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0 as HLOCAL);
+                }
+            }
+        }
+    }
+
+    /// Owned copy of the current process's user SID. Used both as the DACL
+    /// principal at create time and as the trusted-peer SID at accept time.
+    #[derive(Clone)]
+    struct OwnerSid {
+        bytes: Vec<u8>,
+    }
+
+    impl OwnerSid {
+        fn as_psid(&self) -> PSID {
+            self.bytes.as_ptr() as PSID
+        }
+    }
+
+    /// Pull the current process's user SID via OpenProcessToken +
+    /// GetTokenInformation(TokenUser) + CopySid. Two-call pattern because
+    /// `GetTokenInformation` always fails with INSUFFICIENT_BUFFER on the
+    /// sizing probe and writes the required length back through the last
+    /// parameter (verified against MSDN + windows-sys 0.59 signature).
+    fn current_user_sid() -> std::io::Result<OwnerSid> {
+        // SAFETY: pure Win32 FFI; every HANDLE / LocalAlloc'd buffer is
+        // bounded by an RAII drop guard.
+        unsafe {
+            let mut tok: HANDLE = ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let _tok_guard = OwnedHandle(tok);
+
+            let mut need: u32 = 0;
+            // Sizing probe: ignore the (always failing) return; rely on `need`.
+            let _ = GetTokenInformation(tok, TokenUser, ptr::null_mut(), 0, &mut need);
+            let mut buf = vec![0u8; need as usize];
+            if GetTokenInformation(
+                tok,
+                TokenUser,
+                buf.as_mut_ptr() as *mut c_void,
+                need,
+                &mut need,
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let tu = buf.as_ptr() as *const TOKEN_USER;
+            let psid = (*tu).User.Sid;
+
+            // CopySid: serialize the SID into a standalone buffer so callers
+            // can keep it past `buf`'s drop. SIDs are ~28-68 bytes; the
+            // alloc is cheap.
+            let len = GetLengthSid(psid);
+            let mut sid_buf = vec![0u8; len as usize];
+            if CopySid(len, sid_buf.as_mut_ptr() as PSID, psid) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(OwnerSid { bytes: sid_buf })
+        }
+    }
+
+    /// Build the wide SDDL string `D:P(A;;GA;;;<sid>)(A;;GA;;;SY)`:
+    /// Protected DACL (no inheritance) granting GENERIC_ALL to the owner
+    /// SID and to LocalSystem only.
+    fn sddl_for_owner(owner: &OwnerSid) -> std::io::Result<Vec<u16>> {
+        unsafe {
+            let mut sid_str_ptr: *mut u16 = ptr::null_mut();
+            if ConvertSidToStringSidW(owner.as_psid(), &mut sid_str_ptr) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Wrap immediately so an early-return frees the LocalAlloc'd buf.
+            let _free = LocalAllocPtr(sid_str_ptr as *mut c_void);
+
+            let mut len = 0usize;
+            while *sid_str_ptr.add(len) != 0 {
+                len += 1;
+            }
+            let sid_slice = std::slice::from_raw_parts(sid_str_ptr, len);
+            let sid_str = String::from_utf16(sid_slice).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf16 SID string")
+            })?;
+
+            let sddl = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)", sid = sid_str);
+            let mut wide: Vec<u16> = sddl.encode_utf16().collect();
+            wide.push(0);
+            Ok(wide)
+        }
+    }
+
+    /// SECURITY_ATTRIBUTES + the SECURITY_DESCRIPTOR it points at. The
+    /// kernel deep-copies the SD into the pipe object inside
+    /// `CreateNamedPipeW`, so this struct only needs to outlive the
+    /// `create_with_security_attributes_raw` call — Drop frees the
+    /// LocalAlloc'd descriptor.
+    struct OwnerOnlySa {
+        sa: SECURITY_ATTRIBUTES,
+        _sd: LocalAllocPtr,
+    }
+
+    impl OwnerOnlySa {
+        fn new(owner: &OwnerSid) -> std::io::Result<Self> {
+            let sddl_w = sddl_for_owner(owner)?;
+            let mut psd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl_w.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut psd,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let sd_guard = LocalAllocPtr(psd);
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd,
+                bInheritHandle: 0,
+            };
+            Ok(OwnerOnlySa { sa, _sd: sd_guard })
+        }
+
+        fn as_ptr(&self) -> *mut c_void {
+            &self.sa as *const _ as *mut c_void
+        }
+    }
+
+    /// Single-source helper so `bind` and `accept` cannot drift apart:
+    /// both server-instance creation sites MUST route through this so the
+    /// second-and-later instances stay owner-locked too. Otherwise the
+    /// first connection is safe but every subsequent one falls back to
+    /// the default DACL (which allows other interactive-session users).
+    fn create_locked_server(
+        opts: &ServerOptions,
+        name: &str,
+        owner: &OwnerSid,
+    ) -> std::io::Result<NamedPipeServer> {
+        let sa = OwnerOnlySa::new(owner)?;
+        // SAFETY: `sa.as_ptr()` is valid for this call; the kernel copies
+        // the SD into the pipe object before returning per
+        // CreateNamedPipeW's contract.
+        unsafe { opts.create_with_security_attributes_raw(name, sa.as_ptr()) }
+    }
+
+    /// Belt-and-suspenders peer check: after `connect().await`, look up
+    /// the client process's user SID via GetNamedPipeClientProcessId +
+    /// OpenProcessToken + GetTokenInformation(TokenUser) and compare to
+    /// the cached owner SID. Prefers this read-only path over
+    /// `ImpersonateNamedPipeClient`, which requires SE_IMPERSONATE_NAME
+    /// (often absent for a plain-user daemon) and mutates thread-local
+    /// security context.
+    fn verify_peer_is_owner(
+        server: &NamedPipeServer,
+        expected_owner: &OwnerSid,
+    ) -> std::io::Result<()> {
+        unsafe {
+            let raw = server.as_raw_handle() as HANDLE;
+            let mut peer_pid: u32 = 0;
+            if GetNamedPipeClientProcessId(raw, &mut peer_pid) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let proc_h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, peer_pid);
+            if proc_h.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let _proc_guard = OwnedHandle(proc_h);
+
+            let mut tok: HANDLE = ptr::null_mut();
+            if OpenProcessToken(proc_h, TOKEN_QUERY, &mut tok) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let _tok_guard = OwnedHandle(tok);
+
+            let mut need: u32 = 0;
+            let _ = GetTokenInformation(tok, TokenUser, ptr::null_mut(), 0, &mut need);
+            let mut buf = vec![0u8; need as usize];
+            if GetTokenInformation(
+                tok,
+                TokenUser,
+                buf.as_mut_ptr() as *mut c_void,
+                need,
+                &mut need,
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let tu = buf.as_ptr() as *const TOKEN_USER;
+            let peer_sid = (*tu).User.Sid;
+
+            if EqualSid(peer_sid, expected_owner.as_psid()) == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("named pipe peer pid {peer_pid} SID does not match server owner"),
+                ));
+            }
+            Ok(())
+        }
+    }
 
     /// Listener handle. Named Pipes don't have a long-lived listener like
-    /// UDS; each instance is created on demand via `ServerOptions`.
+    /// UDS; each instance is created on demand via `ServerOptions`. The
+    /// cached `owner` SID is the principal both the DACL and the
+    /// peer-verification step compare against — capture once at bind
+    /// time so a forked daemon would not silently relax the contract.
     pub struct Listener {
         name: String,
+        owner: OwnerSid,
         next: tokio::sync::Mutex<NamedPipeServer>,
     }
 
@@ -318,28 +564,44 @@ mod imp {
                     )))
                 }
             };
+            let owner = current_user_sid().map_err(IpcError::Io)?;
             // `first_pipe_instance(true)` enforces that this is the first
             // instance — the documented Windows pattern for "I am the server".
-            let first = ServerOptions::new()
-                .first_pipe_instance(true)
-                .reject_remote_clients(true)
-                .create(&name)?;
+            // It can only be set on the very first ServerOptions creation —
+            // a second instance with the flag fails EACCES (already exists).
+            let mut opts = ServerOptions::new();
+            opts.first_pipe_instance(true).reject_remote_clients(true);
+            let first = create_locked_server(&opts, &name, &owner).map_err(IpcError::Io)?;
             Ok(Self {
                 name,
+                owner,
                 next: tokio::sync::Mutex::new(first),
             })
         }
 
         pub async fn accept(&self) -> Result<StreamPair, IpcError> {
             // Hand out the pre-created instance, then immediately create the
-            // next one so a second client doesn't race in to a closed pipe.
+            // next one (also owner-locked!) so a second client doesn't race
+            // in to a closed pipe.
             let mut slot = self.next.lock().await;
-            let new_next = ServerOptions::new()
-                .reject_remote_clients(true)
-                .create(&self.name)?;
+            let mut opts = ServerOptions::new();
+            opts.reject_remote_clients(true);
+            let new_next =
+                create_locked_server(&opts, &self.name, &self.owner).map_err(IpcError::Io)?;
             let server = std::mem::replace(&mut *slot, new_next);
             drop(slot);
             server.connect().await?;
+
+            // Belt-and-suspenders: even though the DACL above gates
+            // CreateFileW at the kernel, also verify the connected peer's
+            // process-token SID matches our owner SID. Defends against ACL
+            // misconfiguration / kernel-level regressions / future refactors
+            // that accidentally relax `create_locked_server`.
+            if let Err(e) = verify_peer_is_owner(&server, &self.owner) {
+                tracing::warn!(error = %e, "rejecting named-pipe peer: SID mismatch");
+                drop(server);
+                return Err(IpcError::Io(e));
+            }
             Ok(StreamPair::Server(server))
         }
 
@@ -363,7 +625,9 @@ mod imp {
         // concurrent client opens that arrive before the listener task
         // finishes swapping in the next instance get a busy. We retry for
         // up to 5 s with a 20 ms backoff — well inside the daemon's normal
-        // accept-loop turnaround.
+        // accept-loop turnaround. Cross-user opens hit ERROR_ACCESS_DENIED
+        // (5) *before* BUSY because `CreateFileW` evaluates the DACL first,
+        // so this loop is not a denial-of-service vector.
         const ERROR_PIPE_BUSY: i32 = 231;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

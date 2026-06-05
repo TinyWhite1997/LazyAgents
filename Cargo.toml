@@ -188,6 +188,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_System_Threading",
     "Win32_Foundation",
+    # WEK-81 — la-ipc Named Pipe owner-only DACL + peer-SID verification.
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
 ] }
 tempfile = "3"
 cron = "0.16"
