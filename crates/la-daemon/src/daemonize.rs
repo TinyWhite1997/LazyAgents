@@ -197,13 +197,15 @@ pub fn cleanup_endpoint_artifacts(_socket_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Apply per-pipe ACLs at server-side creation time. Today the
-/// `tokio::net::windows::named_pipe::ServerOptions` API enforces the
-/// "current user only" default via the SDDL string baked into the
-/// transport layer (see `la_ipc::transport`); this hook is here so a
-/// future change that exposes ACL customisation can plug in without
-/// touching every call site. Returning `Ok(())` on Unix keeps the
-/// surface uniform across platforms.
+/// Apply per-pipe ACLs at server-side creation time. On Windows the
+/// `la_ipc::transport::Listener::bind` / `accept` paths now build an
+/// owner-only SDDL (`D:P(A;;GA;;;<owner-sid>)(A;;GA;;;SY)`) and call
+/// `tokio::net::windows::named_pipe::ServerOptions::
+/// create_with_security_attributes_raw` for every server instance, so this
+/// hook is intentionally a no-op — the transport layer owns the DACL. It
+/// stays here so a future change that needs daemon-side ACL customisation
+/// can plug in without touching every call site. Returning `Ok(())` on
+/// Unix keeps the surface uniform across platforms.
 pub fn enforce_named_pipe_acl_defaults() -> std::io::Result<()> {
     Ok(())
 }

@@ -21,6 +21,12 @@ serde_json = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# WEK-81 — Win32 FFI for Named Pipe SECURITY_ATTRIBUTES / SDDL builder +
+# peer-process token lookup. Feature set is declared at the workspace level
+# so other crates depending on the same windows-sys version don't double-pull.
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "process", "signal"] }
