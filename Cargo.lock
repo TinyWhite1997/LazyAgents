@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "la-adapter"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "la-config"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "la-core"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "la-daemon"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "la-ipc"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "la-observ"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "chrono",
  "metrics",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "la-proto"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "base64",
  "schemars",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "la-pty"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "bytes",
  "nix 0.29.0",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "la-scheduler"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "la-storage"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "base64",
  "chrono",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "la-tui"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "m0-smoke"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "m2-smoke"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "m4-macos-smoke"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
