@@ -236,8 +236,13 @@ jobs:
       - name: write dist-manifest.json
         run: |
           set -euo pipefail
-          dist plan --tag="${PR_DRYRUN_TAG}" --output-format=json > target/distrib/dist-manifest.json
-          test -f target/distrib/dist-manifest.json
+          # Write to a sibling path first then move into place. Some
+          # cargo-dist code paths read an existing dist-manifest.json
+          # before overwriting it; piping `>` truncates that file to 0
+          # bytes mid-read, producing "EOF while parsing JSON" errors.
+          dist plan --tag="${PR_DRYRUN_TAG}" --output-format=json > /tmp/dist-manifest.json
+          mv /tmp/dist-manifest.json target/distrib/dist-manifest.json
+          test -s target/distrib/dist-manifest.json
       # Exercise the same extraction + size measurement code paths the
       # tag-driven `build` job runs, so a typo in those shell blocks
       # surfaces on PR instead of at tag-cut time.
