@@ -166,8 +166,33 @@ jobs:
       - name: dist build x86_64-unknown-linux-gnu
         run: dist build --tag="${PR_DRYRUN_TAG}" --artifacts=local --target=x86_64-unknown-linux-gnu
       # Cross target: matches the release.yml `build` job's two-step
-      # shape (cargo-zigbuild compiles, `dist build` packs).
+      # shape (cargo-zigbuild compiles, `dist build` packs). Both
+      # cargo-zigbuild and the subsequent `dist build` invocation (which
+      # re-runs cargo workspace-wide for packing) need cc-rs to route
+      # through zig — otherwise build scripts like `zstd-sys` look for
+      # the non-existent `x86_64-linux-musl-gcc` toolchain.
+      #
+      # We install a tiny `zigcc` / `zigcxx` wrapper since cargo's
+      # `LINKER` env var doesn't accept arguments inline.
+      - name: install zigcc wrapper
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          cat > "$HOME/bin/zigcc" <<'EOF'
+          #!/usr/bin/env bash
+          exec zig cc -target x86_64-linux-musl "$@"
+          EOF
+          cat > "$HOME/bin/zigcxx" <<'EOF'
+          #!/usr/bin/env bash
+          exec zig c++ -target x86_64-linux-musl "$@"
+          EOF
+          chmod +x "$HOME/bin/zigcc" "$HOME/bin/zigcxx"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
       - name: dist build x86_64-unknown-linux-musl (cross)
+        env:
+          CC_x86_64_unknown_linux_musl: zigcc
+          CXX_x86_64_unknown_linux_musl: zigcxx
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: zigcc
         run: |
           cargo zigbuild --release --target=x86_64-unknown-linux-musl -p la-daemon -p la-tui
           dist build --tag="${PR_DRYRUN_TAG}" --artifacts=local --target=x86_64-unknown-linux-musl
@@ -360,14 +385,55 @@ jobs:
       # Cross targets (aarch64-gnu, x86_64-musl): cargo-zigbuild builds
       # the binaries first, then `dist build` packs the archives off
       # the already-populated target dir.
+      #
+      # The `dist build` pack step re-invokes cargo workspace-wide, so
+      # cc-rs build scripts (zstd-sys, etc.) need the same zig-as-cc
+      # routing cargo-zigbuild itself uses — install a tiny wrapper.
+      - name: install zigcc wrapper (cross)
+        if: matrix.cross == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)  zig_target=aarch64-linux-gnu ;;
+            x86_64-unknown-linux-musl)  zig_target=x86_64-linux-musl ;;
+            *) echo "unhandled cross target ${{ matrix.target }}"; exit 1 ;;
+          esac
+          cat > "$HOME/bin/zigcc" <<EOF
+          #!/usr/bin/env bash
+          exec zig cc -target $zig_target "\$@"
+          EOF
+          cat > "$HOME/bin/zigcxx" <<EOF
+          #!/usr/bin/env bash
+          exec zig c++ -target $zig_target "\$@"
+          EOF
+          chmod +x "$HOME/bin/zigcc" "$HOME/bin/zigcxx"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
       - name: build binaries (cross)
         if: matrix.cross == true
         shell: bash
+        env:
+          # Same env names cargo expands per-target:
+          # CC_<triple> / CXX_<triple> / CARGO_TARGET_<TRIPLE_UPPER>_LINKER
+          CC_aarch64_unknown_linux_gnu: zigcc
+          CXX_aarch64_unknown_linux_gnu: zigcxx
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: zigcc
+          CC_x86_64_unknown_linux_musl: zigcc
+          CXX_x86_64_unknown_linux_musl: zigcxx
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: zigcc
         run: |
           cargo zigbuild --release --target=${{ matrix.target }} -p la-daemon -p la-tui
       - name: pack archives (cross)
         if: matrix.cross == true
         shell: bash
+        env:
+          CC_aarch64_unknown_linux_gnu: zigcc
+          CXX_aarch64_unknown_linux_gnu: zigcxx
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: zigcc
+          CC_x86_64_unknown_linux_musl: zigcc
+          CXX_x86_64_unknown_linux_musl: zigcxx
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: zigcc
         run: dist build --tag="${RELEASE_TAG}" --artifacts=local --target=${{ matrix.target }}
 
       # A5.1 + A5.2 verification operates on the binaries that
