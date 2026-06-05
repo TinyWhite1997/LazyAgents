@@ -52,6 +52,34 @@ pub fn init_json_tracing(level: &str) {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
+/// Developer-tty alternative to [`init_json_tracing`]: compact, single-line
+/// human-readable formatter. Same level resolution and recent-event ring as
+/// the JSON path so a `--log-format compact` flag doesn't break crash
+/// reports.
+///
+/// Architecture §9.3: production deployments must default to JSON; only the
+/// `lad start --log-format compact` / `LAZYAGENTS_LOG_FORMAT=compact`
+/// override should reach this. The two installers are mutually exclusive
+/// (the global subscriber slot is one-shot); whichever wins the race owns
+/// the process for its lifetime, which is fine because both
+/// `init_*_tracing` calls happen in `init_observability` before any work
+/// has been scheduled.
+pub fn init_compact_tracing(level: &str) {
+    let filter = tracing_subscriber::EnvFilter::try_new(level)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let ring = EVENT_RING.get_or_init(RecentEvents::default).clone();
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .compact()
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .with_ansi(false);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(RecentEventLayer { ring })
+        .with(fmt_layer);
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
 pub fn install_crash_reporter(crash_dir: impl Into<PathBuf>) {
     let crash_dir = crash_dir.into();
     let ring = EVENT_RING.get_or_init(RecentEvents::default).clone();
@@ -213,35 +241,79 @@ pub fn render_prometheus() -> String {
 }
 
 fn describe_metrics() {
+    // M4.5 / WEK-75 — A9 metric naming table (architecture §9.3).
+    //
+    // Adding / renaming a metric here without updating the pinned table
+    // in `docs/observability.md` is a contract break. The dispatcher's
+    // `metrics.scrape` unit test asserts at least one counter, gauge,
+    // and histogram from this list appears in the rendered body so a
+    // silent drop of a rail trips CI.
+    //
+    // Order mirrors the table in `docs/observability.md` for grep-ability.
     metrics::describe_counter!(
         "lad_rpc_requests_total",
         Unit::Count,
-        "Total JSON-RPC requests handled by lad, labelled by method and result."
+        "Total JSON-RPC requests handled by lad, labelled by method and result (ok|error)."
+    );
+    metrics::describe_histogram!(
+        "lad_rpc_duration_seconds",
+        Unit::Seconds,
+        "Per-RPC handler latency, labelled by method."
     );
     metrics::describe_gauge!(
         "lad_session_active",
         Unit::Count,
-        "Currently active sessions known to the daemon."
+        "Currently active sessions known to the daemon, labelled by backend."
     );
     metrics::describe_counter!(
         "lad_session_output_bytes_total",
         Unit::Bytes,
-        "Session output bytes delivered to attached clients."
+        "Session output bytes delivered to attached clients, labelled by backend."
     );
     metrics::describe_counter!(
         "lad_cron_runs_total",
         Unit::Count,
-        "Cron runs by status; status=running marks the fire entry, all other statuses are terminal outcomes."
+        "Cron run terminal-status counter (status=ok|error|timeout|budget_rejected)."
+    );
+    metrics::describe_counter!(
+        "lad_cron_missed_total",
+        Unit::Count,
+        "Cron catch-up disposition counter (mode=skip|coalesce|replay)."
+    );
+    metrics::describe_counter!(
+        "lad_cron_throttled_seconds_total",
+        Unit::Seconds,
+        "Cumulative seconds the scheduler delayed a fire because of the loadavg throttle."
     );
     metrics::describe_histogram!(
         "lad_pty_spawn_duration_seconds",
         Unit::Seconds,
-        "PTY/session spawn duration observed by the daemon."
+        "PTY/session spawn duration observed by the daemon, labelled by backend."
     );
     metrics::describe_histogram!(
         "lad_storage_write_latency_seconds",
         Unit::Seconds,
-        "Storage write latency for SQLite-backed mutations."
+        "Storage write latency for SQLite-backed mutations, labelled by op."
+    );
+    metrics::describe_counter!(
+        "lad_runs_archive_pruned_total",
+        Unit::Count,
+        "Rows deleted from SQLite by the daily runs-archive job."
+    );
+    metrics::describe_gauge!(
+        "lad_scheduler_queue_depth",
+        Unit::Count,
+        "Global count of cron fires waiting in the scheduler heap."
+    );
+    metrics::describe_gauge!(
+        "lad_scheduler_clock_skew_seconds",
+        Unit::Seconds,
+        "Most recently observed wall-clock jump, in seconds (signed)."
+    );
+    metrics::describe_counter!(
+        "lad_adapter_drift_total",
+        Unit::Count,
+        "Adapter protocol-drift events surfaced by the dispatcher / health probe loop, labelled by backend."
     );
 }
 

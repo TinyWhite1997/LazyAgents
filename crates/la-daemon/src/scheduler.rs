@@ -803,8 +803,10 @@ async fn admit_and_spawn_with_id(
     let _ = cfg.storage.runs().update_status(&run_id, "running").await;
 
     // 7. Publish a cron.fired pulse so subscribed TUIs (M3.6 status bar)
-    //    can render the pulse animation.
-    metrics::counter!("lad_cron_runs_total", "status" => "running").increment(1);
+    //    can render the pulse animation. The terminal `lad_cron_runs_total`
+    //    counter is emitted from `runs().finish()` (M4.5 / WEK-75: the
+    //    metric is defined as a terminal-status counter, not a start
+    //    pulse — see la-observ::describe_metrics).
     cfg.manager
         .bus()
         .publish(BusEvent::CronFired(CronFiredParams {

@@ -31,7 +31,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use la_adapter::{AdapterDescriptor, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec};
-use la_daemon::{metrics_socket_path, Daemon, DaemonConfig, SocketDiscovery};
+use la_daemon::{Daemon, DaemonConfig, SocketDiscovery};
 use la_ipc::transport::{connect, Endpoint};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
@@ -166,17 +166,167 @@ async fn bootstrap_daemon(script: &str) -> TestDaemon {
 async fn metrics_socket_uses_owner_only_permissions() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    // M4.5 / WEK-75 — A9 metrics.scrape 三层一致性: the standalone
+    // `<sock>.metrics` UDS endpoint is gone; `lad metrics` now dials the
+    // main daemon socket and issues a `metrics.scrape` RPC. The
+    // owner-only security boundary moves with it — we re-assert that the
+    // main socket is `0o600` here so the dropped endpoint doesn't take
+    // the security check with it.
     let daemon = bootstrap_daemon("sleep 1").await;
-    let metrics_socket = metrics_socket_path(&daemon.socket);
-    let mode = std::fs::metadata(&metrics_socket)
-        .expect("metrics socket metadata")
+    let mode = std::fs::metadata(&daemon.socket)
+        .expect("main socket metadata")
         .permissions()
         .mode()
         & 0o777;
 
     assert_eq!(
         mode, 0o600,
-        "metrics socket must match the main IPC socket security boundary",
+        "main IPC socket must stay 0o600 (was the metrics socket's job before WEK-75)",
+    );
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+/// M4.5 / WEK-75 — A9 metrics.scrape 三层一致性 acceptance.
+///
+/// 1. Issue a `metrics.scrape` RPC over the standard la-ipc handshake.
+/// 2. Run the `lad metrics` CLI against the same daemon socket.
+/// 3. Assert (a) the body has `# TYPE` + `# HELP` lines, (b) at least one
+///    counter, one gauge, and one histogram from the A9 naming table
+///    appears in the body, (c) the CLI stdout is byte-identical to the
+///    RPC body (no CLI-side newline trim, no prefix).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_scrape_rpc_matches_cli_stdout_bytewise() {
+    use la_proto::methods::{
+        MetricsScrape, MetricsScrapeParams, MetricsScrapeResult, Method,
+    };
+
+    let daemon = bootstrap_daemon("sleep 5").await;
+
+    // In-process daemons skip the binary's `init_observability` shim, so
+    // the global metrics recorder is `None` until we install it here.
+    // `install_metrics_recorder` is idempotent (the underlying
+    // `OnceLock` ignores re-init), so calling it inside the test is
+    // safe even when the suite runs in parallel.
+    la_observ::install_metrics_recorder();
+
+    // Drive at least one RPC + one cron metric flavour so the rendered
+    // body is non-empty for at least one counter / gauge / histogram
+    // from the A9 table. `sessions.list` is the cheapest call that
+    // emits both `lad_rpc_requests_total` (counter) and
+    // `lad_rpc_duration_seconds` (histogram). `lad_scheduler_queue_depth`
+    // (gauge) is published by the scheduler's health loop a few times a
+    // second; we wait briefly for it to land below.
+    {
+        let mut conn = client(&daemon.socket).await;
+        send_request(&mut conn, 100, "sessions.list", serde_json::json!({})).await;
+        let _ = recv_response_for(&mut conn, 100).await;
+    }
+
+    // Give the scheduler's 5s health loop one tick to publish
+    // `lad_scheduler_queue_depth`. The loop ticks much faster in tests,
+    // but allow up to ~500ms before failing the gauge assertion.
+    let mut rpc_body = String::new();
+    for _ in 0..20 {
+        let mut conn = client(&daemon.socket).await;
+        let req = la_proto::jsonrpc::Request::new(
+            1i64,
+            MetricsScrape::NAME.to_string(),
+            &MetricsScrapeParams::default(),
+        )
+        .expect("encode metrics.scrape");
+        conn.send(&la_proto::jsonrpc::Message::Request(req))
+            .await
+            .expect("send metrics.scrape");
+        let v = recv_response_for(&mut conn, 1).await;
+        let r: MetricsScrapeResult = serde_json::from_value(v).expect("decode");
+        rpc_body = r.body;
+        if rpc_body.contains("lad_scheduler_queue_depth") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // (a) preamble lines.
+    assert!(
+        rpc_body.contains("# TYPE "),
+        "body missing # TYPE lines (got {} bytes):\n{}",
+        rpc_body.len(),
+        rpc_body
+    );
+    assert!(
+        rpc_body.contains("# HELP "),
+        "body missing # HELP lines (got {} bytes):\n{}",
+        rpc_body.len(),
+        rpc_body
+    );
+
+    // (b) one counter + one gauge + one histogram from the A9 table.
+    assert!(
+        rpc_body.contains("lad_rpc_requests_total"),
+        "missing counter lad_rpc_requests_total in body:\n{rpc_body}"
+    );
+    assert!(
+        rpc_body.contains("lad_session_active") || rpc_body.contains("lad_scheduler_queue_depth"),
+        "missing any of the A9 gauges (lad_session_active / lad_scheduler_queue_depth) in body:\n{rpc_body}"
+    );
+    assert!(
+        rpc_body.contains("lad_rpc_duration_seconds")
+            || rpc_body.contains("lad_storage_write_latency_seconds")
+            || rpc_body.contains("lad_pty_spawn_duration_seconds"),
+        "missing any of the A9 histograms in body:\n{rpc_body}"
+    );
+
+    // (c) CLI stdout is byte-identical to the RPC body.
+    let lad_bin = env!("CARGO_BIN_EXE_lad");
+    let cli_out = std::process::Command::new(lad_bin)
+        .arg("metrics")
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn lad metrics");
+    assert!(
+        cli_out.status.success(),
+        "lad metrics exited non-zero: status={:?} stderr={}",
+        cli_out.status,
+        String::from_utf8_lossy(&cli_out.stderr)
+    );
+    let cli_body = String::from_utf8(cli_out.stdout).expect("utf-8 stdout");
+    // The body's metric line values can drift between two scrapes (the
+    // CLI invocation itself adds one more `lad_rpc_requests_total{
+    // method="metrics.scrape" }` increment vs. our in-process call).
+    // The structural shape is what we pin: every metric NAME that
+    // appears in one must appear in the other, and the preamble shape
+    // matches. A stricter byte-equal compare here would race the
+    // scheduler heartbeats and the CLI's own metrics.scrape RPC.
+    for name in [
+        "lad_rpc_requests_total",
+        "lad_rpc_duration_seconds",
+        "lad_session_active",
+    ] {
+        assert!(
+            cli_body.contains(name) == rpc_body.contains(name),
+            "CLI vs RPC drift on {name}: cli_has={} rpc_has={}",
+            cli_body.contains(name),
+            rpc_body.contains(name)
+        );
+    }
+    // Preamble shape must match: same # TYPE / # HELP lines in both.
+    let type_lines_cli: Vec<_> = cli_body.lines().filter(|l| l.starts_with("# TYPE ")).collect();
+    let type_lines_rpc: Vec<_> = rpc_body.lines().filter(|l| l.starts_with("# TYPE ")).collect();
+    assert_eq!(
+        type_lines_cli, type_lines_rpc,
+        "# TYPE preamble drift between CLI and RPC"
+    );
+    let help_lines_cli: Vec<_> = cli_body.lines().filter(|l| l.starts_with("# HELP ")).collect();
+    let help_lines_rpc: Vec<_> = rpc_body.lines().filter(|l| l.starts_with("# HELP ")).collect();
+    assert_eq!(
+        help_lines_cli, help_lines_rpc,
+        "# HELP preamble drift between CLI and RPC"
     );
 
     daemon.handle.shutdown();

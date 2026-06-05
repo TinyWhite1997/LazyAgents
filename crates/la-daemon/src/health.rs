@@ -284,8 +284,16 @@ async fn probe_one(id: &str, adapter: &dyn AgentAdapter) -> BackendHealthEntry {
     // `AdapterError::ProtocolDrift` (we surface that variant via the
     // `Error { detail }` path; see `looks_like_drift`) and any
     // `Error { detail }` whose detail self-identifies as drift.
+    //
+    // M4.5 / WEK-75 — A9: the canonical surface is now the
+    // `lad_adapter_drift_total{backend}` counter (architecture §9.3
+    // pinned metric naming table). The structured log on
+    // `target = "adapter_drift"` is preserved so existing log-side
+    // collectors (Loki dashboards, the WEK-29 acceptance test) keep
+    // working — it is no longer the only surface.
     if let ProbeResult::Error { detail } = &probe {
         if looks_like_drift(detail) {
+            metrics::counter!("lad_adapter_drift_total", "backend" => id.to_string()).increment(1);
             // High-priority, machine-parseable record. The `target`
             // is the metric name per task description.
             tracing::error!(

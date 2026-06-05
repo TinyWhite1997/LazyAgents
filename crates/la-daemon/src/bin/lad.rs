@@ -280,8 +280,16 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
     })
 }
 
-fn init_observability(level: &str, state_dir: &std::path::Path) {
-    la_observ::init_json_tracing(level);
+fn init_observability(level: &str, format: la_config::LogFormat, state_dir: &std::path::Path) {
+    // M4.5 / WEK-75 — A9 tracing JSON format 统一: JSON is the production
+    // default (`tracing-subscriber::fmt().json()` with the pinned field
+    // set in la-observ::init_json_tracing); `--log-format compact` /
+    // `LAZYAGENTS_LOG_FORMAT=compact` swaps in the human-readable layer
+    // for developer tty use.
+    match format {
+        la_config::LogFormat::Json => la_observ::init_json_tracing(level),
+        la_config::LogFormat::Compact => la_observ::init_compact_tracing(level),
+    }
     la_observ::install_metrics_recorder();
     la_observ::install_crash_reporter(state_dir.join("crashes"));
 }
@@ -364,7 +372,6 @@ fn run(p: Parsed) -> ExitCode {
                 .state_dir_override
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
-            let metrics_socket = la_daemon::metrics_socket_path(&loc.socket_path);
             let adapter_pairs: Vec<(&'static str, std::sync::Arc<dyn AgentAdapter>)> = vec![
                 ("claude", std::sync::Arc::new(ClaudeAdapter::new())),
                 ("codex", std::sync::Arc::new(CodexAdapter::new())),
@@ -386,7 +393,6 @@ fn run(p: Parsed) -> ExitCode {
             let adapter_probes = la_daemon::doctor::probe_adapters_sync(&doctor_adapters);
             let inputs = la_daemon::doctor::DoctorInputs {
                 socket_path: loc.socket_path.clone(),
-                metrics_socket_path: metrics_socket,
                 state_dir: state_dir.clone(),
                 server_version: SERVER_VERSION.to_string(),
                 running_daemon_version: query_running_daemon_version(&loc.socket_path),
@@ -417,7 +423,7 @@ fn run(p: Parsed) -> ExitCode {
                 .state_dir_override
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
-            init_observability(resolved.log_level.as_str(), &state_dir);
+            init_observability(resolved.log_level.as_str(), resolved.log_format, &state_dir);
             match run_backup(resolved.state_dir_override.clone(), output) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -458,7 +464,7 @@ fn run(p: Parsed) -> ExitCode {
                 .state_dir_override
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
-            init_observability(resolved.log_level.as_str(), &state_dir);
+            init_observability(resolved.log_level.as_str(), resolved.log_format, &state_dir);
             let loc = resolve_socket(&resolved.socket_override);
             if let Err(err) = ensure_runtime_dir(&loc.runtime_dir) {
                 eprintln!(
@@ -549,7 +555,7 @@ fn run(p: Parsed) -> ExitCode {
                 .state_dir_override
                 .clone()
                 .unwrap_or_else(la_daemon::default_state_dir);
-            init_observability(resolved.log_level.as_str(), &state_dir);
+            init_observability(resolved.log_level.as_str(), resolved.log_format, &state_dir);
             match run_foreground(p, resolved) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -691,22 +697,92 @@ fn run_uninstall_cmd(spec: &UninstallSpec) -> ExitCode {
     }
 }
 
-#[cfg(unix)]
+/// M4.5 / WEK-75 — A9 metrics.scrape 三层一致性 (`lad metrics` CLI 层).
+///
+/// Dial the daemon's main socket (Unix UDS / Windows Named Pipe), run the
+/// standard la-ipc handshake, issue a single `metrics.scrape` RPC, and
+/// return `result.body` verbatim. The integration test in
+/// `crates/la-daemon/tests/acceptance.rs` asserts the bytes returned here
+/// are byte-identical to the daemon's `la_observ::render_prometheus()`
+/// output so a CLI-side `print!` cannot drop newlines or add prefixes.
 fn scrape_metrics(socket_path: &std::path::Path) -> std::io::Result<String> {
-    use std::io::Read as _;
-    let metrics_socket = la_daemon::metrics_socket_path(socket_path);
-    let mut stream = std::os::unix::net::UnixStream::connect(&metrics_socket)?;
-    let mut text = String::new();
-    stream.read_to_string(&mut text)?;
-    Ok(text)
-}
+    use la_ipc::connection::Connection;
+    use la_ipc::handshake::client_handshake;
+    use la_ipc::transport::{connect, Endpoint};
+    use la_proto::jsonrpc::{Message, Request, RequestId};
+    use la_proto::methods::{Method, MetricsScrape, MetricsScrapeParams, MetricsScrapeResult};
 
-#[cfg(not(unix))]
-fn scrape_metrics(_socket_path: &std::path::Path) -> std::io::Result<String> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "metrics endpoint is UDS-only in v1",
-    ))
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    rt.block_on(async move {
+        let endpoint = match () {
+            #[cfg(unix)]
+            () => Endpoint::uds(socket_path),
+            // Windows Named Pipe (B2 决议): the daemon binds
+            // `\\.\pipe\lazyagents-<stem>` (see `endpoint_for` in
+            // runtime.rs); mirror that path here so the CLI talks to
+            // the same endpoint regardless of platform.
+            #[cfg(not(unix))]
+            () => Endpoint::named_pipe(format!(
+                r"\\.\pipe\lazyagents-{}",
+                socket_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("lad")
+            )),
+        };
+        let stream = tokio::time::timeout(Duration::from_secs(5), connect(&endpoint))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?
+            .map_err(|e| std::io::Error::other(format!("connect: {e}")))?;
+        let mut conn = Connection::new(stream);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client_handshake(
+                &mut conn,
+                "lad-metrics",
+                SERVER_VERSION,
+                &[la_proto::PROTOCOL_VERSION],
+            ),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timeout"))?
+        .map_err(|e| std::io::Error::other(format!("handshake: {e}")))?;
+
+        let req = Request::new(1i64, MetricsScrape::NAME, MetricsScrapeParams::default())
+            .map_err(|e| std::io::Error::other(format!("encode request: {e}")))?;
+        conn.send(&Message::Request(req))
+            .await
+            .map_err(|e| std::io::Error::other(format!("send request: {e}")))?;
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), conn.recv())
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "response timeout")
+                })?
+                .map_err(|e| std::io::Error::other(format!("recv: {e}")))?
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "daemon closed")
+                })?;
+            if let Message::Response(resp) = msg {
+                if resp.id != RequestId::Num(1) {
+                    continue;
+                }
+                return match resp.outcome {
+                    la_proto::jsonrpc::ResponseOutcome::Result(v) => {
+                        let body: MetricsScrapeResult = serde_json::from_value(v)
+                            .map_err(|e| std::io::Error::other(format!("decode result: {e}")))?;
+                        Ok(body.body)
+                    }
+                    la_proto::jsonrpc::ResponseOutcome::Error(err) => Err(std::io::Error::other(
+                        format!("metrics.scrape rpc error: code={} {}", err.code, err.message),
+                    )),
+                };
+            }
+        }
+    })
 }
 
 fn run_backup(

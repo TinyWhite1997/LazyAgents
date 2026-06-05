@@ -418,14 +418,22 @@ async fn handle_request(req: Request, state: &ConnState, ctx: &ConnectionContext
     let method = req.method.clone();
     let trace_id = la_observ::new_trace_id();
     let span = tracing::info_span!("rpc", trace_id = %trace_id, method = %method);
+    let started = std::time::Instant::now();
     let result = dispatch(req, state, ctx).instrument(span).await;
+    let elapsed = started.elapsed().as_secs_f64();
     let result_label = if result.is_ok() { "ok" } else { "error" };
+    // M4.5 / WEK-75 — A9 metric naming table: every RPC call emits
+    // `lad_rpc_requests_total{method,result}` + a `lad_rpc_duration_seconds`
+    // histogram observation, labelled by method (no `result` label on the
+    // histogram — keeping cardinality bounded matters more than slicing
+    // success/error latency, which the dispatcher logs already carry).
     metrics::counter!(
         "lad_rpc_requests_total",
         "method" => method.clone(),
         "result" => result_label,
     )
     .increment(1);
+    metrics::histogram!("lad_rpc_duration_seconds", "method" => method.clone()).record(elapsed);
     match result {
         Ok(value) => Response {
             jsonrpc: la_proto::jsonrpc::Version,
@@ -565,6 +573,18 @@ async fn dispatch(
         la_proto::methods::RunsGet::NAME => {
             let params: la_proto::methods::RunsGetParams = decode_params(req)?;
             handle_runs_get(state, params).await
+        }
+        la_proto::methods::MetricsScrape::NAME => {
+            // M4.5 / WEK-75 — A9 metrics.scrape 三层一致性 (daemon RPC handler
+            // 层): render the in-process `metrics-exporter`-style recorder
+            // straight from `la-observ`. The body is whatever
+            // `render_prometheus` produces, unmodified — the CLI then
+            // prints it byte-identical so `lad metrics` and a future
+            // direct RPC client agree on the exposition text.
+            let _params: la_proto::methods::MetricsScrapeParams = decode_params(req)?;
+            ok(la_proto::methods::MetricsScrapeResult {
+                body: la_observ::render_prometheus(),
+            })
         }
         "shutdown" => ok(la_proto::methods::ShutdownResult {}),
         other => Err(RpcError::method_not_found(other)),

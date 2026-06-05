@@ -62,6 +62,7 @@ pub const METHOD_NAMES: &[&str] = &[
     CronsDryRun::NAME,
     RunsList::NAME,
     RunsGet::NAME,
+    MetricsScrape::NAME,
 ];
 
 /// Trait carried by every RPC method type for static method-name lookup.
@@ -1581,4 +1582,38 @@ impl Method for RunsGet {
     const NAME: &'static str = "runs.get";
     type Params = RunsGetParams;
     type Result = RunsGetResult;
+}
+
+// ---------- metrics.scrape (M4.5 / WEK-75 — A9 三层一致性) ----------
+//
+// `metrics.scrape` is the single observability scrape RPC. The daemon
+// renders its internal `metrics`-crate recorder to an OpenMetrics / text-
+// exposition body via `la_observ::render_prometheus()` and returns it
+// verbatim. `lad metrics` shells over the same UDS / Named Pipe handshake
+// every other client uses, then prints `result.body` byte-for-byte.
+//
+// Architecture §9.3 (M4.5 brief A9): the body MUST contain the `# TYPE`
+// / `# HELP` preamble plus at least one counter, gauge, and histogram
+// from the pinned metric naming table. Anything that drops one of those
+// rails is a contract break — see the dispatcher unit test for the
+// assertion.
+
+pub enum MetricsScrape {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "MetricsScrapeParams")]
+pub struct MetricsScrapeParams {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "MetricsScrapeResult")]
+pub struct MetricsScrapeResult {
+    /// Prometheus text-exposition body. Empty only if the recorder has
+    /// not been installed (production daemons always install it).
+    pub body: String,
+}
+
+impl Method for MetricsScrape {
+    const NAME: &'static str = "metrics.scrape";
+    type Params = MetricsScrapeParams;
+    type Result = MetricsScrapeResult;
 }
