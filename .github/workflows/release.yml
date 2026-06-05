@@ -852,6 +852,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # WEK-78 hotfix #3: cargo-dist 0.32's `dist host` pipeline is
+          # `create → upload → announce`. The prior wiring jumped
+          # straight to `upload`, which silently no-ops when no release
+          # object exists yet (the `dist host` invocations exit 0); the
+          # subsequent shell `gh release view`/`edit` then fails with
+          # `release not found` and the job exits 1. Add the create
+          # step so we land an empty draft release first, then upload
+          # artifacts onto it, then announce. Witnessed in run
+          # 27037307951 / host (github release) after the v0.1.0-rc.1
+          # third force-move.
+          dist host --tag="${RELEASE_TAG}" --steps=create
           dist host --tag="${RELEASE_TAG}" --steps=upload
           dist host --tag="${RELEASE_TAG}" --steps=announce
           # Append the A5.2 musl declaration + A5.1 size table on top of
