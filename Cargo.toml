@@ -106,6 +106,15 @@ inherits = "release"
 # lock-step with the installer URLs in `.github/workflows/release.yml`.
 cargo-dist-version = "0.32.0"
 ci = "github"
+# A5.3 / R2: `release.yml` is hand-curated (custom runner-pin matrix,
+# cross-zigbuild steps, A5.1 size annotation, A5.2 musl ldd assertion,
+# extracted-archive verification — none of which `dist init` knows how
+# to generate). Telling cargo-dist the workflow is "dirty" suppresses
+# its workflow-up-to-date diff so `dist plan` / `dist build` will run
+# against this file. The trade-off is that future `dist init` upgrades
+# need a manual re-merge of the generated workflow into ours; that is
+# the explicit cost of owning the workflow that A5.3 requires.
+allow-dirty = ["ci"]
 installers = ["shell", "powershell", "homebrew"]
 # A5.2 / A5.3 — 6-target release matrix. Order matches the addendum table
 # so the release-notes size table renders in a stable, reviewable order.
