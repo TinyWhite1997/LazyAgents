@@ -135,12 +135,14 @@ jobs:
     env:
       # PR-only stand-in for the resolved tag. `dist build` requires the
       # tag's version to match the workspace's actual published version
-      # (currently 0.1.0 — see crates/la-daemon/Cargo.toml). Bump this
-      # in lock-step with `[package] version` if the workspace version
-      # changes; otherwise `dist build` errors with "This workspace
-      # doesn't have anything for dist to Release". Never pushed; only
-      # used by `dist build --tag=`.
-      PR_DRYRUN_TAG: "v0.1.0"
+      # (currently 0.1.0-rc.1 — see crates/la-daemon/Cargo.toml; bumped
+      # from 0.1.0 in PR #62 / WEK-78). Bump this in lock-step with
+      # `[package] version` whenever the workspace version changes
+      # (full-repo `git grep -nE '0\.[0-9]+\.[0-9]+' .github/workflows/`
+      # before tagging is the next-to-last gate); otherwise `dist build`
+      # errors with "This workspace doesn't have anything for dist to
+      # Release". Never pushed; only used by `dist build --tag=`.
+      PR_DRYRUN_TAG: "v0.1.0-rc.1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -536,7 +538,17 @@ jobs:
             esac
           done
           echo "Extracted contents:"
-          find "target/distrib/_extracted/${{ matrix.target }}" -type f -printf '%p (%s bytes)\n'
+          # WEK-78 hotfix: `find -printf` is a GNU extension; BSD / macOS
+          # `find` rejects it ("unknown primary or operator"). The macOS
+          # build legs of v0.1.0-rc.1 (run 27033285698) failed here.
+          # Replace with a portable `find -exec sh -c ...` loop that
+          # mimics the `'%p (%s bytes)\n'` shape via `wc -c`.
+          find "target/distrib/_extracted/${{ matrix.target }}" -type f -exec sh -c '
+            for f; do
+              size=$(wc -c < "$f")
+              printf "%s (%s bytes)\n" "$f" "$size"
+            done
+          ' sh {} +
 
       # A5.2: musl artifact must be statically linked. We now ldd the
       # binaries unpacked from the SHIPPED archive (above) — the actual
@@ -552,7 +564,12 @@ jobs:
           mapfile -t bins < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f \( -name lad -o -name la \))
           if [[ ${#bins[@]} -eq 0 ]]; then
             echo "::error::no lad/la binary found in extracted musl archive"
-            find "target/distrib/_extracted/${{ matrix.target }}" -type f -printf '  %p\n'
+            # WEK-78 hotfix: same `find -printf` GNU-extension fix as above.
+            # This branch only runs on the linux-musl leg (Ubuntu/GNU find),
+            # so `-printf` would technically still work here, but normalise
+            # the call shape so a future copy-paste to a different leg
+            # doesn't reintroduce the BSD-incompat regression.
+            find "target/distrib/_extracted/${{ matrix.target }}" -type f -print | sed 's/^/  /'
             exit 1
           fi
           for bin in "${bins[@]}"; do
