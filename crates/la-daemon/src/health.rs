@@ -244,7 +244,25 @@ async fn probe_once_and_broadcast(cfg: &ProbeLoopConfig) {
     wire_entries.sort_by(|a, b| a.id.cmp(&b.id));
 
     let running = cfg.manager.active_count().await as u32;
-    metrics::gauge!("lad_session_active").set(running as f64);
+    // A9 (M4.5 / WEK-75): per-backend gauge. Always publish one sample per
+    // registered backend so a backend that has transitioned to zero
+    // sessions overwrites its previous non-zero value instead of leaving
+    // stale data in the recorder.
+    {
+        use std::collections::HashMap;
+        let mut by_backend: HashMap<String, u64> = HashMap::new();
+        for (id, _) in &cfg.adapters {
+            by_backend.insert(id.clone(), 0);
+        }
+        if let Ok(rows) = cfg.storage.sessions().list_active().await {
+            for row in rows {
+                *by_backend.entry(row.backend_id).or_insert(0) += 1;
+            }
+        }
+        for (backend, count) in by_backend {
+            metrics::gauge!("lad_session_active", "backend" => backend).set(count as f64);
+        }
+    }
     let params = DaemonHealthParams {
         // M3 will populate this when the scheduler lands; until then we
         // honestly report zero. Keeping the field on the wire shape

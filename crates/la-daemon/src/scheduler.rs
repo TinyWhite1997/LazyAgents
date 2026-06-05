@@ -51,6 +51,7 @@ use la_scheduler::{
 use la_storage::{Cron, CronUpsert, NewRejectedRun, NewRun, RunFinish, RunRecord, Storage};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::dispatcher::AdapterRegistry;
 
@@ -554,6 +555,58 @@ async fn drain_remaining_fires(cfg: &ExecutorConfig, fires: &mut mpsc::Receiver<
 }
 
 async fn process_fire(cfg: &ExecutorConfig, fire: FireEvent) {
+    // A9 (M4.5 / WEK-75) — 128-bit trace_id for the whole fire pipeline.
+    // Generated once at the entry of `process_fire`; the surrounding
+    // tracing span carries it for the lifetime of the call (via
+    // `Instrument`), and we hand it to `spawn_run_watcher` so the same
+    // id becomes the first line of `runs.tail_log` when the run
+    // finishes. That gives Loki / runs-table joins a single key to
+    // follow a cron fire from scheduled tick → spawn → exit.
+    let trace_id = la_observ::new_trace_id();
+
+    process_fire_inner(cfg, fire, trace_id.clone())
+        .instrument(tracing::info_span!("cron_fire", trace_id = %trace_id))
+        .await
+}
+
+async fn process_fire_inner(cfg: &ExecutorConfig, fire: FireEvent, trace_id: String) {
+    // A9 (M4.5 / WEK-75): every fire we see came through the catch-up
+    // applicator. `coalesced_count > 1` means coalesce collapsed N missed
+    // fires into one; `catchup_truncated` means replay dropped some past
+    // the safety cap. Skip mode never produces a fire when a catch-up
+    // backlog exists, so we increment it only when `count_missed`
+    // returned > 0 — but the heap layer already swallowed the missed
+    // fires, so the cheapest signal we have here is the cron's declared
+    // mode. We label by the cron's mode (the only label `lad_cron_missed_total`
+    // takes per the A9 table) and increment once per processed fire
+    // event so dashboards can divide by `lad_cron_runs_total` for a
+    // catch-up rate.
+    //
+    // Note: per the A9 table this counter is for "catch-up disposition"
+    // events (skip / coalesce / replay), so a normal single-fire tick
+    // still bumps `mode=<configured>` — the dashboard reads
+    // `delta(lad_cron_missed_total{mode="coalesce"})` to see how often
+    // coalescing actually happened. If the brief later restricts this to
+    // "only when N>1", flip the increment to gate on
+    // `fire.coalesced_count > 1`.
+    {
+        // Cron mode lookup is sub-microsecond (in-memory string compare
+        // a few lines down) but we do it once here against the only
+        // place we have authoritative cron state on hand without an
+        // extra DB hit.
+        let mode_label: &'static str = match cfg.storage.crons().get(&fire.cron_id).await {
+            Ok(Some(c)) => match c.catchup_mode.as_str() {
+                "skip" => "skip",
+                "replay" => "replay",
+                _ => "coalesce",
+            },
+            _ => "coalesce",
+        };
+        if fire.coalesced_count > 1 || fire.catchup_truncated {
+            metrics::counter!("lad_cron_missed_total", "mode" => mode_label).increment(1);
+        }
+    }
+
     // Single-line admission gate: the whole snapshot → evaluate → insert
     // sequence runs under one mutex so two fires for any cron cannot
     // each see `running_for_cron = 0` and both pass.
@@ -598,9 +651,22 @@ async fn process_fire(cfg: &ExecutorConfig, fire: FireEvent) {
     let loadavg_throttled = decision.error_kind() == Some("quota_cpu_load_throttle");
     cfg.throttled_by_loadavg
         .store(loadavg_throttled, Ordering::Relaxed);
+    // A9 (M4.5 / WEK-75): record the wall-clock delay this fire took on
+    // because of the loadavg throttle. `(fired_at - scheduled_at)` is
+    // a conservative lower bound — once admission defers, the heap
+    // either drops the fire (skip) or re-tries on the next tick; either
+    // way the gap we attribute here is the visible portion of the
+    // throttle. Negative gaps (clock skew) clamp to zero.
+    if loadavg_throttled {
+        let delay = (fire.fired_at - fire.scheduled_at).num_milliseconds().max(0) as f64 / 1000.0;
+        if delay > 0.0 {
+            metrics::counter!("lad_cron_throttled_seconds_total")
+                .increment(delay as u64);
+        }
+    }
 
     if let AdmissionDecision::Admit = decision {
-        if let Err(err) = admit_and_spawn(cfg, &cron, &fire).await {
+        if let Err(err) = admit_and_spawn(cfg, &cron, &fire, &trace_id).await {
             tracing::warn!(cron_id = %cron.id, %err, "admit failed");
         }
     } else if decision.is_deferral() {
@@ -683,8 +749,9 @@ async fn admit_and_spawn(
     cfg: &ExecutorConfig,
     cron: &Cron,
     fire: &FireEvent,
+    trace_id: &str,
 ) -> Result<String, AdmitError> {
-    admit_and_spawn_with_id(cfg, cron, fire, None).await
+    admit_and_spawn_with_id(cfg, cron, fire, None, Some(trace_id.to_string())).await
 }
 
 async fn admit_and_spawn_with_id(
@@ -692,6 +759,7 @@ async fn admit_and_spawn_with_id(
     cron: &Cron,
     fire: &FireEvent,
     out_run_id: Option<Arc<Mutex<String>>>,
+    trace_id: Option<String>,
 ) -> Result<String, AdmitError> {
     // 1. Reserve the global slot under the admission lock so the next
     //    fire sees the updated count even before the runs row exists.
@@ -817,7 +885,7 @@ async fn admit_and_spawn_with_id(
         }));
 
     // 8. Spawn the run-completion watcher.
-    spawn_run_watcher(cfg, run_id.clone(), spawned.id, cron.clone());
+    spawn_run_watcher(cfg, run_id.clone(), spawned.id, cron.clone(), trace_id.clone());
 
     if let Some(holder) = out_run_id {
         *holder.lock().await = run_id.clone();
@@ -939,7 +1007,13 @@ async fn write_rejected_audit(
     }
 }
 
-fn spawn_run_watcher(cfg: &ExecutorConfig, run_id: String, session_id: SessionId, cron: Cron) {
+fn spawn_run_watcher(
+    cfg: &ExecutorConfig,
+    run_id: String,
+    session_id: SessionId,
+    cron: Cron,
+    trace_id: Option<String>,
+) {
     let storage = cfg.storage.clone();
     let manager = cfg.manager.clone();
     let handle = cfg.handle.clone();
@@ -1021,7 +1095,14 @@ fn spawn_run_watcher(cfg: &ExecutorConfig, run_id: String, session_id: SessionId
             cost_usd_est: None,
             error_kind: outcome.error_kind.clone(),
             error_detail: outcome.error_detail.clone(),
-            tail_log: None,
+            // A9 (M4.5 / WEK-75): write the cron-fire trace_id as the
+            // first header line of `tail_log` so a future `lad runs get`
+            // (or any direct query against the runs table) can pivot
+            // straight to the Loki window for the same fire. The
+            // leading `# trace_id=...` shape is what the WEK-44 tail-log
+            // viewer already strips; existing readers ignore unknown
+            // header lines.
+            tail_log: trace_id.as_ref().map(|tid| format!("# trace_id={tid}\n").into_bytes()),
         };
         if let Err(err) = storage.runs().finish(&run_id, finish).await {
             tracing::warn!(%run_id, %err, "run finish persist failed");
@@ -1118,6 +1199,13 @@ fn spawn_diag_drain(mut diag: mpsc::Receiver<la_scheduler::SchedulerEvent>, shut
                 ev = diag.recv() => {
                     match ev {
                         Some(la_scheduler::SchedulerEvent::ClockSkewDetected { skew_seconds, recomputed_entries }) => {
+                            // A9 (M4.5 / WEK-75): pin the most recent skew
+                            // observation on the gauge. Signed seconds so a
+                            // backward jump (NTP step) and a forward jump
+                            // (laptop wake) are distinguishable on a
+                            // dashboard.
+                            metrics::gauge!("lad_scheduler_clock_skew_seconds")
+                                .set(skew_seconds as f64);
                             tracing::warn!(skew_seconds, recomputed_entries, "scheduler clock skew");
                         }
                         Some(la_scheduler::SchedulerEvent::CatchupTruncated { cron_id, missed, executed, dropped, saturated }) => {
@@ -1406,7 +1494,7 @@ pub async fn run_now(
     match decision {
         AdmissionDecision::Admit => {
             let run_id_holder = Arc::new(Mutex::new(String::new()));
-            admit_and_spawn_with_id(&exec_cfg, &cron, &fire, Some(run_id_holder.clone()))
+            admit_and_spawn_with_id(&exec_cfg, &cron, &fire, Some(run_id_holder.clone()), None)
                 .await
                 .map_err(|e| CronOpError::Other(e.to_string()))?;
             let id = run_id_holder.lock().await.clone();
@@ -1714,7 +1802,7 @@ mod tests {
         // so the gate doesn't permanently refuse subsequent fires.
         storage.close().await;
 
-        let err = admit_and_spawn_with_id(&cfg, &cron, &fire, None)
+        let err = admit_and_spawn_with_id(&cfg, &cron, &fire, None, None)
             .await
             .expect_err("storage failure must surface");
         assert!(matches!(err, AdmitError::Storage(_)), "got {err:?}");

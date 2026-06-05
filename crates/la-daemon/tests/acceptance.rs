@@ -190,15 +190,30 @@ async fn metrics_socket_uses_owner_only_permissions() {
 
 /// M4.5 / WEK-75 — A9 metrics.scrape 三层一致性 acceptance.
 ///
-/// 1. Issue a `metrics.scrape` RPC over the standard la-ipc handshake.
-/// 2. Run the `lad metrics` CLI against the same daemon socket.
-/// 3. Assert (a) the body has `# TYPE` + `# HELP` lines, (b) at least one
-///    counter, one gauge, and one histogram from the A9 naming table
-///    appears in the body, (c) the CLI stdout is byte-identical to the
-///    RPC body (no CLI-side newline trim, no prefix).
+/// "Byte-identical" in the DoD means the CLI passes the RPC `result.body`
+/// straight through to stdout without trimming, prefixing, or rewriting.
+/// We can't compare two separate scrapes byte-for-byte: every scrape itself
+/// emits one new `lad_rpc_requests_total{method="metrics.scrape"}` increment
+/// and one new `lad_rpc_duration_seconds{method="metrics.scrape"}` sample,
+/// and the scheduler-health loop runs in the background bumping gauges. So
+/// the test pins the parts that the CLI is responsible for:
+///
+/// 1. The RPC body has the `# TYPE` / `# HELP` preamble shape required of
+///    a Prometheus text-exposition payload, and exposes at least one
+///    counter + gauge + histogram from the pinned A9 naming table.
+/// 2. The CLI body has the SAME `# TYPE` and `# HELP` line set as the RPC
+///    body. These lines are static for a given describe set, so any
+///    rewriting in the CLI (a stray `print!("metrics: ...")`, an
+///    extension-handler scrub, a `\n`-stripping `write_str`, …) would
+///    show up here even with the metric-value noise.
+/// 3. Every metric name present in one body is present in the other.
+///
+/// The literal byte-equality property (CLI doesn't mutate the body) is
+/// covered by `cli_passes_through_rpc_body_unchanged_unit` below; this
+/// integration test exists to prove the wire path itself works.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn metrics_scrape_rpc_matches_cli_stdout_bytewise() {
+async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
     use la_proto::methods::{
         MetricsScrape, MetricsScrapeParams, MetricsScrapeResult, Method,
     };

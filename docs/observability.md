@@ -14,8 +14,20 @@ it. Adding or renaming a metric without updating both this file and
 `lad metrics` dials the daemon's main socket (Unix UDS / Windows Named Pipe)
 and issues a single `metrics.scrape` JSON-RPC call. The response carries the
 Prometheus text-exposition body in `result.body` and the CLI prints it to
-stdout byte-for-byte. There is no separate metrics socket — the same security
-boundary as every other RPC applies (`0o600` UDS / SID-restricted pipe).
+stdout unchanged — no prefix, no trim, no rewrite. There is no separate
+metrics socket; the same security boundary as every other RPC applies
+(`0o600` UDS / SID-restricted pipe).
+
+> Note on "byte-identical": the CLI is byte-identical with respect to the
+> RPC body of its own scrape — the bytes it prints are exactly the bytes
+> the daemon returned. Two scrapes back-to-back are NOT byte-identical:
+> every `metrics.scrape` call itself bumps `lad_rpc_requests_total{
+> method="metrics.scrape"}` and the scheduler-health loop ticks the gauges
+> in the background, so metric VALUES drift between scrapes. The
+> acceptance test
+> `metrics_scrape_rpc_and_cli_expose_same_a9_surface` pins the pieces that
+> the CLI is responsible for: same `# TYPE` / `# HELP` preamble, same
+> metric NAME set, structural shape unchanged.
 
 ```text
 # Inside the box
@@ -74,13 +86,15 @@ fixed field set below; per-event fields nest under the top-level keys via
 `trace_id` is a 128-bit hex string minted at:
 
 - the entry of every JSON-RPC request handler (`la_daemon::dispatcher::handle_request`),
-- the publication of every cron-fired notification (`la_daemon::dispatcher::deliver_bus_event`).
+- the entry of every cron fire (`la_daemon::scheduler::process_fire`), then
+  threaded through admit → spawn → watcher → `runs().finish()`.
 
 Both call sites use `la_observ::new_trace_id()`. The same value is injected
 into the surrounding `tracing::Span` so every downstream event inherits it
-via the `span.trace_id` field. RPC runs additionally write the id into the
-`runs.tail_log` row header so post-hoc log correlation works without a
-separate join.
+via the `span.trace_id` field. For cron runs the trace_id is also written as
+the first header line of `runs.tail_log` (`# trace_id=<id>\n`) so a future
+`lad runs get` (or a direct row query) can pivot straight into the Loki
+window for that fire without a separate join.
 
 ### `--log-format compact`
 

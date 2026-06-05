@@ -679,6 +679,14 @@ fn spawn_runs_archive_loop(cfg: RunsArchiveLoopConfig) -> JoinHandle<()> {
                 _ = &mut sleep => {
                     match storage.runs().archive_older_than_days(retention_days).await {
                         Ok(outcome) if outcome.archived_rows > 0 => {
+                            // A9 (M4.5 / WEK-75): every pruned row is one
+                            // increment on the `lad_runs_archive_pruned_total`
+                            // counter. The metric is unlabeled per the
+                            // pinned table — dashboards aggregate over
+                            // retention_days via the surrounding tracing
+                            // event.
+                            metrics::counter!("lad_runs_archive_pruned_total")
+                                .increment(outcome.archived_rows);
                             tracing::info!(
                                 rows = outcome.archived_rows,
                                 files = outcome.archive_files,
