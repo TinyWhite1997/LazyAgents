@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -77,28 +79,20 @@ impl AgentAdapter for FakeBackend {
     }
 
     fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, AdapterError> {
-        let script_dir = std::env::temp_dir().join("lazyagents-m2-smoke-scripts");
-        std::fs::create_dir_all(&script_dir).map_err(AdapterError::SpawnFailed)?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-
-        // Windows has no /bin/sh in the default PATH on the CI runner, and
-        // chmod +x is a no-op; emit a `cmd.exe /Q /K ...` long-running
-        // probe instead so the daemon sees a backend that stays up for the
-        // life of the test. Mirrors `integration/m0-smoke`'s CatAdapter.
+        // Windows: exec `ping.exe` directly. `ping -n 61 127.0.0.1` blocks
+        // ~60s without needing a shell wrapper. Going straight to ping
+        // avoids the daemon's `cmd /c <command-string>` shell-wrap reject
+        // (la-pty::reject_shell_wrapper, PtyError::ShellWrapping) — that
+        // gate trips on the m0-smoke `cmd /K echo` form too in spirit, but
+        // m0-smoke uses `/K` which the rule allow-lists; here we'd need
+        // `/C` to actually exit, so we sidestep cmd.exe entirely. ping.exe
+        // is in `C:\Windows\System32\` and always in PATH on supported
+        // Windows hosts.
         #[cfg(windows)]
         {
-            let script_path = script_dir.join(format!("{}-{nonce}.cmd", std::process::id()));
-            // `ping -n 61` blocks ~60s without needing a TRAP/SIGTERM
-            // equivalent; the test harness drops the session well before
-            // that. `>NUL` keeps the daemon's PTY buffer quiet.
-            std::fs::write(&script_path, "@echo off\r\nping -n 61 127.0.0.1 >NUL\r\n")
-                .map_err(AdapterError::SpawnFailed)?;
             return Ok(SpawnSpec {
-                program: PathBuf::from("cmd.exe"),
-                args: vec!["/Q".into(), "/C".into(), script_path.into()],
+                program: PathBuf::from("ping.exe"),
+                args: vec!["-n".into(), "61".into(), "127.0.0.1".into()],
                 env: req.env.clone(),
                 cwd: req.cwd.clone(),
                 pty: req.pty,
@@ -108,6 +102,12 @@ impl AgentAdapter for FakeBackend {
 
         #[cfg(unix)]
         {
+            let script_dir = std::env::temp_dir().join("lazyagents-m2-smoke-scripts");
+            std::fs::create_dir_all(&script_dir).map_err(AdapterError::SpawnFailed)?;
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
             let script_path = script_dir.join(format!("{}-{nonce}.sh", std::process::id()));
             std::fs::write(&script_path, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 60\n")
                 .map_err(AdapterError::SpawnFailed)?;
