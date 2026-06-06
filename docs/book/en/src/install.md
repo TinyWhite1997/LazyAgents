@@ -70,7 +70,7 @@ lad doctor
 socket path:    /run/user/1000/lazyagents/lad-1.sock
 runtime dir:    /run/user/1000/lazyagents
 state dir:      /home/alice/.local/share/lazyagents
-server version: 0.1.0
+server version: 0.1.1
 status:         no daemon listening
 ```
 

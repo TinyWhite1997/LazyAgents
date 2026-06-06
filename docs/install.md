@@ -158,7 +158,7 @@ A healthy fresh install — **after** the daemon has been started via `lad insta
 ```text
 ✓ daemon socket reachable: /run/user/1000/lazyagents/lad-1.sock
 ✓ socket permissions: 0600 owner=uid:1000
-✓ daemon version: la 0.1.0 (matches client)
+✓ daemon version: la 0.1.1 (matches client)
 ✓ state dir writable: /home/alice/.local/share/lazyagents (free: 765.5 GiB)
 ✓ git available: git version 2.43.0
 ✓ adapter claude: ok version=2.1.158
@@ -173,7 +173,7 @@ If the daemon is **not** running yet, `lad doctor` will report it as a **critica
 ```text
 ✗ daemon socket reachable: no daemon listening at /run/user/1000/lazyagents/lad-1.sock; start with `lad start` or `lad daemonize`
 ✗ socket permissions: could not stat /run/user/1000/lazyagents/lad-1.sock: No such file or directory (os error 2); daemon may not have created it yet
-✓ daemon version: client la 0.1.0; daemon unreachable, skipping match
+✓ daemon version: client la 0.1.1; daemon unreachable, skipping match
 ✓ state dir writable: /home/alice/.local/share/lazyagents (free: 765.5 GiB)
 ✓ git available: git version 2.43.0
 …
