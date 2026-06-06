@@ -10,8 +10,10 @@ name: release
 # happens in WEK-78 / M4.6 — this workflow only has to be syntactically
 # valid and `cargo dist plan` clean for M4.3 acceptance.
 #
-# v1.1 扩展架构 §13 支持 x86_64-unknown-linux-musl 作为静态 Linux artifact
-# （A5.2）；aarch64-unknown-linux-musl 推 v1.x（追踪 issue: WEK-80）。
+# v1.1 扩展架构 §13 支持 x86_64-unknown-linux-musl 与
+# aarch64-unknown-linux-musl 作为静态 Linux artifact（A5.2）。
+# aarch64-musl 在 WEK-80 下落地：native `ubuntu-22.04-arm` runner +
+# cargo-zigbuild + 显式 bundled-sqlite + ring acceptance。
 
 on:
   push:
@@ -96,13 +98,17 @@ jobs:
           echo "distinct target triples in manifest:"
           echo "$targets"
           count=$(printf '%s\n' "$targets" | grep -c .)
-          if [[ "$count" -lt 6 ]]; then
-            echo "::error::dist plan produced fewer than 6 distinct targets — A5.3 matrix regression (got $count)"
+          if [[ "$count" -lt 7 ]]; then
+            echo "::error::dist plan produced fewer than 7 distinct targets — A5.3 matrix regression (got $count)"
             exit 1
           fi
-          # A5.2 spot-check: musl artifact must be in the plan.
+          # A5.2 spot-check: both musl artifacts must be in the plan.
           if ! printf '%s\n' "$targets" | grep -qx 'x86_64-unknown-linux-musl'; then
             echo "::error::x86_64-unknown-linux-musl missing from dist plan — A5.2 regression"
+            exit 1
+          fi
+          if ! printf '%s\n' "$targets" | grep -qx 'aarch64-unknown-linux-musl'; then
+            echo "::error::aarch64-unknown-linux-musl missing from dist plan — A5.2 / WEK-80 regression"
             exit 1
           fi
       - name: install actionlint
@@ -343,9 +349,19 @@ jobs:
     #   x86_64-unknown-linux-gnu   → ubuntu-22.04                (native)
     #   aarch64-unknown-linux-gnu  → ubuntu-22.04 + zigbuild     (cross)
     #   x86_64-unknown-linux-musl  → ubuntu-22.04 + zigbuild     (cross)
+    #   aarch64-unknown-linux-musl → ubuntu-22.04-arm + zigbuild (native ARM, WEK-80)
     #   aarch64-apple-darwin       → macos-14                    (native)
     #   x86_64-apple-darwin        → macos-15-intel              (native)
     #   x86_64-pc-windows-msvc     → windows-2022                (native)
+    #
+    # `ubuntu-22.04-arm` is the GitHub-hosted native Linux/ARM64 image
+    # (per https://github.blog/changelog/2025-01-16-linux-arm64-hosted-runners-now-available-for-free-in-public-repositories-public-preview/
+    # and follow-on GA). WEK-80 leader decision: native ARM hosted
+    # runner, NOT QEMU user-mode emulation — QEMU under cargo-zigbuild
+    # is unreliable for ring's aarch64 asm path and slows the build to
+    # the point where it eats the matrix timeout. Pin this image
+    # (never `ubuntu-*-arm-latest`); if GitHub deprecates it a follow-up
+    # flips the pin to the next fixed ARM image.
     #
     # `macos-15-intel` (NOT the brief's `macos-13`): GitHub retired the
     # `macos-13` hosted runner image on 2025-12-04 — see
@@ -375,6 +391,13 @@ jobs:
             cross: true
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-22.04
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            # WEK-80: native ARM hosted runner; cargo-zigbuild still drives
+            # the cross-link so the toolchain shape matches the x86_64-musl
+            # leg (bundled-sqlite + ring asm path verified under
+            # cargo-zigbuild + zigcc, not under QEMU emulation).
+            runner: ubuntu-22.04-arm
             cross: true
           - target: aarch64-apple-darwin
             runner: macos-14
@@ -445,8 +468,9 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/bin"
           case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu)  zig_target=aarch64-linux-gnu ;;
-            x86_64-unknown-linux-musl)  zig_target=x86_64-linux-musl ;;
+            aarch64-unknown-linux-gnu)   zig_target=aarch64-linux-gnu ;;
+            x86_64-unknown-linux-musl)   zig_target=x86_64-linux-musl ;;
+            aarch64-unknown-linux-musl)  zig_target=aarch64-linux-musl ;;
             *) echo "unhandled cross target ${{ matrix.target }}"; exit 1 ;;
           esac
           # Strip any --target=<rust-triple> that cc-rs prepends — zig
@@ -490,10 +514,16 @@ jobs:
           # cargo-zigbuild installs its own linker shim; piling our
           # zigcc on top causes duplicate-symbol errors against rustc's
           # musl self-contained crt files (_start / _init / _fini).
+          # WEK-80: aarch64-musl reuses the same cc-rs routing pattern
+          # so bundled-sqlite (libsqlite3-sys) and ring's aarch64 asm
+          # path both pick up the zig-fronted musl cross compiler
+          # rather than the host gcc on the ARM runner.
           CC_aarch64_unknown_linux_gnu: zigcc
           CXX_aarch64_unknown_linux_gnu: zigcxx
           CC_x86_64_unknown_linux_musl: zigcc
           CXX_x86_64_unknown_linux_musl: zigcxx
+          CC_aarch64_unknown_linux_musl: zigcc
+          CXX_aarch64_unknown_linux_musl: zigcxx
         run: |
           cargo zigbuild --release --target=${{ matrix.target }} -p la-daemon -p la-tui
       - name: pack archives (cross)
@@ -504,6 +534,8 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: zigcxx
           CC_x86_64_unknown_linux_musl: zigcc
           CXX_x86_64_unknown_linux_musl: zigcxx
+          CC_aarch64_unknown_linux_musl: zigcc
+          CXX_aarch64_unknown_linux_musl: zigcxx
         run: dist build --tag="${RELEASE_TAG}" --artifacts=local --target=${{ matrix.target }}
 
       # A5.1 + A5.2 verification operates on the binaries that
@@ -563,8 +595,11 @@ jobs:
       # bytes a user downloads. `ldd` on a static binary prints either
       # "statically linked" (GNU ldd) or "not a dynamic executable"
       # (musl ldd); any .so dependency line fails the build.
+      # WEK-80: aarch64-musl runs on the native ARM runner, where `ldd`
+      # is the same GNU ldd shipped with Ubuntu — the assertion shape
+      # is identical to the x86_64-musl leg.
       - name: assert musl artifact is static (ldd)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
         shell: bash
         run: |
           set -euo pipefail
@@ -602,6 +637,64 @@ jobs:
             esac
           done
           exit "$fail"
+
+      # WEK-80: bundled-sqlite (libsqlite3-sys) + ring asm path acceptance.
+      # Both crates are the historical aarch64-musl + cargo-zigbuild
+      # friction points called out in Cargo.toml. The build steps above
+      # already prove they COMPILE; this step proves the resulting
+      # binary actually LOADS on the native ARM runner without:
+      #   • dlopen-ing host /usr/lib/aarch64-linux-gnu/libsqlite3.so.0
+      #     (bundled-sqlite would silently link the host so if the
+      #     feature gate had regressed under cargo-zigbuild)
+      #   • segfaulting in ring's aarch64 PMULL/SHA2 dispatch bootstrap
+      #     (historical cargo-zigbuild + ring asm collision on musl
+      #     self-contained crt — see Cargo.toml deferral history)
+      # `lad --version` is the smallest invocation that links the full
+      # binary into memory; `lad doctor` additionally exercises sqlite
+      # open + ring-backed IPC handshake. doctor exits non-zero on a
+      # fresh runner (no daemon, no git workspace) — that is expected
+      # and not what this step gates on; what we gate on is a clean
+      # process exit (no segfault, no "ELF load error: libsqlite3.so.0
+      # not found") and any visible doctor report being printed.
+      # The x86_64-musl leg cannot run this step because the runner is
+      # x86_64; the native ARM runner is the whole point of pinning
+      # `ubuntu-22.04-arm` rather than QEMU.
+      - name: aarch64-musl smoke (bundled-sqlite + ring acceptance, WEK-80)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bins=()
+          while IFS= read -r line; do
+            bins+=("$line")
+          done < <(find "target/distrib/_extracted/${{ matrix.target }}" -type f -name lad)
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "::error::no lad binary found in extracted aarch64-musl archive"
+            find "target/distrib/_extracted/${{ matrix.target }}" -type f -print | sed 's/^/  /'
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
+            chmod +x "$bin"
+            echo "smoke: $bin --version"
+            # --version must exit 0; any failure here means the binary
+            # itself doesn't load (ELF / dyld / ring asm bootstrap).
+            "$bin" --version
+            echo "smoke: $bin doctor (informational; non-zero exit is expected on a fresh CI runner)"
+            # Capture so we can grep for known acceptance signals while
+            # tolerating doctor's tiered exit codes (1 = critical,
+            # 2 = degraded, 0 = ok). The acceptance bar is that doctor
+            # produces a normal report — proving sqlite + ring init
+            # ran without dlopen / segfault — not that every check is OK.
+            doctor_out=$("$bin" doctor 2>&1 || true)
+            printf '%s\n' "$doctor_out"
+            # The "socket path" + "state dir" lines are emitted before
+            # any tier check runs; absence means the binary crashed
+            # before doctor::run_with_inputs returned.
+            if ! grep -q 'socket' <<<"$doctor_out"; then
+              echo "::error::lad doctor on aarch64-musl did not print a normal report; binary likely crashed during ring / sqlite init"
+              exit 1
+            fi
+          done
 
       # A5.1: stripped-binary size is a WARN-only soft goal (NOT a hard
       # release gate — 硬门等 v1.x debug-symbol audit). Measures the
@@ -918,11 +1011,11 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "## Linux musl artifact (A5.2)"
+            echo "## Linux musl artifacts (A5.2)"
             echo
-            echo "This release ships a statically-linked \`x86_64-unknown-linux-musl\` artifact alongside the GNU Linux targets, per v1.1 扩展架构 §13. Suitable for Alpine / glibc-less environments."
+            echo "This release ships statically-linked \`x86_64-unknown-linux-musl\` and \`aarch64-unknown-linux-musl\` artifacts alongside the GNU Linux targets, per v1.1 扩展架构 §13. Suitable for Alpine / glibc-less environments on both x86_64 and aarch64 (embedded ARM, aarch64 Alpine containers, aarch64 musl Docker bases)."
             echo
-            echo "\`aarch64-unknown-linux-musl\` is **not** in this release; it is tracked for v1.x via [WEK-80](https://github.com/TinyWhite1997/LazyAgents/issues) (推 v1.x)."
+            echo "Both musl binaries are built with \`cargo-zigbuild\` against pinned zig \`${ZIG_VERSION}\` / cargo-zigbuild \`${CARGO_ZIGBUILD_VERSION}\`. The aarch64-musl artifact is built on a native \`ubuntu-22.04-arm\` runner (not QEMU) and exercises the same \`bundled-sqlite\` + \`ring\` asm path acceptance as the x86_64-musl leg (WEK-80)."
             echo
             echo "## Verifying release artifacts (sigstore / GitHub Attestations)"
             echo
