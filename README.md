@@ -59,6 +59,8 @@ A full-fidelity screenshot of the same tab once the New-session form lands is tr
 
 Full install path, including service install (`systemd` / `launchd` / Windows Scheduled Task) and the macOS configuration fallback chain, is in [`docs/install.md`](docs/install.md). Already on LazyAgents and bumping to a new release? See [`docs/upgrade.md`](docs/upgrade.md).
 
+> **Fork / offline / internal mirror?** `la --check-update` reads the manifest URL from the `LAZYAGENTS_UPDATE_MANIFEST_URL` env var, falling back to GitHub Releases. Point it at your own GitHub-compatible Releases endpoint (response must carry `tag_name` / `html_url` / `prerelease`) when the default host is unreachable. See [`docs/install.md` → Update / uninstall](docs/install.md#update--uninstall).
+
 ---
 
 ## Why LazyAgents

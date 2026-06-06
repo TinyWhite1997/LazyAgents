@@ -102,6 +102,17 @@ gh attestation verify ./lazyagents-x86_64-unknown-linux-gnu.tar.xz \
 
 `la --check-update` 会查询 GitHub Releases，并告诉你是否有更新版。它不会自动安装 —— 用上面的安装器重新跑一次即可升级。
 
+### Fork、内网镜像、离线网络
+
+设置 `LAZYAGENTS_UPDATE_MANIFEST_URL` 把检查重定向到自己的 GitHub-兼容 Releases 端点。响应必须带 `tag_name`、`html_url`、`prerelease` 字段（你 fork 仓库的 GitHub Enterprise Server 镜像可直接复用）。这是唯一的开关 —— 没有第二条逃生通道，也没有可关的自动安装器。
+
+```sh
+export LAZYAGENTS_UPDATE_MANIFEST_URL=https://releases.internal.example.com/lazyagents/latest
+la --check-update
+```
+
+如果指定的 URL 访问不通或返回体格式错误，`la --check-update` 会把简短原因写到 stderr 并以 `0` 退出 —— 这个检查刻意做成非致命的。
+
 ## 卸载
 
 ```sh

@@ -799,6 +799,17 @@ jobs:
             echo
             echo "\`aarch64-unknown-linux-musl\` is **not** in this release; it is tracked for v1.x via [WEK-80](https://github.com/TinyWhite1997/LazyAgents/issues) (推 v1.x)."
             echo
+            echo "## Fork / internal-mirror escape hatch — \`LAZYAGENTS_UPDATE_MANIFEST_URL\`"
+            echo
+            echo "\`la --check-update\` reads the release-manifest URL from \`LAZYAGENTS_UPDATE_MANIFEST_URL\`, falling back to the public GitHub Releases API. This is the supported escape hatch for **forks**, **air-gapped or proxied networks**, and **internal mirrors** — there is no other knob, and \`la\` will not auto-install regardless."
+            echo
+            echo "\`\`\`sh"
+            echo "export LAZYAGENTS_UPDATE_MANIFEST_URL=https://releases.internal.example.com/lazyagents/latest"
+            echo "la --check-update"
+            echo "\`\`\`"
+            echo
+            echo "The endpoint must respond with a JSON object compatible with the GitHub Releases shape — at minimum \`tag_name\`, \`html_url\`, and \`prerelease\`. A GitHub Enterprise Server mirror of your fork works as-is. If the override is unreachable or returns a malformed body, \`la --check-update\` prints a short reason to stderr and exits \`0\` — intentionally non-fatal so the check can sit inside a wrapper script. Full details in [\`docs/install.md\` → Update / uninstall](https://github.com/TinyWhite1997/LazyAgents/blob/main/docs/install.md#update--uninstall)."
+            echo
             echo "## Artifact sizes (stripped, soft goal: < 30 MiB — A5.1 WARN-only)"
             echo
             echo "| target | binary | size |"
