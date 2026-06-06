@@ -35,13 +35,14 @@ use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, ResponseOutcome};
 use la_proto::methods::{
     AdaptersDiscover, AdaptersDiscoverParams, Method, SessionSummary, SessionsArchive,
-    SessionsArchiveParams, SessionsDelete, SessionsDeleteParams, SessionsImport,
-    SessionsImportParams, SessionsList, SessionsListParams,
+    SessionsArchiveParams, SessionsCreate, SessionsCreateParams, SessionsCreateResult,
+    SessionsDelete, SessionsDeleteParams, SessionsImport, SessionsImportParams, SessionsList,
+    SessionsListParams,
 };
 use tokio::sync::mpsc;
 
 use crate::model::{ProjectGroup, SessionRow};
-use crate::source::SessionSource;
+use crate::source::{NewSessionRequest, SessionId, SessionSource, SourceError};
 
 /// Background-loop tick. A1 contract: polling. A5 (WEK-95) replaces
 /// this with `sessions.changed` push notifications.
@@ -50,6 +51,15 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Initial sleep after a connect/RPC failure. Mirrors [`crate::notif_sub`].
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Hard cap on how long [`SessionSource::create_session`] blocks the TUI
+/// thread waiting for the bg loop's `sessions.create` round-trip. The
+/// daemon's spawn path can stall on adapter probes, mutex contention,
+/// or an unresponsive backend CLI while the socket still looks healthy
+/// from our side; we'd rather close the modal with a Backend toast than
+/// freeze the UI (review feedback from architect on PR #86 — `Esc`/`q`
+/// must keep working). The user can retry from a fresh `n` press.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Daemon-backed [`SessionSource`].
 ///
@@ -62,6 +72,11 @@ pub struct RpcSessionSource {
     /// last sender (i.e. dropping `RpcSessionSource`) causes the bg
     /// loop's `recv()` to return `None`, which triggers a clean exit.
     cmd_tx: mpsc::UnboundedSender<Command>,
+    /// How long [`Self::create_session`] will block the TUI thread
+    /// before giving up with [`SourceError::Backend`]. Tests override
+    /// this via [`Self::set_create_timeout`] so the timeout arm can be
+    /// exercised in < 1 s; production uses [`CREATE_TIMEOUT`].
+    create_timeout: Duration,
     _thread: ThreadGuard,
 }
 
@@ -71,6 +86,17 @@ enum Command {
     Archive(String),
     Delete(String),
     ImportDiscovered(String),
+    /// Spawn a new session via `sessions.create`. The reply channel
+    /// carries the daemon-assigned id (success) or the wire-level
+    /// failure (mapped to [`SourceError::Backend`]) so the calling
+    /// thread can block on a synchronous trait method. Uses
+    /// [`std::sync::mpsc::SyncSender`] instead of `tokio::sync::oneshot`
+    /// so the TUI thread can `recv_timeout` natively without dragging
+    /// in an extra runtime handle.
+    Create {
+        req: NewSessionRequest,
+        reply: std::sync::mpsc::SyncSender<Result<SessionId, SourceError>>,
+    },
     /// Test-only: force a `sessions.list` refresh on the next loop turn.
     #[cfg(test)]
     Refresh,
@@ -123,10 +149,21 @@ impl RpcSessionSource {
         Self {
             cache,
             cmd_tx,
+            create_timeout: CREATE_TIMEOUT,
             _thread: ThreadGuard {
                 handle: Some(handle),
             },
         }
+    }
+
+    /// Override [`CREATE_TIMEOUT`]. Public for the integration smoke
+    /// tests in `tests/rpc_source_live.rs` that need to exercise the
+    /// timeout arm without burning 10 s of wall-clock per run. Not
+    /// intended for production callers — the constant is sized for
+    /// real daemon latency, not unit tests.
+    #[doc(hidden)]
+    pub fn set_create_timeout(&mut self, d: Duration) {
+        self.create_timeout = d;
     }
 
     /// Synchronously wait until the bg loop has populated the cache at
@@ -185,6 +222,50 @@ impl SessionSource for RpcSessionSource {
         let _ = self
             .cmd_tx
             .send(Command::ImportDiscovered(session_id.to_string()));
+    }
+
+    fn create_session(&mut self, req: NewSessionRequest) -> Result<SessionId, SourceError> {
+        // Validation gate matches the mock: the daemon also rejects
+        // these, but failing in the TUI keeps the round-trip out of the
+        // hot path and lets the modal stay open with the user's input
+        // intact (Validation arm).
+        if req.backend.trim().is_empty() {
+            return Err(SourceError::Validation("backend is required".into()));
+        }
+        if req.prompt.trim().is_empty() {
+            return Err(SourceError::Validation("prompt cannot be empty".into()));
+        }
+        if req.project_dir.trim().is_empty() {
+            return Err(SourceError::Validation(
+                "project directory is missing — try a different project row".into(),
+            ));
+        }
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        self.cmd_tx
+            .send(Command::Create {
+                req,
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                SourceError::Backend("rpc session source bg thread is no longer running".into())
+            })?;
+        // Block the TUI thread until the bg loop answers, but only up
+        // to CREATE_TIMEOUT. A daemon that has the socket open but
+        // sits on `sessions.create` (adapter probe stall, manager
+        // mutex held, unresponsive backend CLI) would otherwise freeze
+        // the UI — `Esc`/`q` wouldn't fire because the input loop is
+        // parked here. Timing out lets the modal close with a Backend
+        // toast so the user can decide to retry.
+        match reply_rx.recv_timeout(self.create_timeout) {
+            Ok(res) => res,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(SourceError::Backend(format!(
+                "create timed out — daemon did not reply within {}s",
+                self.create_timeout.as_secs()
+            ))),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(SourceError::Backend(
+                "rpc session source bg thread dropped the create reply".into(),
+            )),
+        }
     }
 }
 
@@ -316,6 +397,59 @@ async fn run_once(
                             external = %external_id,
                             "import_discovered: external id not found in adapters.discover; dropping"
                         );
+                    }
+                }
+                Command::Create {
+                    req: new_req,
+                    reply,
+                } => {
+                    // Translate trait-level fields to the wire shape.
+                    // The TUI thread waits on the reply channel up to
+                    // CREATE_TIMEOUT; we still notify the reply before
+                    // bubbling a transport failure up to the reconnect
+                    // loop so a wedged bg thread can't wedge the modal.
+                    //
+                    // `prompt` is always Some(...) here because
+                    // [`SessionSource::create_session`] already rejected
+                    // an empty buffer as `Validation`; the daemon also
+                    // requires a non-empty prompt so we don't bother
+                    // sending `None`.
+                    let params = SessionsCreateParams {
+                        project_dir: new_req.project_dir.clone(),
+                        backend: new_req.backend.clone(),
+                        args: new_req.args.clone(),
+                        prompt: Some(new_req.prompt.clone()),
+                        worktree: new_req.worktree,
+                    };
+                    let req = match Request::new(next_id, SessionsCreate::NAME, params) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = reply
+                                .send(Err(SourceError::Backend(format!("encode create: {e}"))));
+                            continue;
+                        }
+                    };
+                    next_id += 1;
+                    match send_and_await_ack(&mut conn, req).await {
+                        Ok(value) => match serde_json::from_value::<SessionsCreateResult>(value) {
+                            Ok(r) => {
+                                let _ = reply.send(Ok(SessionId(r.session_id)));
+                                mutated = true;
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(SourceError::Backend(format!(
+                                    "decode create result: {e}"
+                                ))));
+                            }
+                        },
+                        Err(e) => {
+                            // Tell the caller before bubbling the
+                            // transport failure up to the reconnect
+                            // loop — otherwise the TUI would wait the
+                            // full CREATE_TIMEOUT for nothing.
+                            let _ = reply.send(Err(SourceError::Backend(e.clone())));
+                            return Err(e);
+                        }
                     }
                 }
                 #[cfg(test)]
