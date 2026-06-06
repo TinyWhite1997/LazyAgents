@@ -1000,18 +1000,20 @@ jobs:
           done
 
           # Substitute the release tag + version into the checked-in
-          # templates. Use `|` as the sed delimiter so a `/` in the tag
-          # (which would only happen under workflow_dispatch misuse)
-          # doesn't break the substitution.
-          version="${RELEASE_TAG#v}"
-          for ext in sh ps1; do
-            src=".github/installers/lazyagents-installer.${ext}.in"
-            dst="target/distrib/lazyagents-installer.${ext}"
-            sed \
-              -e "s|__RELEASE_TAG__|${RELEASE_TAG}|g" \
-              -e "s|__RELEASE_VERSION__|${version}|g" \
-              "$src" > "$dst"
-          done
+          # templates via the dedicated renderer
+          # (.github/installers/render-aggregator-installer.py). It uses
+          # pure Python `str.replace()` — not `sed` — because sed's
+          # replacement DSL would interpret `&` as the match backref
+          # and break on the delimiter character. SemVer tags don't
+          # contain those characters today, but a workflow_dispatch run
+          # with a stray tag value should still fail loud rather than
+          # emit a half-substituted script. The renderer also fails on
+          # any unsubstituted `__RELEASE_*__` marker, catching template
+          # drift before the artifact is uploaded.
+          export RELEASE_TAG="${RELEASE_TAG}"
+          export RELEASE_VERSION="${RELEASE_TAG#v}"
+          .github/installers/render-aggregator-installer.py sh
+          .github/installers/render-aggregator-installer.py ps1
           chmod +x target/distrib/lazyagents-installer.sh
 
           # Smoke: parse + show the resolved URLs so a release pipeline
