@@ -1721,6 +1721,11 @@ async fn shutdown_finishes_within_cap_with_active_worktree_sweep_loop() {
 ///   && echo target/debug/lad) cargo test \
 ///   -p la-daemon --test acceptance lad_daemonize_binary_smoke
 /// ```
+// Unix-only: `lad daemonize` is the POSIX double-fork path; Windows
+// has no equivalent (the service-install path runs through a
+// Windows-task wrapper, not `daemonize`). Keep this off the Windows
+// test list per the WEK-84 保留清单.
+#[cfg(unix)]
 #[test]
 fn lad_daemonize_binary_smoke() {
     let Some(lad) = std::env::var_os("LAD_BIN") else {
