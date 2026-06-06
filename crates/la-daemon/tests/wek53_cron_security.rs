@@ -20,6 +20,12 @@
 //! 4. `bypass_token_rejected` — `crons.set_enabled { enabled: true,
 //!    token: Some("not-issued") }` errors with
 //!    `CRON_CONFIRMATION_REQUIRED`; the cron stays disabled.
+//! 5. `pending_token_invalidated_by_sensitive_upsert_on_disabled_cron`
+//!    — regression for the WEK-53 review TOCTOU: a token issued
+//!    against a disabled cron's content A is unredeemable once the
+//!    cron's sensitive snapshot has been mutated to B, even though
+//!    the cron stayed disabled and `requires_reconfirmation` never
+//!    fired on the upsert side.
 
 #![cfg(unix)]
 
@@ -513,6 +519,132 @@ async fn bypass_token_rejected() {
     )
     .await;
     assert!(!got.cron.enabled, "fabricated token must not enable");
+
+    shutdown(td).await;
+}
+
+/// WEK-53 review regression: a confirmation token issued for a
+/// **disabled** cron's content A must be unredeemable once a subsequent
+/// upsert mutates that cron's sensitive snapshot to B. The original
+/// implementation only invalidated tokens on the "enabled-cron sensitive
+/// edit" path; a disabled cron could be re-targeted between issue and
+/// confirm, letting the user unwittingly authorise content they were
+/// never shown.
+///
+/// Repro shape (verbatim from the reviewer):
+///   1. Upsert new disabled cron with prompt A.
+///   2. crons.set_enabled { enabled: true, token: None } → token T.
+///   3. crons.upsert same cron with sensitive field flipped to B
+///      (cron is still disabled, so `requires_reconfirmation` itself
+///      stays false — but T was issued against A).
+///   4. crons.set_enabled { enabled: true, token: Some(T) } must error.
+#[tokio::test]
+async fn pending_token_invalidated_by_sensitive_upsert_on_disabled_cron() {
+    let td = bootstrap().await;
+    let project_id = seed_project_row(td.tempdir.path().join("state").as_path()).await;
+    let mut conn = client(&td.socket).await;
+
+    // Step 1: create disabled cron with prompt A.
+    let up: CronsUpsertResult = call(
+        &mut conn,
+        "crons.upsert",
+        &upsert_params(&project_id, "PROMPT-A"),
+    )
+    .await;
+    let cron_id = up.cron.id;
+    assert!(!up.cron.enabled);
+    assert!(
+        !up.requires_reconfirmation,
+        "new cron has nothing to reconfirm against"
+    );
+
+    // Step 2: issue an enable token. Cron is still disabled.
+    let first: CronsSetEnabledResult = call(
+        &mut conn,
+        "crons.set_enabled",
+        &CronsSetEnabledParams {
+            cron_id: cron_id.clone(),
+            enabled: true,
+            confirmation_token: None,
+        },
+    )
+    .await;
+    let confirmation = first
+        .requires_confirmation
+        .as_ref()
+        .expect("first call must issue a token");
+    assert_eq!(confirmation.prompt_preview, "PROMPT-A");
+    let token = confirmation.confirmation_token.clone();
+    assert!(!first.cron.enabled);
+
+    // Step 3: sensitive-field upsert (prompt → B) on the still-disabled
+    // cron. The wire response does NOT set `requires_reconfirmation`
+    // here because the cron was not enabled, and that is exactly the
+    // signal the original implementation latched onto — meaning it
+    // would have kept the token alive. The fix is that the token now
+    // carries a fingerprint of A's sensitive snapshot; switching to B
+    // unbinds it at confirm time.
+    let mut next_params = upsert_params(&project_id, "PROMPT-B");
+    next_params.id = Some(cron_id.clone());
+    let edited: CronsUpsertResult = call(&mut conn, "crons.upsert", &next_params).await;
+    assert!(!edited.cron.enabled);
+    assert!(
+        !edited.requires_reconfirmation,
+        "edit on disabled cron has no enabled state to flip — \
+         this is exactly the path the original code missed"
+    );
+
+    // Step 4: replaying T against B's snapshot must be rejected. Without
+    // the fix, this asserted `Ok(...)` with `cron.enabled = true` and
+    // prompt = B, which is the attack.
+    let err = call_raw(
+        &mut conn,
+        "crons.set_enabled",
+        serde_json::to_value(CronsSetEnabledParams {
+            cron_id: cron_id.clone(),
+            enabled: true,
+            confirmation_token: Some(token),
+        })
+        .unwrap(),
+    )
+    .await
+    .expect_err("token issued for prompt A must not enable prompt B");
+    assert_eq!(err.code, error_codes::CRON_CONFIRMATION_REQUIRED);
+
+    // And the cron must still be disabled with the most recent (B)
+    // content landed.
+    let got: CronsGetResult = call(
+        &mut conn,
+        "crons.get",
+        &CronsGetParams {
+            cron_id: cron_id.clone(),
+        },
+    )
+    .await;
+    assert!(!got.cron.enabled);
+    assert_eq!(got.cron.prompt, "PROMPT-B");
+
+    // A fresh first-step call now reflects the B content the user
+    // should be asked to authorise.
+    let restart: CronsSetEnabledResult = call(
+        &mut conn,
+        "crons.set_enabled",
+        &CronsSetEnabledParams {
+            cron_id: cron_id.clone(),
+            enabled: true,
+            confirmation_token: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        restart
+            .requires_confirmation
+            .as_ref()
+            .expect("restart issues a fresh token")
+            .prompt_preview,
+        "PROMPT-B",
+        "restart of the two-step flow surfaces the current (B) preview"
+    );
 
     shutdown(td).await;
 }

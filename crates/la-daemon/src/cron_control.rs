@@ -279,11 +279,16 @@ impl CronControl {
             return Ok(SetEnabledOutcome::Applied { cron: updated });
         }
 
-        // Enable path: consult the token state machine.
+        // Enable path: consult the token state machine. The fingerprint
+        // of the cron's current sensitive snapshot is bound into the
+        // token on the issue path and re-checked on the confirm path —
+        // see `cron_security::ConfirmationTokens::require_or_confirm`
+        // for the WEK-53 TOCTOU this closes.
         let summary = build_confirmation_summary(&cron);
+        let fingerprint = cron_to_security_snapshot(&cron).sensitive_fingerprint();
         let gate = {
             let mut tokens = self.inner.tokens.lock().await;
-            tokens.require_or_confirm(cron_id, token, summary.clone(), now)?
+            tokens.require_or_confirm(cron_id, token, summary.clone(), fingerprint, now)?
         };
         match gate {
             SetEnabledGate::RequiresConfirmation { token, summary } => {

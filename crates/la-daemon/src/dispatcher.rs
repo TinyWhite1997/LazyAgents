@@ -1624,6 +1624,11 @@ fn cron_control_to_rpc(err: crate::cron_control::CronControlError) -> RpcError {
             error_codes::CRON_CONFIRMATION_REQUIRED,
             "confirmation token does not belong to this cron",
         ),
+        E::Security(SecErr::SensitiveSnapshotChanged) => RpcError::new(
+            error_codes::CRON_CONFIRMATION_REQUIRED,
+            "cron sensitive content changed since this token was issued; \
+             restart the two-step enable flow",
+        ),
         E::Security(SecErr::RandomToken) => RpcError::new(
             error_codes::INTERNAL_ERROR,
             "failed to generate confirmation token",
