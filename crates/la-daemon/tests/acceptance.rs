@@ -231,19 +231,33 @@ async fn metrics_socket_uses_owner_only_permissions() {
 async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
     use la_proto::methods::{Method, MetricsScrape, MetricsScrapeParams, MetricsScrapeResult};
 
-    let daemon = bootstrap_daemon_with("sleep 5", |cfg| {
-        // Force the scheduler-health loop to tick fast so the test
-        // doesn't wait the prod default (5s) for the gauge to land.
-        cfg.scheduler.scheduler_health_interval = Duration::from_millis(20);
-    })
-    .await;
-
     // In-process daemons skip the binary's `init_observability` shim, so
     // the global metrics recorder is `None` until we install it here.
     // `install_metrics_recorder` is idempotent (the underlying
     // `OnceLock` ignores re-init), so calling it inside the test is
     // safe even when the suite runs in parallel.
+    //
+    // MUST run BEFORE `Daemon::bind` (and the probe-loop spawn that
+    // follows): `run_probe_loop` fires its first `probe_once_and_broadcast`
+    // inline (health.rs:219), and that is the sole emit path for the
+    // `lad_session_active` gauge. If the recorder is installed after
+    // bind, the inline first probe races and may emit into the no-op
+    // recorder, leaving the next sample 60 s away — the macos-14 flake.
     la_observ::install_metrics_recorder();
+
+    let daemon = bootstrap_daemon_with("sleep 5", |cfg| {
+        // Force the scheduler-health loop to tick fast so the test
+        // doesn't wait the prod default (5s) for the gauge to land.
+        cfg.scheduler.scheduler_health_interval = Duration::from_millis(20);
+        // Belt-and-braces backstop for the recorder-install race above:
+        // if the inline first probe still slips through into a no-op
+        // recorder, the next `lad_session_active` emit lands well
+        // inside this test's 5 s wait window instead of 60 s out.
+        // 500 ms mirrors the existing precedent in
+        // `bootstrap_daemon_with_adapters` (acceptance.rs:1990).
+        cfg.probe_interval = Duration::from_millis(500);
+    })
+    .await;
 
     // Drive at least one RPC + one cron metric flavour so the rendered
     // body is non-empty for at least one counter / gauge / histogram
