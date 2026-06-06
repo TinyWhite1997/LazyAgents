@@ -43,14 +43,14 @@ That's it. `la` checks whether `lad` is already running and runs `lad daemonize`
 
 ## 2. The v1 UX caveat
 
-LazyAgents v1 ships the full daemon — sessions, crons, worktrees, adapters all work — but the **TUI New-session form and the attach view are still being built**. In the TUI today:
+LazyAgents v1 ships the full daemon — sessions, crons, worktrees, adapters all work — and **as of WEK-92-A3 the TUI's live attach view is wired**: pressing `Enter` on a session row opens a live PTY pane backed by `sessions.attach`, and `Ctrl+B d` detaches back to the sidebar. The **New-session form** is still a placeholder:
 
-- Pressing `n` on a project opens a placeholder modal that acknowledges the keystroke; it doesn't yet spawn a backend.
-- Pressing `Enter` on a session row navigates but doesn't yet stream the PTY into the pane.
+- Pressing `n` on a project opens a modal that acknowledges the keystroke; it doesn't yet spawn a backend. Until the form lands you create sessions via JSON-RPC.
+- Pressing `Enter` on an existing session row **does** stream the PTY into the pane and routes your keystrokes back to the daemon via `sessions.write`. Use `Ctrl+B d` (or `Ctrl+B Esc` / `Ctrl+B .`) to detach — the session keeps running on the daemon. `Ctrl+B Ctrl+B` sends a literal `Ctrl+B` (0x02) for agents that need it.
 
 This means a v1 quickstart has two paths depending on what you want to see:
 
-- **Path A (see the TUI):** open `la`, navigate the empty workspace, the Crons editor, the keymap overlay (`?`). The shell is real; the New-session glue is not yet wired.
+- **Path A (see the TUI):** open `la`, navigate the empty workspace, the Crons editor, the keymap overlay (`?`). Use Path B once to spawn a session, then come back to `la` and press `Enter` on it to attach.
 - **Path B (drive the daemon directly):** push JSON-RPC over the socket — sessions spawn, transcripts persist, crons fire, worktrees provision. This is what we cover next.
 
 ## 3. Drive a real session through the daemon

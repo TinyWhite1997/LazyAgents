@@ -243,15 +243,16 @@ impl HintRegistry {
     }
 
     /// Hints surfaced while a session attach is live. The bottom bar
-    /// shows the detach prefix (Ctrl+B) and the universal scroll keys;
-    /// printable bytes go to the daemon so they're intentionally NOT
-    /// advertised.
+    /// shows the detach prefix (Ctrl+B) — every other keystroke,
+    /// including PgUp/PgDn/Home/End/G, is forwarded to the daemon PTY
+    /// via `sessions.write`, so we deliberately do NOT advertise any
+    /// local-scroll keys here (the agent process may have its own
+    /// pager binding). Bringing in a local scroll mode is its own
+    /// follow-up (likely `Ctrl+B [` tmux-style copy mode).
     fn for_attach() -> Vec<Hint> {
         let mut out = vec![
             Hint::new("Ctrl+B d", "detach", Importance::Primary),
             Hint::new("Ctrl+B Ctrl+B", "send literal Ctrl+B", Importance::Low),
-            Hint::new("PgUp/PgDn", "scroll transcript", Importance::Medium),
-            Hint::new("G", "follow tail", Importance::Low),
         ];
         out.extend(Self::globals());
         out.sort_by_key(|h| std::cmp::Reverse(h.importance));

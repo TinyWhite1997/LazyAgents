@@ -26,7 +26,9 @@ Transitions you'll see day-to-day:
 
 ### From the TUI (v1 status)
 
-The Sessions tab in v1 has the navigation, sidebar, and modal scaffolding wired, but the New-session form itself is still a placeholder — pressing **`n`** on a project opens a modal that acknowledges the keystroke without yet spawning a backend. The form, project picker, and live attach are tracked under "M1.7" in the source and will land in a follow-up release.
+The Sessions tab in v1 has the navigation, sidebar, and modal scaffolding wired, but the New-session form itself is still a placeholder — pressing **`n`** on a project opens a modal that acknowledges the keystroke without yet spawning a backend. The form and project picker are tracked under "M1.7" in the source.
+
+**Live attach landed in WEK-92-A3:** highlighting a session row and pressing **`Enter`** opens a live PTY pane backed by `sessions.attach { acquire_input: true }`. The daemon streams `session.output` chunks straight into the transcript, and every keystroke you type goes back through `sessions.write`.
 
 The fields the form will collect:
 
@@ -58,11 +60,13 @@ Response includes the `session_id` (UUID v7), the resolved `cwd` (which is the w
 | TUI key | Effect |
 |---|---|
 | `j` / `k` / arrow keys | Move the cursor in the session list. |
-| `Enter` | Attach to the highlighted session. |
-| `Esc` | Detach from the current session (it keeps running). |
-| `q` | Quit `la`. Sessions and the daemon stay alive. |
+| `Enter` | Attach to the highlighted session (live PTY pane opens; daemon owns input). |
+| `Ctrl+B d` | Detach prefix → `d` leaves the attach and returns to the sidebar (the session keeps running on the daemon). `Ctrl+B Esc` and `Ctrl+B .` also work. |
+| `Ctrl+B Ctrl+B` | Send a literal `Ctrl+B` (0x02) into the PTY for agents that use it themselves. |
+| Any other key | Forwarded to the daemon as PTY input — including arrows, PgUp/PgDn, Home/End, function keys. There is no local scroll mode yet; the agent process owns the pane. |
+| `q` (in the sidebar) | Quit `la`. Sessions and the daemon stay alive. |
 
-**Detach vs quit:** detaching releases your viewer; quitting `la` does the same plus shuts down the TUI process. Neither stops the session. The daemon is the one keeping it alive.
+**Detach vs quit:** `Ctrl+B d` releases your viewer; the daemon eagerly drops your `acquire_input` ownership via `sessions.detach`. Quitting `la` does the same plus shuts down the TUI process. Neither stops the session.
 
 **Reattach:** when you re-open `la`, the daemon replays everything in its in-memory ring buffer (2 MiB per session) on attach so you catch up to "now". Output beyond that is in the persisted transcript (see below) but isn't streamed back automatically.
 

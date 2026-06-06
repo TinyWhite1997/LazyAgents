@@ -200,6 +200,16 @@ fn event_loop<S: SessionSource, C: CronSource>(
         // detach prefix Ctrl+B (see `AttachRuntime::feed_key`).
         if app.focus == Focus::Transcript && app.modal.is_none() {
             if let (Some(rt), Event::Key(k)) = (attach.as_mut(), &ev) {
+                // Mirror the normal input translator's release-event
+                // filter (`crate::input::translate`): some terminals
+                // (notably Windows) report both Press and Release for
+                // every key. Without this gate the Release event would
+                // also be encoded and written to the PTY, doubling
+                // every keystroke and arming the detach prefix on key-up
+                // by mistake.
+                if !is_transcript_press(k) {
+                    continue;
+                }
                 match rt.feed_key(*k) {
                     KeyOutcome::Consumed => continue,
                     KeyOutcome::Detach => {
@@ -400,6 +410,17 @@ fn drain_attach<S: SessionSource, C: CronSource>(rt: &mut AttachRuntime, app: &m
             }
         }
     }
+}
+
+/// True when a transcript-focus key event should be forwarded to the
+/// daemon PTY. Returns false for `KeyEventKind::Release` (and any other
+/// non-press kind), matching the filter applied by the normal input
+/// translator in [`crate::input::translate`]. Some terminals — Windows
+/// is the canonical offender — report both Press and Release for every
+/// keystroke; without this gate every typed character would double on
+/// the PTY and a key release of `b` would arm the Ctrl+B detach prefix.
+fn is_transcript_press(k: &KeyEvent) -> bool {
+    matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
 /// Translate a crossterm [`KeyEvent`] into the byte sequence the daemon
@@ -778,22 +799,11 @@ fn render_attach_pane(
         AttachStatus::Connected {
             input_acquired: false,
         } => ("connected · read-only", warn),
-        AttachStatus::Disconnected {
-            reason,
-            will_reconnect,
-        } => {
-            let label = if *will_reconnect {
-                format!("已断开 ({reason}) · 重试中…")
-            } else {
-                format!("已断开 ({reason}) · Ctrl+B d to detach")
-            };
-            // Leak the string into a static slot via a closure: ratatui
-            // titles want `&str`. We render header lines directly instead
-            // so we can keep ownership.
-            let _ = label;
-            ("已断开", err)
-        }
+        AttachStatus::Disconnected { .. } => ("已断开", err),
     };
+    // The reason / retry suffix is rendered as a second styled span on
+    // the header line (see below). The border title stays terse so it
+    // does not jitter as the reason text changes length.
     let detached_extra: Option<String> = match &att.status {
         AttachStatus::Disconnected {
             reason,
@@ -1274,4 +1284,94 @@ pub fn synth_key(code: KeyCode) -> Event {
         kind: KeyEventKind::Press,
         state: crossterm::event::KeyEventState::NONE,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn key(kind: KeyEventKind, code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn release_events_do_not_reach_the_attach_pump() {
+        // Regression: on terminals that emit both Press and Release for
+        // every key (Windows is the canonical case), the runner's
+        // transcript fast path used to forward the release too — which
+        // doubled every typed character and could arm the Ctrl+B detach
+        // prefix on key-up.
+        assert!(is_transcript_press(&key(
+            KeyEventKind::Press,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_transcript_press(&key(
+            KeyEventKind::Repeat,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_transcript_press(&key(
+            KeyEventKind::Release,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
+        // The release of `Ctrl+b` is the worst-case offender — without
+        // the filter it would arm the detach prefix latch.
+        assert!(!is_transcript_press(&key(
+            KeyEventKind::Release,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn encode_key_handles_chars_specials_and_ctrl_chords() {
+        // Plain char.
+        assert_eq!(
+            encode_key(key(
+                KeyEventKind::Press,
+                KeyCode::Char('a'),
+                KeyModifiers::NONE
+            ))
+            .unwrap(),
+            b"a".to_vec()
+        );
+        // Enter → CR (matches what the daemon's line discipline expects).
+        assert_eq!(
+            encode_key(key(KeyEventKind::Press, KeyCode::Enter, KeyModifiers::NONE)).unwrap(),
+            b"\r".to_vec()
+        );
+        // Ctrl+C → 0x03.
+        assert_eq!(
+            encode_key(key(
+                KeyEventKind::Press,
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))
+            .unwrap(),
+            vec![0x03]
+        );
+        // Alt+a → ESC + a.
+        assert_eq!(
+            encode_key(key(
+                KeyEventKind::Press,
+                KeyCode::Char('a'),
+                KeyModifiers::ALT
+            ))
+            .unwrap(),
+            vec![0x1b, b'a']
+        );
+        // Arrow keys → CSI sequences.
+        assert_eq!(
+            encode_key(key(KeyEventKind::Press, KeyCode::Up, KeyModifiers::NONE)).unwrap(),
+            b"\x1b[A".to_vec()
+        );
+    }
 }

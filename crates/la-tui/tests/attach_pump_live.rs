@@ -56,6 +56,22 @@ async fn run_stub_once(
     pushes_before_writes: Vec<Message>,
     process_for: Duration,
 ) -> StubResult {
+    run_stub_with_order(listener, Vec::new(), pushes_before_writes, process_for).await
+}
+
+/// Same as [`run_stub_once`] but lets the caller send a batch of
+/// `session.*` notifications BEFORE the attach response is written
+/// back. The daemon's dispatcher legitimately produces this ordering
+/// (subscription published + writer task notified before the
+/// SessionsAttachResult is serialized — see
+/// `crates/la-daemon/src/dispatcher.rs:handle_sessions_attach`), so the
+/// pump must NOT drop the pre-ack frames.
+async fn run_stub_with_order(
+    listener: &Listener,
+    pushes_before_ack: Vec<Message>,
+    pushes_after_ack: Vec<Message>,
+    process_for: Duration,
+) -> StubResult {
     let stream = listener.accept().await.expect("accept");
     let mut conn = Connection::new(stream);
     let caps = ServerCapabilities {
@@ -98,11 +114,17 @@ async fn run_stub_once(
         },
     )
     .expect("encode ack");
+
+    // Pre-ack notifications (regression coverage for the daemon
+    // ordering where session.output lands before SessionsAttachResult).
+    for push in pushes_before_ack {
+        conn.send(&push).await.expect("send pre-ack push");
+    }
     conn.send(&Message::Response(ack))
         .await
         .expect("send attach ack");
 
-    for push in pushes_before_writes {
+    for push in pushes_after_ack {
         conn.send(&push).await.expect("send push");
     }
 
@@ -363,6 +385,109 @@ async fn pump_reconnects_with_resume_cursor_after_daemon_drop() {
     assert!(
         bytes.windows(16).any(|w| w == b"after-reconnect "),
         "expected reconnect bytes; got {bytes:?}"
+    );
+
+    let _ = std::fs::remove_file(&socket);
+    drop(dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_ack_notifications_are_replayed_not_dropped() {
+    // Regression: the daemon's dispatcher inserts the new subscription
+    // into the attachments map and notifies the writer task BEFORE the
+    // SessionsAttachResult response is written back. Catch-up bytes
+    // can therefore land on the wire before the ack we're waiting for.
+    // The pump must buffer those frames and replay them after the
+    // Connected event instead of silently dropping them.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("lad-attach-3.sock");
+    let listener = Listener::bind(&Endpoint::uds(&socket))
+        .await
+        .expect("bind stub");
+    let server = tokio::spawn(async move {
+        run_stub_with_order(
+            &listener,
+            // Pre-ack: simulate two catch-up chunks the daemon emits
+            // between subscribing the writer task and serializing the
+            // ack. These are what the pre-fix pump dropped.
+            vec![output_push(1, b"early-"), output_push(2, b"before-ack ")],
+            // Post-ack: ordinary live increment.
+            vec![output_push(3, b"after-ack\n")],
+            Duration::from_secs(2),
+        )
+        .await
+    });
+
+    let pump = AttachPump::spawn(&socket, SESSION_ID);
+    let rx = pump.rx;
+    let tx = pump.tx.clone();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let events = tokio::task::spawn_blocking(move || {
+        let mut all = Vec::new();
+        let mut bytes_seen = Vec::new();
+        let mut sent_detach = false;
+        loop {
+            if sent_detach && all.iter().any(|e| matches!(e, AttachEvent::Closed)) {
+                return all;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return all;
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(ev) => {
+                    if let AttachEvent::Bytes { bytes, .. } = &ev {
+                        bytes_seen.extend_from_slice(bytes);
+                    }
+                    all.push(ev);
+                    if !sent_detach && bytes_seen.windows(9).any(|w| w == b"after-ack") {
+                        let _ = tx.send(AttachCommand::Detach);
+                        sent_detach = true;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return all,
+            }
+        }
+    })
+    .await
+    .expect("blocking join");
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+
+    // Connected must arrive before any Bytes event the App receives —
+    // that is the user-visible invariant. The pump achieves it by
+    // buffering pre-ack notifications and replaying them after Connected.
+    let connected_idx = events
+        .iter()
+        .position(|e| matches!(e, AttachEvent::Connected { .. }))
+        .expect("never saw Connected");
+    let first_bytes_idx = events
+        .iter()
+        .position(|e| matches!(e, AttachEvent::Bytes { .. }))
+        .expect("never saw any Bytes — pre-ack notifications were dropped");
+    assert!(
+        first_bytes_idx > connected_idx,
+        "Bytes arrived before Connected (idx {first_bytes_idx} vs {connected_idx}) — \
+         buffered notifications must be replayed AFTER the Connected event"
+    );
+
+    // Concatenated bytes must contain BOTH the pre-ack chunks and the
+    // post-ack chunk, in order.
+    let mut received = Vec::new();
+    for ev in &events {
+        if let AttachEvent::Bytes { bytes, .. } = ev {
+            received.extend_from_slice(bytes);
+        }
+    }
+    assert!(
+        received.windows(17).any(|w| w == b"early-before-ack "),
+        "pre-ack catch-up chunks were dropped; got {received:?}"
+    );
+    assert!(
+        received.windows(9).any(|w| w == b"after-ack"),
+        "post-ack chunk missing; got {received:?}"
     );
 
     let _ = std::fs::remove_file(&socket);

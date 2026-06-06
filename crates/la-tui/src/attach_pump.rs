@@ -246,7 +246,17 @@ async fn run_one(
         .await
         .map_err(|e| format!("send sessions.attach: {e}"))?;
 
-    let attach_result = wait_for_response(&mut conn, RequestId::Num(attach_id)).await?;
+    // Wait for the attach ack. The daemon's dispatcher inserts the new
+    // subscription into the attachments map and notifies the writer task
+    // BEFORE the ack is sent back (`handle_sessions_attach` in
+    // `crates/la-daemon/src/dispatcher.rs`), so `session.output` /
+    // `session.gap` / `session.state` notifications for our subscription
+    // can legitimately interleave with — or even precede — the
+    // SessionsAttachResult response. Buffer them here and replay in
+    // arrival order after the Connected event so the first attach (and
+    // every reconnect) keeps the catch-up bytes that landed pre-ack.
+    let (attach_result, pre_ack_notifications) =
+        wait_for_response(&mut conn, RequestId::Num(attach_id)).await?;
     let attach: SessionsAttachResult = serde_json::from_value(attach_result)
         .map_err(|e| format!("decode SessionsAttachResult: {e}"))?;
     if ev_tx
@@ -265,6 +275,16 @@ async fn run_one(
     // there even if no `session.output` lands between attach and drop.
     if last_seq.unwrap_or(0) < attach.snapshot_seq {
         *last_seq = Some(attach.snapshot_seq);
+    }
+
+    // Now drain anything wait_for_response stashed pre-ack — bytes /
+    // gap / state — in the order the daemon sent them. Drops on the
+    // event channel mean the runner shut down.
+    for n in pre_ack_notifications {
+        match dispatch_notification(session_id, n, ev_tx, last_seq) {
+            DispatchOutcome::Continue => {}
+            DispatchOutcome::ChannelGone => return Ok(DriverExit::ChannelGone),
+        }
     }
 
     let mut next_req_id: i64 = attach_id + 1;
@@ -321,89 +341,17 @@ async fn run_one(
             Err(_) => continue,
         };
         match frame {
-            Message::Notification(n) => {
-                let Some(params) = n.params else { continue };
-                match n.method.as_str() {
-                    SessionOutput::NAME => {
-                        let payload: SessionOutputParams = match serde_json::from_value(params) {
-                            Ok(p) => p,
-                            Err(err) => {
-                                tracing::warn!(%err, "attach-pump: decode session.output failed");
-                                continue;
-                            }
-                        };
-                        if payload.session_id != session_id {
-                            continue;
-                        }
-                        let bytes = match payload.data_bytes() {
-                            Ok(b) => b,
-                            Err(err) => {
-                                tracing::warn!(%err, "attach-pump: base64 decode failed");
-                                continue;
-                            }
-                        };
-                        *last_seq = Some(payload.seq);
-                        if ev_tx
-                            .send(AttachEvent::Bytes {
-                                session_id: session_id.to_string(),
-                                bytes,
-                            })
-                            .is_err()
-                        {
-                            return Ok(DriverExit::ChannelGone);
-                        }
-                    }
-                    SessionGap::NAME => {
-                        let payload: SessionGapParams = match serde_json::from_value(params) {
-                            Ok(p) => p,
-                            Err(err) => {
-                                tracing::warn!(%err, "attach-pump: decode session.gap failed");
-                                continue;
-                            }
-                        };
-                        if payload.session_id != session_id {
-                            continue;
-                        }
-                        if ev_tx
-                            .send(AttachEvent::Gap {
-                                session_id: session_id.to_string(),
-                                from_seq: payload.from_seq,
-                                to_seq: payload.to_seq,
-                                dropped_bytes: payload.dropped_bytes,
-                            })
-                            .is_err()
-                        {
-                            return Ok(DriverExit::ChannelGone);
-                        }
-                    }
-                    SessionStateNotice::NAME => {
-                        let payload: SessionStateParams = match serde_json::from_value(params) {
-                            Ok(p) => p,
-                            Err(err) => {
-                                tracing::warn!(%err, "attach-pump: decode session.state failed");
-                                continue;
-                            }
-                        };
-                        if payload.session_id != session_id {
-                            continue;
-                        }
-                        if ev_tx
-                            .send(AttachEvent::State {
-                                session_id: session_id.to_string(),
-                                state: format!("{:?}", payload.state).to_lowercase(),
-                                reason: payload.reason,
-                            })
-                            .is_err()
-                        {
-                            return Ok(DriverExit::ChannelGone);
-                        }
-                    }
-                    _ => continue,
-                }
-            }
+            Message::Notification(n) => match dispatch_notification(session_id, n, ev_tx, last_seq)
+            {
+                DispatchOutcome::Continue => {}
+                DispatchOutcome::ChannelGone => return Ok(DriverExit::ChannelGone),
+            },
             Message::Response(_) => {
-                // Acks for sessions.attach/write/detach — already handled
-                // above by `wait_for_response`, or harmless to drop.
+                // Acks for sessions.write/detach — wait_for_response
+                // owns the attach ack; later acks are just confirmation
+                // we ignore (errors land as RPC errors we'd have to
+                // surface, but the daemon currently never errors on
+                // these for a valid session).
                 continue;
             }
             Message::Request(_) => continue,
@@ -411,16 +359,124 @@ async fn run_one(
     }
 }
 
+/// Outcome of dispatching one inbound notification. We only need to
+/// distinguish "keep going" from "the runner channel went away", which
+/// is the one failure mode that should terminate the pump loop.
+enum DispatchOutcome {
+    Continue,
+    ChannelGone,
+}
+
+/// Decode and forward a `session.*` notification to the runner. Returns
+/// [`DispatchOutcome::ChannelGone`] if the runner's mpsc receiver was
+/// dropped (which is how we detect shutdown). Notifications for the
+/// wrong `session_id` or with undecodable params are silently skipped —
+/// the daemon should not send us cross-session traffic on this
+/// subscription, but if it does we don't want to confuse the user's
+/// transcript with another session's bytes.
+fn dispatch_notification(
+    session_id: &str,
+    n: la_proto::jsonrpc::Notification,
+    ev_tx: &Sender<AttachEvent>,
+    last_seq: &mut Option<u64>,
+) -> DispatchOutcome {
+    let Some(params) = n.params else {
+        return DispatchOutcome::Continue;
+    };
+    match n.method.as_str() {
+        SessionOutput::NAME => {
+            let payload: SessionOutputParams = match serde_json::from_value(params) {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(%err, "attach-pump: decode session.output failed");
+                    return DispatchOutcome::Continue;
+                }
+            };
+            if payload.session_id != session_id {
+                return DispatchOutcome::Continue;
+            }
+            let bytes = match payload.data_bytes() {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(%err, "attach-pump: base64 decode failed");
+                    return DispatchOutcome::Continue;
+                }
+            };
+            *last_seq = Some(payload.seq);
+            if ev_tx
+                .send(AttachEvent::Bytes {
+                    session_id: session_id.to_string(),
+                    bytes,
+                })
+                .is_err()
+            {
+                return DispatchOutcome::ChannelGone;
+            }
+        }
+        SessionGap::NAME => {
+            let payload: SessionGapParams = match serde_json::from_value(params) {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(%err, "attach-pump: decode session.gap failed");
+                    return DispatchOutcome::Continue;
+                }
+            };
+            if payload.session_id != session_id {
+                return DispatchOutcome::Continue;
+            }
+            if ev_tx
+                .send(AttachEvent::Gap {
+                    session_id: session_id.to_string(),
+                    from_seq: payload.from_seq,
+                    to_seq: payload.to_seq,
+                    dropped_bytes: payload.dropped_bytes,
+                })
+                .is_err()
+            {
+                return DispatchOutcome::ChannelGone;
+            }
+        }
+        SessionStateNotice::NAME => {
+            let payload: SessionStateParams = match serde_json::from_value(params) {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(%err, "attach-pump: decode session.state failed");
+                    return DispatchOutcome::Continue;
+                }
+            };
+            if payload.session_id != session_id {
+                return DispatchOutcome::Continue;
+            }
+            if ev_tx
+                .send(AttachEvent::State {
+                    session_id: session_id.to_string(),
+                    state: format!("{:?}", payload.state).to_lowercase(),
+                    reason: payload.reason,
+                })
+                .is_err()
+            {
+                return DispatchOutcome::ChannelGone;
+            }
+        }
+        _ => {}
+    }
+    DispatchOutcome::Continue
+}
+
 async fn wait_for_response<S>(
     conn: &mut Connection<S>,
     expected: RequestId,
-) -> Result<serde_json::Value, String>
+) -> Result<(serde_json::Value, Vec<la_proto::jsonrpc::Notification>), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    // Loop until we see the response matching `expected`. The daemon
-    // can interleave notifications with the ack, so we must not assume
-    // the very next frame is the response.
+    // The daemon publishes the new subscription to the writer task
+    // BEFORE it sends the SessionsAttachResult response, so notifications
+    // for our session can land on the wire before the ack we're waiting
+    // for. Buffer them so the caller can replay them after surfacing the
+    // Connected event — dropping them here used to silently lose the
+    // first chunks of catch-up output on a fresh attach or reconnect.
+    let mut pending: Vec<la_proto::jsonrpc::Notification> = Vec::new();
     loop {
         let msg = match tokio::time::timeout(Duration::from_secs(5), conn.recv()).await {
             Ok(Ok(Some(m))) => m,
@@ -430,14 +486,25 @@ where
         };
         match msg {
             Message::Response(r) if r.id == expected => match r.outcome {
-                la_proto::jsonrpc::ResponseOutcome::Result(v) => return Ok(v),
+                la_proto::jsonrpc::ResponseOutcome::Result(v) => return Ok((v, pending)),
                 la_proto::jsonrpc::ResponseOutcome::Error(e) => {
                     return Err(format!("sessions.attach error: {e}"));
                 }
             },
-            // Drop any unrelated frame that lands before the ack.
-            // session.output for our session is still buffered server-
-            // side; the catch-up will replay once we set up the loop.
+            Message::Notification(n) => {
+                // Only stash the per-session push variants the main loop
+                // knows how to dispatch. Unknown notification methods
+                // are dropped on the floor here exactly as they would
+                // be later, so the behaviour is observably the same as
+                // pre-fix for non-attach-related notifications.
+                match n.method.as_str() {
+                    SessionOutput::NAME | SessionGap::NAME | SessionStateNotice::NAME => {
+                        pending.push(n);
+                    }
+                    _ => {}
+                }
+            }
+            // Stray Responses for other ids and Requests are ignored.
             _ => continue,
         }
     }
