@@ -549,19 +549,31 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
     /// Apply one input message and return whether the runner should
     /// continue.
     pub fn handle(&mut self, msg: AppMsg) -> AppOutcome {
-        // Per-message toast slate: every dispatch starts clean so a
-        // surviving toast from a previous frame can't leak forward.
-        self.last_toast = None;
         // Background system notifications must update the status bar even
         // when a modal is open, otherwise daemon health / cron pulses /
         // disconnect events arriving during a modal session are dropped
         // forever (review fix for WEK-36: the modal short-circuit was
         // silently swallowing them, breaking the "<1s latency" and
         // "auto-recover" acceptance).
+        //
+        // System notifications run BEFORE the per-message toast slate is
+        // cleared because they originate from background pumps (IPC
+        // notif-sub, the runner's bg-refresh tick from WEK-92-A4.1) and
+        // are NOT user input. Treating them like input would clear a
+        // toast set by the previous user keystroke before the very next
+        // frame can paint it — e.g. the "created session …" toast set
+        // by NewSession Confirm would be wiped by the refresh tick the
+        // same Confirm enqueued (the create's follow-up sessions.list
+        // bumps refresh_generation, which the runner reads on the next
+        // loop turn and dispatches as RefreshSessions).
         let msg = match self.try_apply_system_notification(msg) {
             None => return AppOutcome::Continue,
             Some(other) => other,
         };
+        // Per-message toast slate: every user-input dispatch starts
+        // clean so a surviving toast from a previous frame can't leak
+        // forward.
+        self.last_toast = None;
         // WEK-42 / M4.3 review fix: T/H/C are advertised as globals and
         // the translator routes them inside modals, but the modal
         // short-circuit below would otherwise drop them on the floor.
@@ -665,19 +677,19 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                     .collect();
                 self.modal = Some(Modal::Errors { rows });
             }
-            AppMsg::RefreshSessions => self.refresh_sessions(),
             // System notifications (StatusUpdate / HealthUpdate /
-            // DaemonOffline / CronFiredEvent / BackendsUpdate) are
-            // handled before the modal short-circuit by
-            // `try_apply_system_notification`; reaching them here is
-            // unreachable but we keep no-op arms instead of a panic so a
-            // future refactor that re-enters this match by a different
-            // path doesn't crash the TUI.
+            // DaemonOffline / CronFiredEvent / BackendsUpdate /
+            // RefreshSessions) are handled before the modal short-
+            // circuit by `try_apply_system_notification`; reaching them
+            // here is unreachable but we keep no-op arms instead of a
+            // panic so a future refactor that re-enters this match by a
+            // different path doesn't crash the TUI.
             AppMsg::StatusUpdate(_)
             | AppMsg::HealthUpdate(_)
             | AppMsg::DaemonOffline
             | AppMsg::CronFiredEvent(_)
-            | AppMsg::BackendsUpdate(_) => {}
+            | AppMsg::BackendsUpdate(_)
+            | AppMsg::RefreshSessions => {}
 
             // --- Crons tab dispatch ---------------------------------
             AppMsg::CronListDown => {
@@ -1005,6 +1017,15 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 sorted.sort_by(|a, b| a.id.cmp(&b.id));
                 self.backends = sorted;
             }
+            // WEK-92-A4.1: the runner reads
+            // `SessionSource::refresh_generation()` once per frame and
+            // dispatches RefreshSessions when the bg cache moves. It is
+            // NOT a user keystroke — handling it inside this short-
+            // circuit keeps `last_toast` intact, so a toast set by the
+            // preceding user message (e.g. NewSession Confirm's
+            // "created session …") survives the immediate follow-up
+            // refresh and gets painted on the next frame.
+            AppMsg::RefreshSessions => self.refresh_sessions(),
             other => return Some(other),
         }
         None
@@ -1577,6 +1598,71 @@ mod tests {
             .find(|s| s.session_id.starts_with("mock-"))
             .expect("new mock row landed under proj-a");
         assert_eq!(new_row.backend.id(), "claude");
+    }
+
+    #[test]
+    fn refresh_sessions_does_not_wipe_toast_set_by_prior_user_msg() {
+        // WEK-92-A4.1 review (Code Reviewer 反馈): the runner reads
+        // `SessionSource::refresh_generation()` once per frame and
+        // dispatches `AppMsg::RefreshSessions` whenever the bg cache
+        // moves. NewSession Confirm's create→snapshot follow-up bumps
+        // that counter, so the runner's very next iteration would
+        // dispatch RefreshSessions BEFORE the next render. The old
+        // `handle()` cleared `last_toast = None` at entry for every
+        // message, which wiped the "created session …" toast Confirm
+        // had just set. Issue acceptance #2 requires the toast to be
+        // visible on the same frame the new row appears, so this is a
+        // real correctness regression — pin it.
+        //
+        // The fix routes RefreshSessions through
+        // `try_apply_system_notification`, which runs BEFORE the
+        // toast-clear; the toast survives the runner's housekeeping
+        // hop and gets painted on the next frame.
+        let mut a = app();
+        open_new_session_modal(&mut a);
+        a.handle(AppMsg::NewSessionFocusNext); // Backend -> Prompt
+        for c in "ship it".chars() {
+            a.handle(AppMsg::NewSessionPromptChar(c));
+        }
+        a.handle(AppMsg::Confirm);
+        let toast_after_create = a
+            .last_toast
+            .clone()
+            .expect("Confirm must stamp a created-session toast");
+        assert!(
+            toast_after_create.starts_with("created session "),
+            "expected created-session toast, got {toast_after_create:?}"
+        );
+        // Simulate the runner's per-frame hop: a fresh
+        // `refresh_generation()` value lands and the runner dispatches
+        // RefreshSessions before painting. The toast MUST survive.
+        a.handle(AppMsg::RefreshSessions);
+        assert_eq!(
+            a.last_toast.as_deref(),
+            Some(toast_after_create.as_str()),
+            "RefreshSessions (system notification) must not clear last_toast"
+        );
+    }
+
+    #[test]
+    fn user_input_msg_still_clears_stale_toast() {
+        // Companion to the test above — the per-message toast slate
+        // for USER input must still reset on entry, otherwise a toast
+        // from a prior keystroke would leak across unrelated user
+        // actions and the status bar would lie about what the user
+        // just did. The split is "system notification = keep toast,
+        // user input = reset toast"; pin both halves so neither side
+        // drifts.
+        let mut a = app();
+        a.last_toast = Some("stale toast from a prior turn".into());
+        // SidebarDown is plain user input and produces no toast of
+        // its own — after handle() the slate must be clean.
+        a.handle(AppMsg::SidebarDown);
+        assert!(
+            a.last_toast.is_none(),
+            "user-input dispatch must clear stale toast, got {:?}",
+            a.last_toast
+        );
     }
 
     #[test]
