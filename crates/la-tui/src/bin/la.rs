@@ -1,32 +1,41 @@
 //! `la` — LazyAgents TUI client.
 //!
-//! M1.5/M1.6 ship the binary against a [`MockSessionSource`] so the UI
-//! could be reviewed before the daemon (M1.7) landed. The TUI itself is
-//! still mock-backed for now — wiring the sidebar against live RPC is
-//! tracked under M1.8 — but the **auto-daemonize** acceptance from
-//! WEK-21 lives here: on startup we probe the daemon socket; if nothing
-//! responds we spawn `lad daemonize` and re-probe. The status bar tells
-//! the user whether the daemon was already up, was just spawned, or
-//! couldn't be reached.
+//! The binary connects to `lad` over IPC by default and renders the
+//! Sessions sidebar against live `sessions.list` payloads via the
+//! [`la_tui::source::RpcSessionSource`] (WEK-93). On startup we probe
+//! the daemon socket; if nothing responds we spawn `lad daemonize`
+//! (subject to the `LAZYAGENTS_NO_AUTODAEMON` / `LAZYAGENTS_MANAGED_BY`
+//! escape hatches), then run the standard handshake. The status bar
+//! tells the user whether the daemon was already up, was just spawned,
+//! or couldn't be reached.
 //!
-//! Disable the auto-spawn with `LAZYAGENTS_NO_AUTODAEMON=1` — useful for
-//! tests that want the "no daemon" fallback explicitly.
+//! Pass `--demo` to bring up the TUI against
+//! [`la_tui::MockSessionSource::fixture`] instead — no daemon probe,
+//! no auto-daemonize, no `notif_sub` subscription. Demo mode is the
+//! regression-screenshot / design-iteration / "I just want to see
+//! the fixture" path; it never produces daemon-lifecycle side effects.
+//!
+//! Disable the auto-spawn on the live path with
+//! `LAZYAGENTS_NO_AUTODAEMON=1` — useful for tests that want the "no
+//! daemon" fallback explicitly.
 //!
 //! ## CLI surface
 //!
-//! Intentionally minimal — `la` is a TUI, not a CLI. Three top-level
-//! flags only:
+//! Intentionally minimal — `la` is a TUI, not a CLI:
+//!   * (no args) — launch the TUI against the daemon
+//!   * `--demo` — launch with the in-process fixture (WEK-93)
 //!   * `--version` / `-V` — print the compiled version and exit
 //!   * `--check-update` — pull the latest GitHub Release manifest,
 //!     compare against the running binary, print result, exit. Never
 //!     auto-installs (WEK-41 acceptance "默认不自动升级"). See
 //!     [`la_tui::update_check`] for the policy details.
+//!   * `doctor [...]` — delegate to `lad doctor`
 //!   * `--help` / `-h` — print the flag summary and exit
 //!
-//! Anything beyond these three drops through to the normal TUI startup
-//! path. We hand-roll the parser so the binary doesn't pull `clap` into
-//! release builds — keeps the size budget honest for the < 30 MiB
-//! acceptance line.
+//! Anything beyond the recognised flags drops through to the normal
+//! TUI startup path. We hand-roll the parser so the binary doesn't
+//! pull `clap` into release builds — keeps the size budget honest for
+//! the < 30 MiB acceptance line.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -101,14 +110,14 @@ fn print_help() {
 fn main() -> ExitCode {
     match parse_cli() {
         CliAction::RunTui => {
-            if let Err(e) = real_main(SourceChoice::Rpc) {
+            if let Err(e) = real_main() {
                 eprintln!("la: {e}");
                 return ExitCode::from(1);
             }
             ExitCode::SUCCESS
         }
         CliAction::RunDemo => {
-            if let Err(e) = real_main(SourceChoice::Demo) {
+            if let Err(e) = run_demo() {
                 eprintln!("la: {e}");
                 return ExitCode::from(1);
             }
@@ -185,80 +194,19 @@ fn run_check_update() -> ExitCode {
     ExitCode::from(update_check::exit_code(&outcome))
 }
 
-/// Which [`SessionSource`] the binary should bring up. The two paths
-/// look identical from here on; we just instantiate a different concrete
-/// type and hand it to [`App::new`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceChoice {
-    /// Default `la` invocation — connect to `lad` over IPC.
-    Rpc,
-    /// `la --demo` — use [`MockSessionSource::fixture`] so the UI is
-    /// browsable even without a daemon. Mirrors the v0.1.0 launch
-    /// behaviour for regression screenshots and design iteration.
-    Demo,
-}
-
-fn real_main(source: SourceChoice) -> io::Result<()> {
+/// Live path: probe / auto-daemonize, then build the App against an
+/// [`RpcSessionSource`] and start the [`la_tui::notif_sub`] pump.
+fn real_main() -> io::Result<()> {
     let discovery = SocketDiscovery::default();
     let location = discovery.resolve();
 
     let bootstrap = bootstrap_daemon(&location.socket_path);
-
-    // WEK-42 / M4.3: load `[ui]` from $XDG_CONFIG_HOME/lazyagents/config.toml
-    // before instantiating App so the very first frame reflects the
-    // user's saved theme + key-hints mode. A missing or unreadable file
-    // yields `UiPrefs::default()`; mutations via `T`/`H`/`C` write back
-    // to the same path.
     let ui_prefs_path = la_tui::ui_prefs::default_config_path();
-    let ui_prefs = ui_prefs_path
-        .as_deref()
-        .map(la_tui::ui_prefs::load)
-        .unwrap_or_default();
+    let ui_prefs = load_ui_prefs(ui_prefs_path.as_deref());
 
-    // WEK-93: build the App against the requested source. Both paths
-    // share the rest of the bootstrap; the only fork is which concrete
-    // `SessionSource` impl we hand `App::new`. We can't store the two
-    // branches in a single `let` because `App<S>` is generic over `S`,
-    // so we duplicate the tail of `real_main` rather than boxing the
-    // source. The duplication is mechanical (5 lines) and keeps the
-    // `App<S>` monomorphisation intact, which matters for the
-    // sub-30 MiB binary budget.
-    match source {
-        SourceChoice::Rpc => run_with_source(
-            RpcSessionSource::connect(&location.socket_path),
-            ui_prefs,
-            ui_prefs_path,
-            &bootstrap,
-            &location,
-        ),
-        SourceChoice::Demo => run_with_source(
-            MockSessionSource::fixture(),
-            ui_prefs,
-            ui_prefs_path,
-            &bootstrap,
-            &location,
-        ),
-    }
-}
-
-fn run_with_source<S: SessionSource + 'static>(
-    source: S,
-    ui_prefs: la_tui::UiPrefs,
-    ui_prefs_path: Option<PathBuf>,
-    bootstrap: &BootstrapOutcome,
-    location: &la_ipc::SocketLocation,
-) -> io::Result<()> {
+    let source = RpcSessionSource::connect(&location.socket_path);
     let mut app = App::new(source).with_ui_prefs(ui_prefs, ui_prefs_path);
-    // Seed the status bar with what we already know after bootstrap:
-    // daemon presence + a right-context note about the socket. Every
-    // other field stays at `Status::default()` and is filled in by the
-    // first `daemon.health` push the notif-sub thread delivers — WEK-36
-    // 验收 "状态栏数据延迟 < 1s" relies on that push, not on a startup
-    // guess.
-    let mut bootstrap_status = Status::offline();
-    bootstrap_status.daemon_online = bootstrap.connected;
-    bootstrap_status.right_context = bootstrap_status_context(bootstrap, &location.socket_path);
-    app.handle(AppMsg::StatusUpdate(bootstrap_status));
+    seed_status_from_bootstrap(&mut app, &bootstrap, &location.socket_path);
 
     // WEK-36: subscribe to `daemon.health` AND `cron.fired` over IPC so
     // the status bar + Backends panel reflect real state. The subscriber
@@ -269,6 +217,69 @@ fn run_with_source<S: SessionSource + 'static>(
     // `lad daemonize` in a sibling shell, the bar lights up on its own.
     let notif_rx = Some(la_tui::notif_sub::spawn(&location.socket_path));
     la_tui::runner::run_with_notifs(app, notif_rx)
+}
+
+/// `--demo` path: in-process fixture only. Deliberately bypasses
+/// [`bootstrap_daemon`] (no socket probe, no `lad daemonize` spawn)
+/// AND [`la_tui::notif_sub`] (no IPC subscription, no reconnect loop).
+/// The status bar is seeded with a static [`BootstrapNote::AutoSpawnDisabled`]
+/// outcome so the user knows they're in fixture mode rather than
+/// looking at a daemon outage.
+fn run_demo() -> io::Result<()> {
+    let ui_prefs_path = la_tui::ui_prefs::default_config_path();
+    let ui_prefs = load_ui_prefs(ui_prefs_path.as_deref());
+
+    let source = MockSessionSource::fixture();
+    let mut app = App::new(source).with_ui_prefs(ui_prefs, ui_prefs_path);
+
+    let bootstrap = demo_bootstrap_outcome();
+    // The socket path is only used to render the right-context label;
+    // we look it up but do NOT probe it or spawn anything.
+    let socket = SocketDiscovery::default().resolve().socket_path;
+    seed_status_from_bootstrap(&mut app, &bootstrap, &socket);
+
+    // Live path uses `run_with_notifs(app, Some(rx))`; demo passes
+    // `None` so the runner doesn't drain a notification channel —
+    // there is no subscriber thread.
+    la_tui::runner::run_with_notifs(app, None)
+}
+
+/// Static bootstrap outcome representing "demo mode, no daemon
+/// involved". Surfaced into the status bar via [`bootstrap_status_context`]
+/// as `no daemon (LAZYAGENTS_NO_AUTODAEMON set); expected at ...`.
+/// Reusing the existing variant keeps the status bar copy consistent
+/// without inventing a new state machine just for `--demo`.
+fn demo_bootstrap_outcome() -> BootstrapOutcome {
+    BootstrapOutcome {
+        connected: false,
+        note: BootstrapNote::AutoSpawnDisabled,
+    }
+}
+
+fn load_ui_prefs(path: Option<&Path>) -> la_tui::UiPrefs {
+    // WEK-42 / M4.3: load `[ui]` from $XDG_CONFIG_HOME/lazyagents/config.toml
+    // before instantiating App so the very first frame reflects the
+    // user's saved theme + key-hints mode. A missing or unreadable file
+    // yields `UiPrefs::default()`; mutations via `T`/`H`/`C` write back
+    // to the same path.
+    path.map(la_tui::ui_prefs::load).unwrap_or_default()
+}
+
+fn seed_status_from_bootstrap<S: SessionSource, C: la_tui::crons::CronSource>(
+    app: &mut App<S, C>,
+    bootstrap: &BootstrapOutcome,
+    socket: &Path,
+) {
+    // Seed the status bar with what we already know after bootstrap:
+    // daemon presence + a right-context note about the socket. Every
+    // other field stays at `Status::default()` and is filled in by the
+    // first `daemon.health` push the notif-sub thread delivers — WEK-36
+    // 验收 "状态栏数据延迟 < 1s" relies on that push, not on a startup
+    // guess.
+    let mut bootstrap_status = Status::offline();
+    bootstrap_status.daemon_online = bootstrap.connected;
+    bootstrap_status.right_context = bootstrap_status_context(bootstrap, socket);
+    app.handle(AppMsg::StatusUpdate(bootstrap_status));
 }
 
 /// Outcome of the startup bootstrap. Carries enough info for the status
@@ -293,5 +304,58 @@ fn bootstrap_status_context(outcome: &BootstrapOutcome, socket: &Path) -> String
         BootstrapNote::ManagedBy(tag) => {
             format!("daemon managed by {tag}; expected at {}", socket.display())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Structural pins for the `--demo` path (WEK-93 review fix).
+    //!
+    //! We don't drive the full TUI here — that needs a real terminal.
+    //! What we DO pin is the contract that lets us claim "demo is
+    //! daemon-free":
+    //!
+    //! * [`demo_bootstrap_outcome`] returns a `connected: false` /
+    //!   `AutoSpawnDisabled` value — i.e. the demo path never reports
+    //!   "daemon online" to the status bar, and the right-context
+    //!   label tells the user they're in fixture mode.
+    //! * [`bootstrap_status_context`] renders that outcome into a
+    //!   string that does NOT claim a daemon is up.
+    //!
+    //! The actual "doesn't call `bootstrap_daemon` / doesn't spawn
+    //! `notif_sub`" guarantee is enforced structurally by the source:
+    //! `run_demo` doesn't reference either symbol. A reader can
+    //! `grep '^fn run_demo' -A 40` to verify.
+
+    use super::*;
+
+    #[test]
+    fn demo_bootstrap_outcome_is_offline_and_auto_spawn_disabled() {
+        let outcome = demo_bootstrap_outcome();
+        assert!(
+            !outcome.connected,
+            "demo path must never report the daemon as connected"
+        );
+        assert_eq!(
+            outcome.note,
+            BootstrapNote::AutoSpawnDisabled,
+            "demo path must surface AutoSpawnDisabled so the status bar \
+             tells the user they're in fixture mode"
+        );
+    }
+
+    #[test]
+    fn demo_status_context_does_not_claim_daemon_is_up() {
+        let outcome = demo_bootstrap_outcome();
+        let socket = std::path::PathBuf::from("/tmp/whatever/lad-1.sock");
+        let label = bootstrap_status_context(&outcome, &socket);
+        // The shared formatter reuses the AutoSpawnDisabled copy. We
+        // pin the load-bearing words so a future copy edit can't
+        // accidentally make demo mode look like a healthy daemon
+        // connection.
+        assert!(
+            label.starts_with("no daemon"),
+            "expected demo status to start with 'no daemon', got {label:?}"
+        );
     }
 }
