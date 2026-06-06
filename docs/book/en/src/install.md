@@ -102,6 +102,17 @@ Fallbacks: `$XDG_DATA_HOME` → `~/.local/share`; `$XDG_CONFIG_HOME` → `~/.con
 
 `la --check-update` queries GitHub Releases and tells you whether a newer build exists. It never installs automatically — re-run the installer above to upgrade.
 
+### Forks, internal mirrors, and air-gapped networks
+
+Set `LAZYAGENTS_UPDATE_MANIFEST_URL` to redirect the check to your own GitHub-compatible Releases endpoint. The response must carry the `tag_name`, `html_url`, and `prerelease` fields (a GitHub Enterprise Server mirror of your fork works as-is). This is the only knob — there is no second escape hatch and no auto-installer to disable.
+
+```sh
+export LAZYAGENTS_UPDATE_MANIFEST_URL=https://releases.internal.example.com/lazyagents/latest
+la --check-update
+```
+
+If the override URL is unreachable or the response is malformed, `la --check-update` prints a short reason to stderr and exits `0` — the check is intentionally non-fatal.
+
 ## Uninstall
 
 ```sh

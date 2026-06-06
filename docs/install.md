@@ -187,6 +187,20 @@ For ongoing production diagnostics — Prometheus metrics, JSON structured logs,
 
 To upgrade between releases, re-run the installer script for your platform — the script overwrites in place. The full upgrade path (including v1.x → v1.y and the v1 → v2 multi-version coexistence plan) is in [`upgrade.md`](upgrade.md).
 
+### Redirect `la --check-update` to a fork or internal mirror
+
+`la --check-update` reads the release manifest from the URL named by `LAZYAGENTS_UPDATE_MANIFEST_URL`, falling back to the public GitHub Releases API. This is the supported escape hatch for **forks**, **air-gapped / proxied networks**, and **internal mirrors** — there is no other knob, and `la` will not auto-install regardless.
+
+```sh
+# Point at your own GitHub-compatible Releases endpoint.
+export LAZYAGENTS_UPDATE_MANIFEST_URL=https://releases.internal.example.com/lazyagents/latest
+la --check-update
+```
+
+The endpoint must respond with a JSON object compatible with the GitHub Releases shape — at minimum the `tag_name`, `html_url`, and `prerelease` fields (`crates/la-tui/src/update_check.rs::ReleaseManifest`). A GitHub Enterprise Server mirror of your fork (`/repos/<org>/<repo>/releases/latest`) works as-is; a custom service only has to emit the same three keys.
+
+If the override URL is unreachable or returns a malformed body, `la --check-update` prints a short reason to stderr and exits `0` — it is intentionally non-fatal so the check can sit inside a wrapper script without breaking when offline.
+
 To remove LazyAgents entirely:
 
 ```sh

@@ -31,6 +31,17 @@ The Homebrew formula is generated on every release, but the `TinyWhite1997/homeb
 
 No. `la --check-update` queries GitHub Releases and tells you when there's a newer build — re-run the installer to upgrade. Auto-update via cargo-dist is explicitly disabled (`install-updater = false`).
 
+### How do I redirect `la --check-update` to a fork or internal mirror?
+
+Set `LAZYAGENTS_UPDATE_MANIFEST_URL` to a GitHub-compatible Releases endpoint (the response must include `tag_name`, `html_url`, and `prerelease`):
+
+```sh
+export LAZYAGENTS_UPDATE_MANIFEST_URL=https://releases.internal.example.com/lazyagents/latest
+la --check-update
+```
+
+This is the only escape hatch for forks, air-gapped networks, and internal mirrors. If the override is unreachable or returns a malformed body, `la --check-update` prints a short reason to stderr and exits `0` — it is intentionally non-fatal. See [Install → Update](install.md#update) for full details.
+
 ### How do I verify the binary I downloaded?
 
 ```sh
