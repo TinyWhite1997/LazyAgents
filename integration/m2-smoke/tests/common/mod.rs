@@ -209,12 +209,7 @@ pub async fn client(socket: &Path) -> Connection<StreamPair> {
     conn
 }
 
-pub async fn call<T, R>(
-    conn: &mut Connection<StreamPair>,
-    id: i64,
-    method: &str,
-    params: T,
-) -> R
+pub async fn call<T, R>(conn: &mut Connection<StreamPair>, id: i64, method: &str, params: T) -> R
 where
     T: serde::Serialize,
     R: serde::de::DeserializeOwned,
