@@ -369,7 +369,7 @@ fn check_git_available(git_version: Option<&str>) -> CheckLine {
         None => CheckLine {
             outcome: CheckOutcome::Critical,
             label,
-            detail: "git not on PATH; required for worktree mode (WEK-27)".to_string(),
+            detail: "git not on PATH; required for worktree mode".to_string(),
         },
     }
 }
