@@ -129,7 +129,38 @@ fn event_loop<S: SessionSource, C: CronSource>(
     // (`app.attached`), the runner owns the *I/O* (pump thread,
     // transcript buffer, Ctrl+B detach-prefix latch).
     let mut attach: Option<AttachRuntime> = None;
+    // WEK-92-A4.1: last `SessionSource::refresh_generation()` value the
+    // runner has surfaced as a `RefreshSessions` dispatch. The bg poll
+    // (and any future `sessions.changed` push) bumps the counter; the
+    // runner notices on the next frame and re-pulls
+    // `source.snapshot()` into the sidebar. Without this hop a daemon-
+    // side mutation (a sibling `lad` creating a session, an external
+    // archive) would only land after the user pressed a key.
+    //
+    // Seed at 0 (not at the source's current value): if the bg loop
+    // finished its first `sessions.list` between `App::with_sources`
+    // (which already pulled an initial snapshot) and us getting here,
+    // seeding from the live value would skip the dispatch and the
+    // sidebar would stay frozen on whatever was true at construction.
+    // The first iteration's redundant refresh costs one Mutex lock +
+    // Vec clone; a non-issue compared to the freeze it prevents.
+    let mut last_refresh_gen: u64 = 0;
     loop {
+        // WEK-92-A4.1: pull the sidebar back into sync with the source
+        // BEFORE rendering whenever the bg loop has updated its cache.
+        // This is the only path that ferries daemon-side state changes
+        // into the App outside of user keypresses — without it the
+        // sidebar permanently displays whatever was true at startup.
+        // Routing through `AppMsg::RefreshSessions` (instead of calling
+        // `app.refresh_sessions()` directly) keeps the App as the
+        // single owner of sidebar mutations and lets the unit-test
+        // surface stay symmetric with `RefreshSessions`'s other call
+        // sites.
+        let gen = app.source().refresh_generation();
+        if gen != last_refresh_gen {
+            last_refresh_gen = gen;
+            let _ = app.handle(AppMsg::RefreshSessions);
+        }
         // Push a fresh `now` into the Crons state so the inline
         // "今日/明日" labels refresh each frame without the user typing.
         let now = chrono::Utc::now();
@@ -1506,5 +1537,157 @@ mod tests {
             encode_key(key(KeyEventKind::Press, KeyCode::Up, KeyModifiers::NONE)).unwrap(),
             b"\x1b[A".to_vec()
         );
+    }
+
+    // ---------------------------------------------------------------
+    // WEK-92-A4.1: refresh_generation → AppMsg::RefreshSessions
+    // ---------------------------------------------------------------
+    //
+    // The runner's event loop reads `app.source().refresh_generation()`
+    // once per frame and dispatches `AppMsg::RefreshSessions` whenever
+    // it differs from the previous value. The full loop is hard to
+    // exercise in a unit test because it owns a real crossterm
+    // terminal; what we CAN pin here is the contract the loop relies
+    // on:
+    //
+    //   1. A source whose generation never moves never produces a
+    //      RefreshSessions hop. (Counter-example: returning a constant
+    //      0 / the App-level default; the sidebar would re-pull on
+    //      every frame for no reason and tests of `last_toast` etc.
+    //      would race against a refresh.)
+    //   2. A source whose generation increases between frames produces
+    //      exactly one RefreshSessions per increase — the sidebar swaps
+    //      in the new snapshot via the App's existing handler, NOT via
+    //      a direct mutation. This keeps the App's "single owner of
+    //      sidebar state" invariant and lets future signals (A5's
+    //      `sessions.changed` push) plug into the same hop with zero
+    //      runner-side change.
+    //
+    // The mini-source below is in-memory so the test stays
+    // crossterm-free; the runner-side dispatch is the same `gen !=
+    // last_refresh_gen` check the live loop performs.
+
+    use crate::app::{App, AppMsg};
+    use crate::source::{NewSessionRequest, SessionId, SessionSource, SourceError};
+    use std::cell::Cell;
+
+    /// Test-only source whose `refresh_generation` is wired to an
+    /// external `Cell<u64>` the test can bump. `snapshot()` returns a
+    /// distinct payload per generation so the assertion can tell which
+    /// frame the App's sidebar is currently displaying.
+    struct GenTickSource {
+        gen: std::rc::Rc<Cell<u64>>,
+        payload: std::rc::Rc<Cell<Vec<crate::model::ProjectGroup>>>,
+    }
+
+    impl SessionSource for GenTickSource {
+        fn snapshot(&self) -> Vec<crate::model::ProjectGroup> {
+            let inner = self.payload.take();
+            self.payload.set(inner.clone());
+            inner
+        }
+        fn refresh_generation(&self) -> u64 {
+            self.gen.get()
+        }
+        fn archive(&mut self, _: &str) {}
+        fn delete(&mut self, _: &str) {}
+        fn restore(&mut self, _: &str) {}
+        fn create_session(&mut self, _: NewSessionRequest) -> Result<SessionId, SourceError> {
+            Err(SourceError::Backend("not implemented".into()))
+        }
+    }
+
+    fn make_groups(names: &[&str]) -> Vec<crate::model::ProjectGroup> {
+        names
+            .iter()
+            .map(|n| crate::model::ProjectGroup::new(n.to_string(), n.to_string()))
+            .collect()
+    }
+
+    /// Mini-replica of the runner's per-frame refresh check. The real
+    /// loop has the same `gen != last_refresh_gen` shape; isolating it
+    /// here keeps the contract test independent of crossterm setup.
+    fn tick<S: SessionSource, C: crate::crons::CronSource>(
+        app: &mut App<S, C>,
+        last_refresh_gen: &mut u64,
+    ) -> bool {
+        let gen = app.source().refresh_generation();
+        if gen != *last_refresh_gen {
+            *last_refresh_gen = gen;
+            let _ = app.handle(AppMsg::RefreshSessions);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[test]
+    fn runner_dispatches_refresh_sessions_only_when_generation_moves() {
+        let gen = std::rc::Rc::new(Cell::new(0u64));
+        let payload = std::rc::Rc::new(Cell::new(make_groups(&["proj-a"])));
+        let source = GenTickSource {
+            gen: gen.clone(),
+            payload: payload.clone(),
+        };
+        let mut app = App::new(source);
+        // Mirror the runner: seed at 0 so the first frame ALWAYS picks
+        // up whatever the bg loop has cached, even if it raced ahead
+        // of `App::with_sources`.
+        let mut last_refresh_gen: u64 = 0;
+
+        // Initial frame: generation is 0 vs seed 0 — no dispatch yet,
+        // because the App's constructor already pulled snapshot once.
+        // (The runner's choice to seed at 0 means we actually DO fire
+        // one redundant refresh; the contract is "at most one per
+        // generation step, including the initial state".)
+        // First tick: dispatch fires because gen(0) != seed(?).
+        // For symmetry with the real runner we leave the seed at 0 and
+        // assert: generation 0 vs seed 0 → no dispatch. Then bump.
+        assert!(
+            !tick(&mut app, &mut last_refresh_gen),
+            "no dispatch when generation is unchanged at the seed value"
+        );
+
+        // Bg loop's first refresh: generation becomes 1, payload
+        // unchanged for this assertion. The runner should pick it up.
+        gen.set(1);
+        assert!(
+            tick(&mut app, &mut last_refresh_gen),
+            "runner must dispatch RefreshSessions on the first generation move"
+        );
+        assert_eq!(last_refresh_gen, 1);
+
+        // Frame N+1 with no further refresh: no redundant dispatch.
+        assert!(
+            !tick(&mut app, &mut last_refresh_gen),
+            "no dispatch when generation is unchanged"
+        );
+
+        // Bg loop completes a second refresh — say, after a peer
+        // process created a session. The payload now includes the new
+        // row; the runner picks up the bump and the App's sidebar
+        // swaps the snapshot.
+        payload.set(make_groups(&["proj-a", "proj-b"]));
+        gen.set(2);
+        assert!(tick(&mut app, &mut last_refresh_gen));
+        assert_eq!(last_refresh_gen, 2);
+        let groups = app.sidebar.groups();
+        let ids: Vec<&str> = groups.iter().map(|g| g.project_id.as_str()).collect();
+        assert!(
+            ids.contains(&"proj-b"),
+            "sidebar must reflect the post-refresh snapshot once dispatch fires; got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn session_source_default_refresh_generation_is_zero() {
+        // Sources that don't own a bg thread (the in-memory mock, the
+        // demo fixture) get the trait default, which the runner reads
+        // as "no new data ever". This pins the invariant so a future
+        // refactor doesn't change the default to `random()` or
+        // `Instant::now().as_nanos()` and accidentally fire a refresh
+        // on every frame for the demo binary.
+        let src = crate::source::MockSessionSource::fixture();
+        assert_eq!(src.refresh_generation(), 0);
     }
 }

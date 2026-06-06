@@ -148,6 +148,19 @@ pub trait SessionSource {
     /// [`RpcSessionSource`] translates this into a `sessions.create`
     /// RPC + a follow-up `sessions.list` refresh.
     fn create_session(&mut self, req: NewSessionRequest) -> Result<SessionId, SourceError>;
+
+    /// Monotonic counter the source bumps after every internal cache
+    /// rebuild. The runner reads this once per frame and dispatches
+    /// [`crate::app::AppMsg::RefreshSessions`] whenever the value
+    /// changes, so a bg-thread refresh (poll tick, mutation re-pull,
+    /// future push notification) reaches the sidebar within one frame
+    /// (~250 ms) instead of waiting for a user keystroke. Sources
+    /// without a background thread (the in-memory mock) can leave the
+    /// default `0`; the runner treats "never changes" as "never has
+    /// new data".
+    fn refresh_generation(&self) -> u64 {
+        0
+    }
 }
 
 /// In-memory `SessionSource` used by tests and the binary's `--demo` mode.

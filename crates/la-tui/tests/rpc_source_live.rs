@@ -25,8 +25,9 @@ use la_ipc::transport::{Endpoint, Listener};
 use la_ipc::{server_handshake, Connection};
 use la_proto::jsonrpc::{Message, Response};
 use la_proto::methods::{
-    Method, ServerCapabilities, SessionState, SessionSummary, SessionsArchive,
-    SessionsArchiveResult, SessionsCreate, SessionsList, SessionsListResult,
+    Method, PtySize, ServerCapabilities, SessionState, SessionSummary, SessionsArchive,
+    SessionsArchiveResult, SessionsCreate, SessionsCreateParams, SessionsCreateResult,
+    SessionsList, SessionsListResult,
 };
 use la_tui::source::{NewSessionRequest, RpcSessionSource, SourceError};
 use la_tui::SessionSource;
@@ -355,6 +356,233 @@ async fn create_session_times_out_when_daemon_never_replies() {
         elapsed < Duration::from_secs(3),
         "create_session returned in {elapsed:?}, expected to honour the override"
     );
+
+    let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    let _ = std::fs::remove_file(&socket);
+    drop(dir);
+}
+
+// WEK-92-A4.1: read-your-write — `create_session` MUST return only
+// after a follow-up `sessions.list` has rebuilt the cache to include
+// the new row. Before the fix the bg loop acked the caller first and
+// re-pulled on the next loop turn, so the TUI's immediate
+// `refresh_sessions()` saw the pre-create cache and the sidebar
+// missed the new row for at least one frame (worst case: until the
+// next 2 s poll tick + a user keystroke). The stub here serves a
+// pre-create `sessions.list` of `[s1]` and a post-create one of
+// `[s1, mock-1]`, and asserts the snapshot the caller reads
+// immediately after the trait call returns already contains `mock-1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_session_pulls_fresh_snapshot_before_acking_caller() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("lad-rpc-src-5.sock");
+    let listener = Listener::bind(&Endpoint::uds(&socket))
+        .await
+        .expect("bind stub");
+
+    let created = Arc::new(Mutex::new(Vec::<String>::new()));
+    let created_bg = created.clone();
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.expect("accept");
+        let mut conn = Connection::new(stream);
+        handshake_stub(&mut conn).await;
+        loop {
+            let msg = match conn.recv().await {
+                Ok(Some(m)) => m,
+                _ => return,
+            };
+            let req = match msg {
+                Message::Request(r) => r,
+                _ => continue,
+            };
+            match req.method.as_str() {
+                m if m == SessionsList::NAME => {
+                    let mut sessions = vec![make_summary("s1", "proj-a", SessionState::Running)];
+                    // Once a create has been ack'd, the list response
+                    // grows to include the new row. The race we are
+                    // pinning down is "did the bg loop call this method
+                    // BEFORE telling the TUI thread the create
+                    // succeeded?".
+                    for id in created_bg.lock().await.iter() {
+                        sessions.push(make_summary(id, "proj-a", SessionState::Running));
+                    }
+                    let resp = Response::success(req.id, &SessionsListResult { sessions })
+                        .expect("encode list");
+                    conn.send(&Message::Response(resp)).await.expect("send");
+                }
+                m if m == SessionsCreate::NAME => {
+                    let params: SessionsCreateParams =
+                        serde_json::from_value(req.params.expect("create params"))
+                            .expect("decode create params");
+                    assert_eq!(params.backend, "claude");
+                    let new_id = "mock-1".to_string();
+                    created_bg.lock().await.push(new_id.clone());
+                    let resp = Response::success(
+                        req.id,
+                        &SessionsCreateResult {
+                            session_id: new_id,
+                            backend: "claude".into(),
+                            cwd: "/tmp/proj-a".into(),
+                            initial_size: PtySize { rows: 24, cols: 80 },
+                            state: SessionState::Running,
+                        },
+                    )
+                    .expect("encode create");
+                    conn.send(&Message::Response(resp)).await.expect("send");
+                }
+                other => panic!("unexpected method on stub: {other}"),
+            }
+        }
+    });
+
+    let mut source = RpcSessionSource::connect(&socket);
+    let snap = tokio::task::spawn_blocking(move || {
+        assert!(
+            source.wait_for_first_snapshot(Duration::from_secs(5)),
+            "first sessions.list never landed"
+        );
+        let gen_before = source.refresh_generation();
+        let id = source
+            .create_session(NewSessionRequest {
+                project_dir: "/tmp/proj-a".into(),
+                backend: "claude".into(),
+                args: Vec::new(),
+                prompt: "hi".into(),
+                worktree: false,
+            })
+            .expect("create ok");
+        assert_eq!(id.as_str(), "mock-1");
+        // The cache MUST already include mock-1 — no sleep, no retry.
+        // This is the contract the App's modal Confirm path relies on:
+        // create_session resolves only after the snapshot has been
+        // refreshed to the post-create view.
+        let snap = source.snapshot();
+        // refresh_generation must also reflect that a refresh has
+        // happened between gen_before and now, so the runner has a
+        // signal to dispatch RefreshSessions.
+        assert!(
+            source.refresh_generation() > gen_before,
+            "refresh_generation must bump on the create's follow-up refresh: \
+             before={gen_before}, after={}",
+            source.refresh_generation()
+        );
+        snap
+    })
+    .await
+    .expect("blocking join");
+
+    let proj_a = snap
+        .iter()
+        .find(|g| g.project_id == "proj-a")
+        .expect("proj-a present");
+    let ids: Vec<&str> = proj_a
+        .sessions
+        .iter()
+        .map(|s| s.session_id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"mock-1"),
+        "snapshot must include mock-1 immediately after create_session returns; got {ids:?}"
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    let _ = std::fs::remove_file(&socket);
+    drop(dir);
+}
+
+// WEK-92-A4.1: the bg loop's refresh path bumps
+// `refresh_generation()` so the runner can dispatch
+// `AppMsg::RefreshSessions` without waiting for a keystroke. This is
+// the contract the runner's per-frame check depends on; if the
+// counter never moves the sidebar permanently displays whatever was
+// true at startup. We serve two distinct `sessions.list` payloads
+// across two ticks (forced via the test-only Refresh command so the
+// test doesn't have to wait the full POLL_INTERVAL on every CI run)
+// and assert both the cache and the counter shifted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_generation_bumps_after_bg_poll_tick() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("lad-rpc-src-6.sock");
+    let listener = Listener::bind(&Endpoint::uds(&socket))
+        .await
+        .expect("bind stub");
+
+    let list_count = Arc::new(Mutex::new(0u32));
+    let list_count_bg = list_count.clone();
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.expect("accept");
+        let mut conn = Connection::new(stream);
+        handshake_stub(&mut conn).await;
+        loop {
+            let msg = match conn.recv().await {
+                Ok(Some(m)) => m,
+                _ => return,
+            };
+            let req = match msg {
+                Message::Request(r) => r,
+                _ => continue,
+            };
+            match req.method.as_str() {
+                m if m == SessionsList::NAME => {
+                    let mut n = list_count_bg.lock().await;
+                    *n += 1;
+                    let sessions = if *n == 1 {
+                        vec![make_summary("s1", "proj-a", SessionState::Running)]
+                    } else {
+                        // Second and subsequent ticks: add s2 so the
+                        // grouped snapshot grows and the test can also
+                        // verify the runner-visible cache changed (not
+                        // just the counter).
+                        vec![
+                            make_summary("s1", "proj-a", SessionState::Running),
+                            make_summary("s2", "proj-a", SessionState::Running),
+                        ]
+                    };
+                    let resp = Response::success(req.id, &SessionsListResult { sessions })
+                        .expect("encode list");
+                    conn.send(&Message::Response(resp)).await.expect("send");
+                }
+                other => panic!("unexpected method on stub: {other}"),
+            }
+        }
+    });
+
+    let source = RpcSessionSource::connect(&socket);
+    tokio::task::spawn_blocking(move || {
+        assert!(
+            source.wait_for_first_snapshot(Duration::from_secs(5)),
+            "first sessions.list never landed"
+        );
+        let gen_after_first = source.refresh_generation();
+        assert!(gen_after_first >= 1, "first refresh must bump the counter");
+        // Force the second tick via the test-only Refresh command so
+        // we don't have to wait the full POLL_INTERVAL on every CI run.
+        // The contract is the same: any successful refresh bumps the
+        // counter; the periodic poll is just one of the triggers.
+        source.force_refresh();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let gen_now = source.refresh_generation();
+            let snap = source.snapshot();
+            if gen_now > gen_after_first {
+                let proj_a = snap
+                    .iter()
+                    .find(|g| g.project_id == "proj-a")
+                    .expect("proj-a present");
+                if proj_a.sessions.len() == 2 {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let gen_now = source.refresh_generation();
+        let snap = source.snapshot();
+        panic!(
+            "refresh_generation never moved past {gen_after_first}: now={gen_now}, snap={snap:?}"
+        );
+    })
+    .await
+    .expect("blocking join");
 
     let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
     let _ = std::fs::remove_file(&socket);
