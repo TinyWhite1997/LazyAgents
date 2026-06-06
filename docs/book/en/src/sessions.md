@@ -63,7 +63,7 @@ Response includes the `session_id` (UUID v7), the resolved `cwd` (which is the w
 | `Enter` | Attach to the highlighted session (live PTY pane opens; daemon owns input). |
 | `Ctrl+B d` | Detach prefix → `d` leaves the attach and returns to the sidebar (the session keeps running on the daemon). `Ctrl+B Esc` and `Ctrl+B .` also work. |
 | `Ctrl+B Ctrl+B` | Send a literal `Ctrl+B` (0x02) into the PTY for agents that use it themselves. |
-| Any other key | Forwarded to the daemon as PTY input — including arrows, PgUp/PgDn, Home/End, function keys. There is no local scroll mode yet; the agent process owns the pane. |
+| Any other key | Forwarded to the daemon as PTY input — printable characters, arrows, PgUp/PgDn, Home/End, Insert/Delete, Tab/BackTab, Backspace, Esc, and Ctrl/Alt chords. Function keys (F1–F12) and media keys are not encoded yet and are dropped. There is no local scroll mode; the agent process owns the pane. |
 | `q` (in the sidebar) | Quit `la`. Sessions and the daemon stay alive. |
 
 **Detach vs quit:** `Ctrl+B d` releases your viewer; the daemon eagerly drops your `acquire_input` ownership via `sessions.detach`. Quitting `la` does the same plus shuts down the TUI process. Neither stops the session.

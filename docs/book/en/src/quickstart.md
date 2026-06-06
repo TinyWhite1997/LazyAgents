@@ -2,7 +2,7 @@
 
 **Goal:** zero to your first running session in under 5 minutes.
 
-> **v1 status.** The daemon (`lad`) is fully functional in v1 — sessions, crons, worktrees, and adapter integrations all work. The TUI's New-session / attach UI is still being wired (the modals exist as placeholders). For a v1 "I want a working session right now" path, you'll talk JSON-RPC to the daemon directly; this chapter shows you both how the TUI looks today and the daemon path you can use to actually run a session.
+> **v1 status.** The daemon (`lad`) is fully functional in v1 — sessions, crons, worktrees, and adapter integrations all work. **As of WEK-92-A3 the TUI's live attach is wired** (press `Enter` on a session row and you get a real PTY pane; `Ctrl+B d` detaches). Only the **New-session form** is still a placeholder, so first-time session creation still goes through JSON-RPC. This chapter shows both the TUI flow and the daemon path you'll use to spawn that first session.
 
 ## Before you start
 
