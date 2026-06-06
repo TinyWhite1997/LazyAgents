@@ -153,17 +153,33 @@ lad doctor
 - **Exit 2** = critical checks all green, but at least one optional adapter is missing or unauthenticated. Critical lines render with `✓`, the degraded ones render with `!`. The install is fine; that adapter just won't be usable until you fix it (`claude login`, install `codex`, etc.).
 - **Exit 1** = a critical check failed (no daemon socket, wrong permissions, missing `git`, state-dir not writable, version mismatch). Critical line renders with `✗`. The installer must surface the failure and bail; do not proceed until you have a green critical row.
 
-Sample output of a healthy fresh install (no daemon yet):
+A healthy fresh install — **after** the daemon has been started via `lad install --service <mode> --start`, `lad daemonize`, or letting `la` auto-spawn it on first launch — looks like:
 
 ```text
-socket path:    /run/user/1000/lazyagents/lad-1.sock
-runtime dir:    /run/user/1000/lazyagents
-state dir:      /home/alice/.local/share/lazyagents
-server version: 0.1.0
-status:         no daemon listening
+✓ daemon socket reachable: /run/user/1000/lazyagents/lad-1.sock
+✓ socket permissions: 0600 owner=uid:1000
+✓ daemon version: la 0.1.0 (matches client)
+✓ state dir writable: /home/alice/.local/share/lazyagents (free: 765.5 GiB)
+✓ git available: git version 2.43.0
+✓ adapter claude: ok version=2.1.158
+✓ adapter codex: ok version=0.49.0
+✓ adapter opencode: ok version=1.2.15
 ```
 
-That last line is expected — `la` starts the daemon on first launch. Once the daemon is up, the same command will print the resolved socket and the listener version.
+Every row green → exit `0`, install is done. Lines for adapters you don't have authenticated will render as `!` (e.g. `! adapter codex: Unauthenticated — see https://developers.openai.com/codex/cli`); that drops the exit to `2` but is not a failure — it just means that backend won't be usable until you log in.
+
+If the daemon is **not** running yet, `lad doctor` will report it as a **critical** failure (exit `1`), not as healthy:
+
+```text
+✗ daemon socket reachable: no daemon listening at /run/user/1000/lazyagents/lad-1.sock; start with `lad start` or `lad daemonize`
+✗ socket permissions: could not stat /run/user/1000/lazyagents/lad-1.sock: No such file or directory (os error 2); daemon may not have created it yet
+✓ daemon version: client la 0.1.0; daemon unreachable, skipping match
+✓ state dir writable: /home/alice/.local/share/lazyagents (free: 765.5 GiB)
+✓ git available: git version 2.43.0
+…
+```
+
+Start the daemon (`lad daemonize`, or install it as a service with `lad install --service <mode> --start`) and re-run `lad doctor` — the two `✗` rows should flip to `✓` and the exit code should drop to `0` or `2`.
 
 For ongoing production diagnostics — Prometheus metrics, JSON structured logs, the adapter-drift surface — see [`observability.md`](observability.md). `lad doctor` is the install-time gate; `lad metrics` is the runtime scrape surface.
 
