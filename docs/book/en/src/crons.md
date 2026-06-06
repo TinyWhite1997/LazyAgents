@@ -29,7 +29,7 @@ The full rationale is in [ADR-0002](https://github.com/TinyWhite1997/LazyAgents/
 
 ## Create a cron
 
-> **v1 status.** The daemon-side cron surface (`crons.upsert`, `crons.set_enabled`, `crons.run_now`, `crons.dry_run`, the admission gate, scheduler, catch-up, archiving) is fully wired in v1 — every behaviour described below is what `lad` actually does once a cron lands in SQLite. The **TUI Crons tab is still mock-backed** (tracked as M3.5 in the source): the editor, list, and `Space` / `r` / `R` / `d` keys all manipulate an in-memory `MockCronSource` and **do not yet round-trip to the daemon**. To create, enable, or trigger a real cron today, drive `crons.*` over the IPC socket; the TUI binding tables below describe the M3.5 wiring already drafted in the UI layer.
+> **v1 status.** The daemon-side cron surface (`crons.upsert`, `crons.set_enabled`, `crons.run_now`, `crons.dry_run`, the admission gate, scheduler, catch-up, archiving) is fully wired in v1 — every behaviour described below is what `lad` actually does once a cron lands in SQLite. The **TUI Crons tab is still mock-backed**: the editor, list, and `Space` / `r` / `R` / `d` keys all manipulate an in-memory `MockCronSource` and **do not yet round-trip to the daemon**. To create, enable, or trigger a real cron today, drive `crons.*` over the IPC socket; the TUI binding tables below describe the live-source wiring already drafted in the UI layer.
 
 ### v1 path: JSON-RPC
 
@@ -47,7 +47,7 @@ The full rationale is in [ADR-0002](https://github.com/TinyWhite1997/LazyAgents/
 
 Then enable it with `crons.set_enabled { cron_id, enabled: true }`. See [Enabling a cron](#enabling-a-cron) below — and note that v1's enable path has no token gate, no auto-disable on sensitive edits, and no IPC-level prompt size cap.
 
-### TUI editor (M3.5 wiring, today mock-backed)
+### TUI editor (today mock-backed)
 
 In the TUI you switch to the **Crons** tab and press **`n`** to open the editor. Cycle fields with `Tab`:
 
@@ -61,11 +61,11 @@ In the TUI you switch to the **Crons** tab and press **`n`** to open the editor.
 | Prompt | Don't put credentials here — see [Security caveats](#security-caveats). A 64 KiB cap (`MAX_PROMPT_BYTES`) exists in `cron_security` but is not enforced at the v1 IPC boundary yet. |
 | Budget | Daily USD cap, runtime per run, max concurrent runs, etc. |
 
-`Ctrl+S` saves the draft. `Esc` discards. **In v1 these writes land in the TUI's mock source only**; M3.5 swaps in a live `IpcCronSource` and the same keystrokes will round-trip to `crons.upsert`.
+`Ctrl+S` saves the draft. `Esc` discards. **In v1 these writes land in the TUI's mock source only**; a follow-up will swap in a live `IpcCronSource` and the same keystrokes will round-trip to `crons.upsert`.
 
 ## Crons-tab keys
 
-| Key | Effect (today — against the mock) | Effect after M3.5 wires the live source |
+| Key | Effect (today — against the mock) | Effect once the live source is wired |
 |---|---|---|
 | `j` / `k` / `↓` / `↑` | Move cursor | Same |
 | `n` | New cron draft | Same; save will call `crons.upsert` |
@@ -77,7 +77,7 @@ In the TUI you switch to the **Crons** tab and press **`n`** to open the editor.
 | `Ctrl+S` | Save the current draft | Same; round-trips to `crons.upsert` |
 | `Esc` | Cancel the draft | Same |
 
-Until M3.5 lands, **don't rely on the TUI to schedule real work** — anything you do here is local-only and disappears when you quit `la`.
+Until the live source is wired, **don't rely on the TUI to schedule real work** — anything you do here is local-only and disappears when you quit `la`.
 
 ## Enabling a cron
 
@@ -151,8 +151,8 @@ Old `runs` rows are pruned after a retention window (default 90 days, swept once
 
 ## Dry-run before you enable
 
-Call `crons.dry_run` with `count: N` (up to 20) to see the next N fire times in the cron's own timezone. This is the cheapest way to catch a `0 9 * * 7` (Sunday at 09:00) when you meant `0 9 * * 1` (Monday). The TUI's `R` key drives a local preview today; after M3.5 it will round-trip to the daemon.
+Call `crons.dry_run` with `count: N` (up to 20) to see the next N fire times in the cron's own timezone. This is the cheapest way to catch a `0 9 * * 7` (Sunday at 09:00) when you meant `0 9 * * 1` (Monday). The TUI's `R` key drives a local preview today; once the live source is wired it will round-trip to the daemon.
 
 ## See it without enabling
 
-`crons.run_now` bypasses the schedule and fires the cron once immediately, going through the same admission gate as a scheduled fire (so quotas still apply). Useful for sanity-checking a fresh cron before you flip it on. The TUI's `r` key will drive this once M3.5 lands; for v1 invoke the RPC directly.
+`crons.run_now` bypasses the schedule and fires the cron once immediately, going through the same admission gate as a scheduled fire (so quotas still apply). Useful for sanity-checking a fresh cron before you flip it on. The TUI's `r` key will drive this once the live source is wired; for v1 invoke the RPC directly.

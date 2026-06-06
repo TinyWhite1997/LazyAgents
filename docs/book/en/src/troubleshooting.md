@@ -103,7 +103,7 @@ Things to watch for: code-signing prompts on first run (the binary is sigstore-a
 
 ### Windows
 
-The release pipeline produces `x86_64-pc-windows-msvc`. Windows ARM is intentionally out of scope for v1. Known issues from the M0 spike report:
+The release pipeline produces `x86_64-pc-windows-msvc`. Windows ARM is intentionally out of scope for v1. Known issues from the initial spike report:
 
 - **EOF reporting is delayed.** Unix PTYs report EOF promptly after the child exits; Windows ConPTY can keep the reader side open beyond child exit on GitHub-hosted runners (and possibly elsewhere). This may make a session appear "still running" for a moment after the agent exited.
 - **`Signal::Interrupt` may not terminate the child.** `GenerateConsoleCtrlEvent(CTRL_C_EVENT)` can succeed without the ConPTY child actually exiting. If a Ctrl-C doesn't stop the agent, follow up with `Signal::Kill` (the TUI's "force kill" path).

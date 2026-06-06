@@ -33,7 +33,7 @@ use la_daemon::{
 };
 
 const HELP: &str = "\
-lad — LazyAgents daemon (WEK-21 / M1.7 + WEK-71 / M4.2 + WEK-73 / M4.1)
+lad — LazyAgents daemon
 
 USAGE:
     lad <command> [flags]

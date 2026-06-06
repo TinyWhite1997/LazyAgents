@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "LazyAgents daemon binary (`lad`): assembles core + storage + ipc with auto-socket-path and graceful shutdown (WEK-21 / M1.7)."
+description = "LazyAgents daemon binary (`lad`): assembles core + storage + ipc with auto-socket-path and graceful shutdown."
 
 [dependencies]
 async-trait = { workspace = true }

@@ -1,4 +1,4 @@
-# LazyAgents M3 Chaos Runbook
+# LazyAgents Chaos Runbook
 
 Scope: Linux v1 validation for the daemon + cron milestone. Run these against a debug or release `lad` built from the same commit under test. The goal is to prove the daemon remains alive, records explicit failures, and avoids scheduler wake-up noise while cron workloads fail or clients disconnect.
 

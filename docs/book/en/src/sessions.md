@@ -26,9 +26,9 @@ Transitions you'll see day-to-day:
 
 ### From the TUI (v1 status)
 
-The Sessions tab in v1 ships the live navigation, sidebar, and modals — and as of **WEK-94 (WEK-92-A2)** the New-session form is wired end-to-end: pressing **`n`** on a project opens a modal that lets you pick a backend, type the initial prompt, and toggle the worktree flag, then **`Ctrl+Enter`** calls `sessions.create` on the daemon. The freshly minted session appears on the sidebar within the next ~2 s refresh tick.
+The Sessions tab in v1 ships the live navigation, sidebar, and modals — and the **New-session form is wired end-to-end**: pressing **`n`** on a project opens a modal that lets you pick a backend, type the initial prompt, and toggle the worktree flag, then **`Ctrl+Enter`** calls `sessions.create` on the daemon. The freshly minted session appears on the sidebar within the next ~2 s refresh tick.
 
-**Live attach landed in WEK-92-A3:** highlighting a session row and pressing **`Enter`** opens a live PTY pane backed by `sessions.attach { acquire_input: true }`. The daemon streams `session.output` chunks straight into the transcript, and every keystroke you type goes back through `sessions.write`.
+**Live attach is wired:** highlighting a session row and pressing **`Enter`** opens a live PTY pane backed by `sessions.attach { acquire_input: true }`. The daemon streams `session.output` chunks straight into the transcript, and every keystroke you type goes back through `sessions.write`.
 
 The New-session modal field map:
 
@@ -123,9 +123,9 @@ Both refuse to touch a session that's still in the active registry — you must 
 
 LazyAgents can surface sessions you started directly with `claude`, `codex`, or `opencode` — without copying anything. The discovery walk is read-only.
 
-The daemon side is fully wired (`adapters.discover` + `sessions.import`), and the TUI emits an `ImportDiscovered` action on the `i` key — the live import overlay is the same M1.7 work as the New-session form. Until then, drive the import over JSON-RPC.
+The daemon side is fully wired (`adapters.discover` + `sessions.import`), and the TUI emits an `ImportDiscovered` action on the `i` key — the live import overlay is the same UI work as the New-session form. Until then, drive the import over JSON-RPC.
 
-After import, the session shows up alongside native LazyAgents sessions, and "resuming" it (planned for the same milestone) will spawn a fresh backend process with the right resume flag, pointed at the original transcript file (which LazyAgents never modifies).
+After import, the session shows up alongside native LazyAgents sessions, and "resuming" it (planned for the same release) will spawn a fresh backend process with the right resume flag, pointed at the original transcript file (which LazyAgents never modifies).
 
 Discovery roots (and how to override them):
 
