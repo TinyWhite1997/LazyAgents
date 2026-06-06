@@ -47,3 +47,4 @@ Thumbs.db
 
 # mdBook build output for the docs/ handbook
 /docs/book/build/
+.claude/worktrees
