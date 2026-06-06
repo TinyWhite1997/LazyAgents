@@ -671,34 +671,54 @@ jobs:
       # exits 0 with the daemon's USAGE block (see
       # crates/la-daemon/src/main.rs `print_help`). Anything else
       # fails the release build, which is the point.
-      - name: install qemu-user-static (aarch64-linux smoke)
+      - name: install qemu-user-static + aarch64 sysroot (aarch64-linux smoke)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-user-static
-          # We exec the aarch64 binary via an explicit
-          # `qemu-aarch64-static` wrapper rather than relying on
-          # binfmt_misc auto-routing; the apt post-install does
-          # register binfmt entries on ubuntu, but the explicit
-          # wrapper keeps the smoke deterministic across runner
-          # image refreshes and makes the failure mode obvious in
-          # logs (no "Exec format error" mystery).
+          # `qemu-user-static` alone is NOT enough for the gnu (dynamic)
+          # leg — `aarch64-unknown-linux-gnu` ships dynamically-linked
+          # PIE binaries whose interpreter is `/lib/ld-linux-aarch64.so.1`
+          # (confirmed against rc.1's la-daemon-aarch64-unknown-linux-gnu
+          # archive). Without an aarch64 glibc loader on the x86_64
+          # runner, `qemu-aarch64-static ./lad --help` errors with
+          # "Could not open '/lib/ld-linux-aarch64.so.1': No such file
+          # or directory" before user-space ever starts. `libc6-arm64-cross`
+          # drops the aarch64 sysroot under `/usr/aarch64-linux-gnu/`,
+          # and `qemu-aarch64-static -L <prefix>` then resolves the
+          # interpreter inside that prefix. We always pair the two so
+          # the same invocation works for either dynamic (gnu) or
+          # static (musl, though musl runs on x86_64 here) binaries.
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static \
+            libc6-arm64-cross
           command -v qemu-aarch64-static
           qemu-aarch64-static --version | head -1
+          # Sanity check the sysroot — if a future ubuntu image
+          # repackages the cross libc the smoke step's `-L` prefix
+          # would silently miss and we'd be back at "interpreter
+          # not found".
+          test -f /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1
       - name: runtime smoke (la --version / lad --help)
         shell: bash
         run: |
           set -euo pipefail
           extracted="target/distrib/_extracted/${{ matrix.target }}"
-          # Need-emulation flag — only the aarch64-linux leg on the
-          # x86_64 ubuntu runner needs qemu. All other targets (native
-          # gnu/musl x86_64, native macOS arm64/x86_64, native
-          # windows-msvc) exec directly.
-          runner=""
+          # Per-target emulator + arg prefix. Only the aarch64-linux
+          # leg on the x86_64 ubuntu runner needs qemu; the sysroot
+          # `-L` flag is required for the gnu (dynamic) target so
+          # qemu can find /lib/ld-linux-aarch64.so.1. The array is
+          # expanded via `${runner[@]+"${runner[@]}"}` (the bash 3.2
+          # safe form) so an empty `runner=()` doesn't trip
+          # `set -u` on the macOS legs (bash 3.2.57 treats
+          # `"${empty[@]}"` as an unbound expansion on some patch
+          # levels).
+          runner=()
           case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu) runner="qemu-aarch64-static" ;;
+            aarch64-unknown-linux-gnu)
+              runner=(qemu-aarch64-static -L /usr/aarch64-linux-gnu)
+              ;;
           esac
           # Collect every shipped la* / lad* entry point. WEK-78
           # hotfix #2 pattern — bash 3-compatible while-read, since
@@ -711,40 +731,38 @@ jobs:
             echo "::error::no la/lad binary inside extracted archives for ${{ matrix.target }}"
             exit 1
           fi
+          # Helper: run argv under `set -e`, capturing exit status
+          # without using `! cmd` (which inverts $? so the failure
+          # branch would otherwise print exit=0). Caller pattern:
+          #   status=0; run_one "${argv[@]}" || status=$?
+          run_one() {
+            "$@"
+          }
           fail=0
           for bin in "${bins[@]}"; do
             name=$(basename "$bin")
-            # Build the argv: [<emulator>] <bin> --version|--help.
             case "$name" in
               la|la.exe)
-                echo "=== ${runner:+$runner }$bin --version ==="
-                if [[ -n "$runner" ]]; then
-                  if ! "$runner" "$bin" --version; then
-                    echo "::error::$runner $bin --version failed (exit $?)"
-                    fail=1
-                  fi
-                else
-                  if ! "$bin" --version; then
-                    echo "::error::$bin --version failed (exit $?)"
-                    fail=1
-                  fi
+                argv=(${runner[@]+"${runner[@]}"} "$bin" --version)
+                echo "=== ${argv[*]} ==="
+                status=0
+                run_one "${argv[@]}" || status=$?
+                if [[ $status -ne 0 ]]; then
+                  echo "::error::${argv[*]} failed (exit $status)"
+                  fail=1
                 fi
                 ;;
               lad|lad.exe)
                 # `lad --help` on a fresh runner has no daemon to talk
                 # to but the help path is pure stdout — no socket,
                 # no config probe — so it returns 0 anywhere.
-                echo "=== ${runner:+$runner }$bin --help ==="
-                if [[ -n "$runner" ]]; then
-                  if ! "$runner" "$bin" --help; then
-                    echo "::error::$runner $bin --help failed (exit $?)"
-                    fail=1
-                  fi
-                else
-                  if ! "$bin" --help; then
-                    echo "::error::$bin --help failed (exit $?)"
-                    fail=1
-                  fi
+                argv=(${runner[@]+"${runner[@]}"} "$bin" --help)
+                echo "=== ${argv[*]} ==="
+                status=0
+                run_one "${argv[@]}" || status=$?
+                if [[ $status -ne 0 ]]; then
+                  echo "::error::${argv[*]} failed (exit $status)"
+                  fail=1
                 fi
                 ;;
             esac
