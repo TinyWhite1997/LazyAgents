@@ -44,6 +44,27 @@ impl Endpoint {
     }
 }
 
+/// Map a "socket path"-shaped identifier to the right [`Endpoint`] for this
+/// platform. On Unix the path becomes a UDS endpoint verbatim; on Windows it
+/// is mapped to the Named Pipe `\\.\pipe\lazyagents-<file_stem>` that the
+/// daemon binds (`lad-1.sock` → `\\.\pipe\lazyagents-lad-1`).
+///
+/// This is the single source of truth for that mapping — daemon, doctor,
+/// la-tui bootstrap, and the m2-smoke / WEK-84 integration harnesses all
+/// route through here so the naming convention cannot drift between
+/// listener and connector.
+pub fn endpoint_for(path: &Path) -> Endpoint {
+    #[cfg(unix)]
+    {
+        Endpoint::uds(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("lad");
+        Endpoint::named_pipe(format!(r"\\.\pipe\lazyagents-{stem}"))
+    }
+}
+
 // ---------------- Unix implementation ----------------
 
 #[cfg(unix)]

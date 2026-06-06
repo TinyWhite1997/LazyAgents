@@ -1,8 +1,7 @@
-#![cfg(unix)]
-
 mod common;
 
 use common::{bootstrap_daemon, call, client, FakeBackend, RPC_TIMEOUT};
+use la_ipc::transport::StreamPair;
 use la_proto::jsonrpc::Message;
 use la_proto::methods::{EventTopic, EventsSubscribeParams, EventsSubscribeResult};
 use la_proto::notifications::{
@@ -61,7 +60,7 @@ async fn unavailable_backend_is_grey_state_health_not_panic() {
 }
 
 async fn read_health_with_backends(
-    conn: &mut la_ipc::Connection<tokio::net::UnixStream>,
+    conn: &mut la_ipc::Connection<StreamPair>,
 ) -> DaemonHealthParams {
     let deadline = tokio::time::Instant::now() + RPC_TIMEOUT;
     while tokio::time::Instant::now() < deadline {

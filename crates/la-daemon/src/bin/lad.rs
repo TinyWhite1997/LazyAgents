@@ -708,7 +708,7 @@ fn run_uninstall_cmd(spec: &UninstallSpec) -> ExitCode {
 fn scrape_metrics(socket_path: &std::path::Path) -> std::io::Result<String> {
     use la_ipc::connection::Connection;
     use la_ipc::handshake::client_handshake;
-    use la_ipc::transport::{connect, Endpoint};
+    use la_ipc::transport::{connect, endpoint_for};
     use la_proto::jsonrpc::{Message, Request, RequestId};
     use la_proto::methods::{Method, MetricsScrape, MetricsScrapeParams, MetricsScrapeResult};
 
@@ -717,22 +717,7 @@ fn scrape_metrics(socket_path: &std::path::Path) -> std::io::Result<String> {
         .enable_time()
         .build()?;
     rt.block_on(async move {
-        let endpoint = match () {
-            #[cfg(unix)]
-            () => Endpoint::uds(socket_path),
-            // Windows Named Pipe (B2 决议): the daemon binds
-            // `\\.\pipe\lazyagents-<stem>` (see `endpoint_for` in
-            // runtime.rs); mirror that path here so the CLI talks to
-            // the same endpoint regardless of platform.
-            #[cfg(not(unix))]
-            () => Endpoint::named_pipe(format!(
-                r"\\.\pipe\lazyagents-{}",
-                socket_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("lad")
-            )),
-        };
+        let endpoint = endpoint_for(socket_path);
         let stream = tokio::time::timeout(Duration::from_secs(5), connect(&endpoint))
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?
@@ -810,7 +795,7 @@ fn run_backup(
 fn query_running_daemon_version(socket: &std::path::Path) -> Option<String> {
     use la_ipc::connection::Connection;
     use la_ipc::handshake::client_handshake;
-    use la_ipc::transport::{connect, Endpoint};
+    use la_ipc::transport::{connect, endpoint_for};
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -818,15 +803,7 @@ fn query_running_daemon_version(socket: &std::path::Path) -> Option<String> {
         .build()
         .ok()?;
     rt.block_on(async {
-        let endpoint = match () {
-            #[cfg(unix)]
-            () => Endpoint::uds(socket),
-            #[cfg(not(unix))]
-            () => Endpoint::named_pipe(format!(
-                r"\\.\pipe\lazyagents-{}",
-                socket.file_stem().and_then(|s| s.to_str()).unwrap_or("lad")
-            )),
-        };
+        let endpoint = endpoint_for(socket);
         let stream = tokio::time::timeout(Duration::from_millis(500), connect(&endpoint))
             .await
             .ok()?

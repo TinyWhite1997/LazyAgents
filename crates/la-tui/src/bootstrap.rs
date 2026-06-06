@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 
-use la_ipc::transport::{connect, Endpoint};
+use la_ipc::transport::{connect, endpoint_for};
 use tokio::runtime::Runtime;
 
 /// Env-var the `la` binary reads to skip its own auto-daemonize path.
@@ -196,21 +196,6 @@ fn wait_for_socket(rt: &Runtime, socket: &Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     false
-}
-
-fn endpoint_for(socket: &Path) -> Endpoint {
-    #[cfg(unix)]
-    {
-        Endpoint::uds(socket)
-    }
-    #[cfg(not(unix))]
-    {
-        let name = format!(
-            r"\\.\pipe\lazyagents-{}",
-            socket.file_stem().and_then(|s| s.to_str()).unwrap_or("lad")
-        );
-        Endpoint::named_pipe(name)
-    }
 }
 
 fn locate_lad() -> Option<PathBuf> {

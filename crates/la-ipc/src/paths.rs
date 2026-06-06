@@ -66,6 +66,15 @@ impl SocketDiscovery {
     }
 
     /// Pin an absolute socket path. Skips env-var discovery.
+    ///
+    /// The path is transport-agnostic: it is the endpoint identifier the
+    /// daemon and clients agree on, NOT a UDS-only filesystem path. On
+    /// Unix it becomes the UDS socket file; on Windows it is mapped to a
+    /// Named Pipe via [`crate::transport::endpoint_for`]
+    /// (`lad-1.sock` → `\\.\pipe\lazyagents-lad-1`). Callers that need
+    /// the corresponding transport endpoint must route the resolved path
+    /// through `endpoint_for` rather than constructing `Endpoint::uds`
+    /// directly, so the two platforms stay in sync.
     pub fn with_override(path: impl Into<PathBuf>) -> Self {
         Self {
             protocol_major: la_proto::PROTOCOL_VERSION.to_string(),

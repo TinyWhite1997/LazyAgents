@@ -155,7 +155,9 @@ fn apply_detached_flags(cmd: &mut std::process::Command) {
 
 /// Translate the Unix-style socket path we get from
 /// `SocketDiscovery::resolve()` into the Win32 named-pipe name the
-/// daemon binds — mirrors `runtime::endpoint_for`.
+/// daemon binds — mirrors `la_ipc::transport::endpoint_for`'s
+/// `\\.\pipe\lazyagents-<stem>` convention, which is the listener's
+/// single source of truth.
 #[cfg(windows)]
 fn pipe_name_from_socket_path(path: &Path) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("lad");

@@ -1,4 +1,3 @@
-#![cfg(unix)]
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -12,7 +11,7 @@ use la_adapter::{
     AdapterDescriptor, AdapterError, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec,
 };
 use la_daemon::{Daemon, DaemonConfig, DaemonHandle, SocketDiscovery};
-use la_ipc::transport::{connect, Endpoint};
+use la_ipc::transport::{connect, endpoint_for, StreamPair};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId, ResponseOutcome, RpcError};
 use tempfile::TempDir;
@@ -84,24 +83,51 @@ impl AgentAdapter for FakeBackend {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let script_path = script_dir.join(format!("{}-{nonce}.sh", std::process::id()));
-        std::fs::write(&script_path, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 60\n")
-            .map_err(AdapterError::SpawnFailed)?;
+
+        // Windows has no /bin/sh in the default PATH on the CI runner, and
+        // chmod +x is a no-op; emit a `cmd.exe /Q /K ...` long-running
+        // probe instead so the daemon sees a backend that stays up for the
+        // life of the test. Mirrors `integration/m0-smoke`'s CatAdapter.
+        #[cfg(windows)]
+        {
+            let script_path = script_dir.join(format!("{}-{nonce}.cmd", std::process::id()));
+            // `ping -n 61` blocks ~60s without needing a TRAP/SIGTERM
+            // equivalent; the test harness drops the session well before
+            // that. `>NUL` keeps the daemon's PTY buffer quiet.
+            std::fs::write(&script_path, "@echo off\r\nping -n 61 127.0.0.1 >NUL\r\n")
+                .map_err(AdapterError::SpawnFailed)?;
+            return Ok(SpawnSpec {
+                program: PathBuf::from("cmd.exe"),
+                args: vec![
+                    "/Q".into(),
+                    "/C".into(),
+                    script_path.to_string_lossy().into_owned(),
+                ],
+                env: req.env.clone(),
+                cwd: req.cwd.clone(),
+                pty: req.pty,
+                stdin_mode: req.stdin_mode,
+            });
+        }
+
         #[cfg(unix)]
         {
+            let script_path = script_dir.join(format!("{}-{nonce}.sh", std::process::id()));
+            std::fs::write(&script_path, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 60\n")
+                .map_err(AdapterError::SpawnFailed)?;
             use std::os::unix::fs::PermissionsExt;
 
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
                 .map_err(AdapterError::SpawnFailed)?;
+            Ok(SpawnSpec {
+                program: script_path,
+                args: Vec::new(),
+                env: req.env.clone(),
+                cwd: req.cwd.clone(),
+                pty: req.pty,
+                stdin_mode: req.stdin_mode,
+            })
         }
-        Ok(SpawnSpec {
-            program: script_path,
-            args: Vec::new(),
-            env: req.env.clone(),
-            cwd: req.cwd.clone(),
-            pty: req.pty,
-            stdin_mode: req.stdin_mode,
-        })
     }
 
     fn encode_user_input(&self, text: &str) -> Bytes {
@@ -115,7 +141,17 @@ pub async fn bootstrap_daemon(backends: Vec<FakeBackend>) -> TestDaemon {
     let state_dir = tempdir.path().join("state");
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
-    let socket = runtime_dir.join("lad-1.sock");
+    // Unique file stem so concurrent test daemons in the same process do
+    // not collide on Windows: `endpoint_for` derives the Named Pipe name
+    // from the path's file stem, so two daemons that both pick `lad-1`
+    // would race for the same `\\.\pipe\lazyagents-lad-1`. The pid +
+    // monotonic counter combination is unique per call.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stem = format!("lad-test-{}-{nonce}", std::process::id());
+    let socket = runtime_dir.join(format!("{stem}.sock"));
 
     let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
     for backend in backends {
@@ -143,7 +179,7 @@ pub async fn bootstrap_daemon(backends: Vec<FakeBackend>) -> TestDaemon {
 async fn wait_for_socket(socket: &Path) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if connect(&Endpoint::uds(socket)).await.is_ok() {
+        if connect(&endpoint_for(socket)).await.is_ok() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -151,8 +187,8 @@ async fn wait_for_socket(socket: &Path) {
     panic!("daemon socket did not become ready at {}", socket.display());
 }
 
-pub async fn client(socket: &Path) -> Connection<tokio::net::UnixStream> {
-    let stream = connect(&Endpoint::uds(socket)).await.expect("connect");
+pub async fn client(socket: &Path) -> Connection<StreamPair> {
+    let stream = connect(&endpoint_for(socket)).await.expect("connect");
     let mut conn = Connection::new(stream);
     let info = client_handshake(
         &mut conn,
@@ -169,7 +205,7 @@ pub async fn client(socket: &Path) -> Connection<tokio::net::UnixStream> {
 }
 
 pub async fn call<T, R>(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     id: i64,
     method: &str,
     params: T,
@@ -199,7 +235,7 @@ where
 }
 
 pub async fn call_expect_err(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     id: i64,
     method: &str,
     params: impl serde::Serialize,

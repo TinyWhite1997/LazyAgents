@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
-use la_ipc::transport::{connect, Endpoint};
+use la_ipc::transport::{connect, endpoint_for};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request};
 use la_proto::methods::{EventTopic, EventsSubscribeParams};
@@ -272,21 +272,6 @@ async fn run_once(
 
 fn wire_to_badges(wire: &[WireBackendHealth]) -> Vec<BackendBadge> {
     wire.iter().map(BackendBadge::from_wire).collect()
-}
-
-fn endpoint_for(socket: &Path) -> Endpoint {
-    #[cfg(unix)]
-    {
-        Endpoint::uds(socket)
-    }
-    #[cfg(not(unix))]
-    {
-        let name = format!(
-            r"\\.\pipe\lazyagents-{}",
-            socket.file_stem().and_then(|s| s.to_str()).unwrap_or("lad")
-        );
-        Endpoint::named_pipe(name)
-    }
 }
 
 #[cfg(test)]
