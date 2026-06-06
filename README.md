@@ -85,7 +85,7 @@ Full install path, including service install (`systemd` / `launchd` / Windows Sc
 
 ## Scope of this release (v1)
 
-LazyAgents v1 is in active development. The daemon — sessions, crons, worktrees, adapters — is fully functional; the TUI's **New-session** and **attach** views are still being wired (the Crons tab shown above is the production UI for v1). The release pipeline produces binaries for Linux x86_64/aarch64 (gnu + musl), macOS x86_64/aarch64, and Windows x86_64; Linux is the end-to-end-validated target for v1, with the other platforms tracked as release-blockers for GA. Known platform issues are listed in [`docs/book/en/src/troubleshooting.md`](docs/book/en/src/troubleshooting.md).
+LazyAgents v1 is in active development. As of **0.1.1**, the three Sessions-tab paths — sidebar list, `n` New-session, Enter attach to live PTY — are wired end-to-end against the daemon by default (`la --demo` keeps the in-process fixture for screenshots and design iteration). The release pipeline produces binaries for Linux x86_64/aarch64 (gnu + musl), macOS x86_64/aarch64, and Windows x86_64; Linux is the end-to-end-validated target for v1, with the other platforms tracked as release-blockers for GA. Known platform issues are listed in [`docs/book/en/src/troubleshooting.md`](docs/book/en/src/troubleshooting.md).
 
 ## License
 
