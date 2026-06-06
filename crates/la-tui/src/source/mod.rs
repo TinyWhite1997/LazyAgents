@@ -17,6 +17,9 @@ use std::collections::BTreeMap;
 
 use crate::model::{Backend, ProjectGroup, RunState, SessionRow};
 
+pub mod rpc;
+pub use rpc::RpcSessionSource;
+
 /// Read/mutate the session view shown in the sidebar.
 ///
 /// Implementations are expected to be cheap to call (in-memory cache);

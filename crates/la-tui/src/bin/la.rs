@@ -34,14 +34,21 @@ use std::process::{Command as ProcessCommand, ExitCode};
 
 use la_ipc::SocketDiscovery;
 use la_tui::bootstrap::{bootstrap_daemon, BootstrapNote, BootstrapOutcome};
+use la_tui::source::RpcSessionSource;
 use la_tui::status::Status;
 use la_tui::update_check;
-use la_tui::{App, AppMsg, MockSessionSource};
+use la_tui::{App, AppMsg, MockSessionSource, SessionSource};
 
 /// Parse result for the top-level CLI flags. Anything other than
 /// [`CliAction::RunTui`] short-circuits the TUI startup path.
 enum CliAction {
     RunTui,
+    /// `--demo` — bring up the TUI against the in-process
+    /// [`MockSessionSource::fixture`] instead of the daemon. Useful
+    /// for regression screenshots, design iteration, and CI smoke
+    /// runs that can't bind a real `lad` (WEK-93 acceptance: a
+    /// no-daemon fallback that mirrors the v0.1.0 demo behaviour).
+    RunDemo,
     PrintVersion,
     CheckUpdate,
     Doctor(Vec<String>),
@@ -59,6 +66,7 @@ fn parse_cli() -> CliAction {
         None => CliAction::RunTui,
         Some("--version" | "-V") => CliAction::PrintVersion,
         Some("--check-update") => CliAction::CheckUpdate,
+        Some("--demo") => CliAction::RunDemo,
         Some("doctor") => CliAction::Doctor(args.collect()),
         Some("--help" | "-h") => CliAction::PrintHelp,
         Some(other) if other.starts_with('-') => CliAction::Unknown(other.to_string()),
@@ -77,6 +85,7 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  la                 launch the TUI (spawns `lad` if not running)");
+    println!("  la --demo          launch with the built-in fixture (no daemon)");
     println!("  la --version       print version and exit");
     println!("  la --check-update  check GitHub for a newer release and exit");
     println!("  la doctor [flags]  run the daemon health/dependency diagnostics");
@@ -92,7 +101,14 @@ fn print_help() {
 fn main() -> ExitCode {
     match parse_cli() {
         CliAction::RunTui => {
-            if let Err(e) = real_main() {
+            if let Err(e) = real_main(SourceChoice::Rpc) {
+                eprintln!("la: {e}");
+                return ExitCode::from(1);
+            }
+            ExitCode::SUCCESS
+        }
+        CliAction::RunDemo => {
+            if let Err(e) = real_main(SourceChoice::Demo) {
                 eprintln!("la: {e}");
                 return ExitCode::from(1);
             }
@@ -169,13 +185,25 @@ fn run_check_update() -> ExitCode {
     ExitCode::from(update_check::exit_code(&outcome))
 }
 
-fn real_main() -> io::Result<()> {
+/// Which [`SessionSource`] the binary should bring up. The two paths
+/// look identical from here on; we just instantiate a different concrete
+/// type and hand it to [`App::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceChoice {
+    /// Default `la` invocation — connect to `lad` over IPC.
+    Rpc,
+    /// `la --demo` — use [`MockSessionSource::fixture`] so the UI is
+    /// browsable even without a daemon. Mirrors the v0.1.0 launch
+    /// behaviour for regression screenshots and design iteration.
+    Demo,
+}
+
+fn real_main(source: SourceChoice) -> io::Result<()> {
     let discovery = SocketDiscovery::default();
     let location = discovery.resolve();
 
     let bootstrap = bootstrap_daemon(&location.socket_path);
 
-    let source = MockSessionSource::fixture();
     // WEK-42 / M4.3: load `[ui]` from $XDG_CONFIG_HOME/lazyagents/config.toml
     // before instantiating App so the very first frame reflects the
     // user's saved theme + key-hints mode. A missing or unreadable file
@@ -186,6 +214,40 @@ fn real_main() -> io::Result<()> {
         .as_deref()
         .map(la_tui::ui_prefs::load)
         .unwrap_or_default();
+
+    // WEK-93: build the App against the requested source. Both paths
+    // share the rest of the bootstrap; the only fork is which concrete
+    // `SessionSource` impl we hand `App::new`. We can't store the two
+    // branches in a single `let` because `App<S>` is generic over `S`,
+    // so we duplicate the tail of `real_main` rather than boxing the
+    // source. The duplication is mechanical (5 lines) and keeps the
+    // `App<S>` monomorphisation intact, which matters for the
+    // sub-30 MiB binary budget.
+    match source {
+        SourceChoice::Rpc => run_with_source(
+            RpcSessionSource::connect(&location.socket_path),
+            ui_prefs,
+            ui_prefs_path,
+            &bootstrap,
+            &location,
+        ),
+        SourceChoice::Demo => run_with_source(
+            MockSessionSource::fixture(),
+            ui_prefs,
+            ui_prefs_path,
+            &bootstrap,
+            &location,
+        ),
+    }
+}
+
+fn run_with_source<S: SessionSource + 'static>(
+    source: S,
+    ui_prefs: la_tui::UiPrefs,
+    ui_prefs_path: Option<PathBuf>,
+    bootstrap: &BootstrapOutcome,
+    location: &la_ipc::SocketLocation,
+) -> io::Result<()> {
     let mut app = App::new(source).with_ui_prefs(ui_prefs, ui_prefs_path);
     // Seed the status bar with what we already know after bootstrap:
     // daemon presence + a right-context note about the socket. Every
@@ -195,7 +257,7 @@ fn real_main() -> io::Result<()> {
     // guess.
     let mut bootstrap_status = Status::offline();
     bootstrap_status.daemon_online = bootstrap.connected;
-    bootstrap_status.right_context = bootstrap_status_context(&bootstrap, &location.socket_path);
+    bootstrap_status.right_context = bootstrap_status_context(bootstrap, &location.socket_path);
     app.handle(AppMsg::StatusUpdate(bootstrap_status));
 
     // WEK-36: subscribe to `daemon.health` AND `cron.fired` over IPC so
