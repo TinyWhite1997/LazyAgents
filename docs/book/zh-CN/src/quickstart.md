@@ -2,7 +2,7 @@
 
 **目标：** 从零到跑起第一个会话，5 分钟以内完成。
 
-> **v1 状态。** v1 中 daemon（`lad`）完整可用 —— sessions、crons、worktree、adapter 集成都工作。**WEK-92-A3 起 TUI 的 live attach 已接入**（按 Enter 真能流出 PTY、Ctrl+B d 退回侧栏）；只剩 New-session 表单仍是占位。v1 想 "现在就创建一个新会话" 的话，你会直接对 daemon 讲 JSON-RPC；本章既展示 TUI 今天的样子，也展示你今天就能跑通会话的 daemon 路径。
+> **v1 状态。** v1 中 daemon（`lad`）完整可用 —— sessions、crons、worktree、adapter 集成都工作。WEK-93 起 TUI 默认走 daemon 后的 `RpcSessionSource`（保留 `la --demo` 用于截图与设计回归走老的 fixture），WEK-94（WEK-92-A2）起 New-session 表单也端到端接入 —— 按 `n` 打开真表单，挑 backend / 敲提示词 / 勾 worktree，Confirm 即调 `sessions.create`。下面的 JSON-RPC 路径继续对脚本化与 CI 有效。
 
 ## 开始之前
 
@@ -43,15 +43,14 @@ la
 
 ## 2. v1 UX 注意事项
 
-LazyAgents v1 提供完整的 daemon —— sessions、crons、worktree、adapter 全部可用 —— 且 **WEK-92-A3 起 TUI 的 live attach 已经接入**：在会话行按 `Enter` 真的会打开实时 PTY 面板（底层走 `sessions.attach`），`Ctrl+B d` 退回侧栏。仍是占位的只剩 **New-session 表单**：
+LazyAgents v1 提供完整的 daemon —— sessions、crons、worktree、adapter 全部可用。**WEK-93 + WEK-92-A2/A3 起 TUI 已端到端接入**：
 
-- 在项目上按 `n` 会打开一个仅确认按键的占位 modal，尚不会拉起后端。表单落地前需要走 JSON-RPC 创建。
-- 在会话行按 `Enter` **真的会**把 PTY 流入面板，并把你的键入通过 `sessions.write` 回送到 daemon。用 `Ctrl+B d`（或 `Ctrl+B Esc` / `Ctrl+B .`）退出 attach —— 会话仍在 daemon 上跑。`Ctrl+B Ctrl+B` 发字面量 `Ctrl+B`（0x02），供需要该键的 agent 使用。
+- 在项目上按 `n` 打开 New-session 表单（WEK-94）：挑 backend、敲提示词、勾 worktree，`Ctrl+Enter` 创建。新会话会在下一次 ~2 s 刷新里出现在侧栏。
+- 在会话行按 `Enter` 把 PTY 流入面板，并把你的键入通过 `sessions.write` 回送到 daemon。用 `Ctrl+B d`（或 `Ctrl+B Esc` / `Ctrl+B .`）退出 attach —— 会话仍在 daemon 上跑。`Ctrl+B Ctrl+B` 发字面量 `Ctrl+B`（0x02），供需要该键的 agent 使用。
 
-因此 v1 的 quickstart 有两条路径，取决于你想看什么：
+如果你想在没有 daemon 的情况下驱动 `la`（截图、设计回归），传 **`la --demo`** —— 会切回 WEK-26 进程内 fixture。默认的 `la` 始终连 daemon，不会把假数据塞进真工作区。
 
-- **路径 A（看 TUI）：** 打开 `la`，浏览空工作区、Crons 编辑器、按键浮层（`?`）。先走一次路径 B 拉起一个会话，再回到 `la` 上按 `Enter` attach 到它。
-- **路径 B（直接驱动 daemon）：** 通过 socket 推 JSON-RPC —— 会话会真正拉起、脚本会持久化、cron 会触发、worktree 会创建。这是下面要做的。
+你仍然可以直接通过 JSON-RPC 驱动 daemon（很多 CI 流程会这么做）—— 下面给出这个路径，方便不论从 TUI 还是脚本接入都能用同一个示例验证。
 
 ## 3. 直接通过 daemon 跑一个真实会话
 

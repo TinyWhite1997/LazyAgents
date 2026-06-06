@@ -26,21 +26,32 @@ Transitions you'll see day-to-day:
 
 ### From the TUI (v1 status)
 
-The Sessions tab in v1 has the navigation, sidebar, and modal scaffolding wired, but the New-session form itself is still a placeholder — pressing **`n`** on a project opens a modal that acknowledges the keystroke without yet spawning a backend. The form and project picker are tracked under "M1.7" in the source.
+The Sessions tab in v1 ships the live navigation, sidebar, and modals — and as of **WEK-94 (WEK-92-A2)** the New-session form is wired end-to-end: pressing **`n`** on a project opens a modal that lets you pick a backend, type the initial prompt, and toggle the worktree flag, then **`Ctrl+Enter`** calls `sessions.create` on the daemon. The freshly minted session appears on the sidebar within the next ~2 s refresh tick.
 
 **Live attach landed in WEK-92-A3:** highlighting a session row and pressing **`Enter`** opens a live PTY pane backed by `sessions.attach { acquire_input: true }`. The daemon streams `session.output` chunks straight into the transcript, and every keystroke you type goes back through `sessions.write`.
 
-The fields the form will collect:
+The New-session modal field map:
 
 | Field | Required | Notes |
 |---|---|---|
-| Project | yes | An absolute path. LazyAgents tracks one or many sessions per project. |
-| Backend | yes | `claude`, `codex`, `opencode`, or a custom adapter id. |
-| Worktree | no (default off) | If on, `git worktree add -b la/session-<short-sid> <base>` runs before the spawn. |
-| Prompt | no | Initial text fed to the agent. Leave empty for an interactive session. |
-| Args | no | Extra CLI arguments appended to the backend command. |
+| Project | yes | Captured from the sidebar selection — pick a project row before pressing `n`. |
+| Backend | yes | One of `App::backends` reported as `Available` by the daemon health probe. `←`/`→` cycle the choice. |
+| Prompt | yes | Initial text fed to the agent. Multi-line: `Enter` inserts a newline, `Ctrl+Enter` creates. |
+| Worktree | no (default off) | `Space` toggles. If on, `git worktree add -b la/session-<short-sid> <base>` runs before the spawn. |
+| Args | reserved | Plumbed through the trait for forward-compat; not exposed in the modal yet. |
 
-Until the form lands, drive `sessions.create` over the IPC socket directly — the daemon side is fully wired.
+Key map inside the modal:
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Cycle focus across Backend → Prompt → Worktree. |
+| `←` / `→` | Move the backend cursor (Backend field). |
+| `Space` | Toggle the worktree flag (Worktree field). |
+| `Ctrl+Enter` | Create the session via `sessions.create`. |
+| `Enter` | In Prompt: insert a newline. In Backend / Worktree: Confirm. |
+| `Esc` | Cancel — closes the modal, draft discarded. |
+
+A validation slip (empty prompt, no available backend) keeps the modal open and stamps the error inline so you can fix it without retyping. A daemon-side refusal closes the modal and surfaces the reason via the status bar toast.
 
 ### Programmatically (JSON-RPC over the daemon socket)
 

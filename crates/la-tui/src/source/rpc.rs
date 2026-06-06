@@ -35,13 +35,14 @@ use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, ResponseOutcome};
 use la_proto::methods::{
     AdaptersDiscover, AdaptersDiscoverParams, Method, SessionSummary, SessionsArchive,
-    SessionsArchiveParams, SessionsDelete, SessionsDeleteParams, SessionsImport,
-    SessionsImportParams, SessionsList, SessionsListParams,
+    SessionsArchiveParams, SessionsCreate, SessionsCreateParams, SessionsCreateResult,
+    SessionsDelete, SessionsDeleteParams, SessionsImport, SessionsImportParams, SessionsList,
+    SessionsListParams,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::model::{ProjectGroup, SessionRow};
-use crate::source::SessionSource;
+use crate::source::{NewSessionRequest, SessionId, SessionSource, SourceError};
 
 /// Background-loop tick. A1 contract: polling. A5 (WEK-95) replaces
 /// this with `sessions.changed` push notifications.
@@ -71,6 +72,14 @@ enum Command {
     Archive(String),
     Delete(String),
     ImportDiscovered(String),
+    /// Spawn a new session via `sessions.create`. The reply oneshot
+    /// carries the daemon-assigned id (success) or the wire-level
+    /// failure (mapped to [`SourceError::Backend`]) so the calling
+    /// thread can block on a synchronous trait method.
+    Create {
+        req: NewSessionRequest,
+        reply: oneshot::Sender<Result<SessionId, SourceError>>,
+    },
     /// Test-only: force a `sessions.list` refresh on the next loop turn.
     #[cfg(test)]
     Refresh,
@@ -185,6 +194,46 @@ impl SessionSource for RpcSessionSource {
         let _ = self
             .cmd_tx
             .send(Command::ImportDiscovered(session_id.to_string()));
+    }
+
+    fn create_session(&mut self, req: NewSessionRequest) -> Result<SessionId, SourceError> {
+        // Validation gate matches the mock: the daemon also rejects
+        // these, but failing in the TUI keeps the round-trip out of the
+        // hot path and lets the modal stay open with the user's input
+        // intact (Validation arm).
+        if req.backend.trim().is_empty() {
+            return Err(SourceError::Validation("backend is required".into()));
+        }
+        if req.prompt.trim().is_empty() {
+            return Err(SourceError::Validation("prompt cannot be empty".into()));
+        }
+        if req.project_dir.trim().is_empty() {
+            return Err(SourceError::Validation(
+                "project directory is missing — try a different project row".into(),
+            ));
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::Create {
+                req,
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                SourceError::Backend("rpc session source bg thread is no longer running".into())
+            })?;
+        // The bg thread is the only one that touches the daemon socket,
+        // so we block the TUI thread here. The Confirm path is a
+        // single-shot user action (Enter on the modal), not a per-frame
+        // call, so the synchronous wait is acceptable for ~daemon-
+        // roundtrip latency. A long-polling daemon would still resolve
+        // the oneshot promptly because send_and_await_ack already times
+        // out the connect.
+        match reply_rx.blocking_recv() {
+            Ok(res) => res,
+            Err(_) => Err(SourceError::Backend(
+                "rpc session source bg thread dropped the create reply".into(),
+            )),
+        }
     }
 }
 
@@ -316,6 +365,63 @@ async fn run_once(
                             external = %external_id,
                             "import_discovered: external id not found in adapters.discover; dropping"
                         );
+                    }
+                }
+                Command::Create {
+                    req: new_req,
+                    reply,
+                } => {
+                    // Translate trait-level fields to the wire shape.
+                    // We deliberately wait for the response here so the
+                    // calling TUI thread can surface a daemon error in
+                    // the modal-close path. A transport failure that
+                    // breaks `send_and_await_ack` propagates out of
+                    // `run_once` so the reconnect loop can re-establish
+                    // the connection on the next iteration; we still
+                    // notify the oneshot before bubbling up so the UI
+                    // doesn't dead-lock waiting for a thread that's
+                    // about to reconnect.
+                    let params = SessionsCreateParams {
+                        project_dir: new_req.project_dir.clone(),
+                        backend: new_req.backend.clone(),
+                        args: new_req.args.clone(),
+                        prompt: if new_req.prompt.is_empty() {
+                            None
+                        } else {
+                            Some(new_req.prompt.clone())
+                        },
+                        worktree: new_req.worktree,
+                    };
+                    let req = match Request::new(next_id, SessionsCreate::NAME, params) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = reply
+                                .send(Err(SourceError::Backend(format!("encode create: {e}"))));
+                            continue;
+                        }
+                    };
+                    next_id += 1;
+                    match send_and_await_ack(&mut conn, req).await {
+                        Ok(value) => match serde_json::from_value::<SessionsCreateResult>(value) {
+                            Ok(r) => {
+                                let _ = reply.send(Ok(SessionId(r.session_id)));
+                                mutated = true;
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(SourceError::Backend(format!(
+                                    "decode create result: {e}"
+                                ))));
+                            }
+                        },
+                        Err(e) => {
+                            // Tell the caller before bubbling the
+                            // transport failure up to the reconnect
+                            // loop — otherwise blocking_recv would
+                            // wait until the entire bg thread tore
+                            // down + respawned.
+                            let _ = reply.send(Err(SourceError::Backend(e.clone())));
+                            return Err(e);
+                        }
                     }
                 }
                 #[cfg(test)]

@@ -14,11 +14,96 @@
 //! fire-and-event flow.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use crate::model::{Backend, ProjectGroup, RunState, SessionRow};
 
 pub mod rpc;
 pub use rpc::RpcSessionSource;
+
+/// Newly-assigned session identifier returned by
+/// [`SessionSource::create_session`].
+///
+/// Kept as a thin newtype over [`String`] so the trait surface does not
+/// drag in a `uuid` dependency (mock IDs are `mock-N` strings) but
+/// callers can tell at a glance whether they are holding a freshly
+/// minted id vs an arbitrary session-id reference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionId(pub String);
+
+impl SessionId {
+    pub fn into_string(self) -> String {
+        self.0
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Request payload for [`SessionSource::create_session`]. Field names and
+/// types mirror [`la_proto::methods::SessionsCreateParams`] so the
+/// `RpcSessionSource` translation is a no-op.
+///
+/// `args` is plumbed through as a future-proofing slot — A2 does not yet
+/// expose extra args from the modal, but reserving the field now avoids
+/// a trait churn when a later milestone wires per-backend launch flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSessionRequest {
+    /// Absolute path of the project directory the agent should `cd` into.
+    pub project_dir: String,
+    /// Backend identifier — must match one of the names in
+    /// [`la_proto::methods::ServerCapabilities::adapters`].
+    pub backend: String,
+    /// Extra args appended to the adapter's base command. Empty until a
+    /// later milestone surfaces an args buffer in the modal.
+    pub args: Vec<String>,
+    /// Initial prompt to push to stdin once the first prompt loop is
+    /// ready. Empty string is rejected by [`SourceError::Validation`] —
+    /// the daemon also rejects it but failing in the TUI keeps the round
+    /// trip out of the hot path.
+    pub prompt: String,
+    /// If true, create a fresh git worktree for this session.
+    pub worktree: bool,
+}
+
+/// Reason [`SessionSource::create_session`] refused.
+///
+/// Split into two arms so the calling [`crate::app::App`] can decide
+/// whether to keep the modal open (for a validation slip the user can
+/// correct in place) or close it and surface a toast (for a backend /
+/// daemon failure the user cannot fix from the modal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceError {
+    /// Caller-side validation failed — empty prompt, missing backend
+    /// list, etc. Modal stays open so the user can correct the input.
+    Validation(String),
+    /// Daemon / IPC layer refused or the round-trip failed. Modal
+    /// closes; the message is surfaced via the status toast.
+    Backend(String),
+}
+
+impl fmt::Display for SourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SourceError::Validation(s) => write!(f, "{s}"),
+            SourceError::Backend(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl SourceError {
+    /// True for [`SourceError::Validation`] — callers use this to keep
+    /// the modal open after a refused Confirm.
+    pub fn is_validation(&self) -> bool {
+        matches!(self, SourceError::Validation(_))
+    }
+}
 
 /// Read/mutate the session view shown in the sidebar.
 ///
@@ -53,6 +138,16 @@ pub trait SessionSource {
     /// `discovered` flag so the snapshot moves it back under its
     /// originating project. No-op for unknown / already-imported ids.
     fn import_discovered(&mut self, _session_id: &str) {}
+
+    /// Spawn a new session against the given backend + project dir.
+    ///
+    /// Returns the daemon-assigned [`SessionId`] on success. The mock
+    /// impl synthesises a deterministic id (`mock-N`) and inserts a
+    /// `RunState::Running` row under the requested project so the
+    /// sidebar reflects the new session on the next snapshot. The
+    /// [`RpcSessionSource`] translates this into a `sessions.create`
+    /// RPC + a follow-up `sessions.list` refresh.
+    fn create_session(&mut self, req: NewSessionRequest) -> Result<SessionId, SourceError>;
 }
 
 /// In-memory `SessionSource` used by tests and the binary's `--demo` mode.
@@ -67,6 +162,13 @@ pub struct MockSessionSource {
     /// rendering. `display_order` carries the deterministic ordering across
     /// snapshots so the sidebar does not jitter on a refresh.
     projects: Vec<ProjectMeta>,
+    /// Monotonic id source for `create_session`. Synthesised id is
+    /// `mock-<n>` so tests can assert deterministic shapes without
+    /// dragging in a uuid dependency on the mock.
+    next_create_id: u64,
+    /// Tape of every `create_session` call, captured for unit tests
+    /// that pin the UI ↔ trait wire-up.
+    created: Vec<NewSessionRequest>,
 }
 
 struct ProjectMeta {
@@ -80,7 +182,16 @@ impl MockSessionSource {
         Self {
             rows: BTreeMap::new(),
             projects: Vec::new(),
+            next_create_id: 0,
+            created: Vec::new(),
         }
+    }
+
+    /// Inspect the tape of [`SessionSource::create_session`] calls. Used
+    /// by unit tests to pin that the modal hands the trait the exact
+    /// fields the user selected.
+    pub fn created(&self) -> &[NewSessionRequest] {
+        &self.created
     }
 
     /// Register a project + its display metadata. Order of registration is
@@ -273,6 +384,49 @@ impl SessionSource for MockSessionSource {
             row.discovered = false;
         }
     }
+
+    fn create_session(&mut self, req: NewSessionRequest) -> Result<SessionId, SourceError> {
+        // Caller-side validation mirrors what the App enforces — keep
+        // the mock honest so a unit test that drives the modal hits the
+        // same gate the production source would.
+        if req.backend.trim().is_empty() {
+            return Err(SourceError::Validation("backend is required".into()));
+        }
+        if req.prompt.trim().is_empty() {
+            return Err(SourceError::Validation("prompt cannot be empty".into()));
+        }
+        // Resolve the project by either its registered id OR its root
+        // path (the modal passes `project_dir` from the sidebar's
+        // `root_path`). Falling back to the id keeps `MockSessionSource`
+        // tests that pre-register a project with `add_project(id, …)`
+        // working without forcing them to thread a path.
+        let project_id = self
+            .projects
+            .iter()
+            .find(|p| p.root_path == req.project_dir || p.project_id == req.project_dir)
+            .map(|p| p.project_id.clone())
+            .ok_or_else(|| {
+                SourceError::Validation(format!("no project registered for {}", req.project_dir))
+            })?;
+        self.next_create_id += 1;
+        let session_id = format!("mock-{}", self.next_create_id);
+        let row = SessionRow {
+            session_id: session_id.clone(),
+            project_id,
+            backend: Backend::new(&req.backend),
+            title: if req.prompt.trim().is_empty() {
+                None
+            } else {
+                Some(req.prompt.lines().next().unwrap_or_default().to_string())
+            },
+            run_state: RunState::Running,
+            archived: false,
+            discovered: false,
+        };
+        self.rows.insert(session_id.clone(), row);
+        self.created.push(req);
+        Ok(SessionId(session_id))
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +506,71 @@ mod tests {
         src.add_project("p1", "p1", "/p1");
         src.add_session("s1", "p1", "claude", None, RunState::Idle);
         src.delete("s1");
+        assert_eq!(src.snapshot()[0].sessions.len(), 0);
+    }
+
+    #[test]
+    fn create_session_inserts_row_under_resolved_project() {
+        let mut src = MockSessionSource::new();
+        src.add_project("proj-a", "proj-a", "/home/me/code/proj-a");
+        let id = src
+            .create_session(NewSessionRequest {
+                project_dir: "/home/me/code/proj-a".into(),
+                backend: "claude".into(),
+                args: Vec::new(),
+                prompt: "hello".into(),
+                worktree: false,
+            })
+            .expect("create ok");
+        assert!(id.as_str().starts_with("mock-"));
+        let snap = src.snapshot();
+        let proj = snap
+            .iter()
+            .find(|g| g.project_id == "proj-a")
+            .expect("project group");
+        assert_eq!(proj.sessions.len(), 1);
+        assert_eq!(proj.sessions[0].session_id, id.as_str());
+        assert_eq!(proj.sessions[0].backend.id(), "claude");
+        assert_eq!(proj.sessions[0].title.as_deref(), Some("hello"));
+        // create() also resolves a project by its registered id, so a
+        // caller threading the project_id (as the App does when the
+        // sidebar root_path is empty) still works.
+        let id2 = src
+            .create_session(NewSessionRequest {
+                project_dir: "proj-a".into(),
+                backend: "codex".into(),
+                args: Vec::new(),
+                prompt: "second".into(),
+                worktree: true,
+            })
+            .expect("create ok via project id");
+        assert_eq!(id2.as_str(), "mock-2");
+        assert_eq!(src.created().len(), 2);
+        assert!(src.created()[1].worktree);
+    }
+
+    #[test]
+    fn create_session_rejects_empty_prompt_and_unknown_project() {
+        let mut src = MockSessionSource::new();
+        src.add_project("proj-a", "proj-a", "/p/a");
+        let empty_prompt = src.create_session(NewSessionRequest {
+            project_dir: "/p/a".into(),
+            backend: "claude".into(),
+            args: Vec::new(),
+            prompt: "   ".into(),
+            worktree: false,
+        });
+        assert!(matches!(empty_prompt, Err(SourceError::Validation(_))));
+        let unknown = src.create_session(NewSessionRequest {
+            project_dir: "/nope".into(),
+            backend: "claude".into(),
+            args: Vec::new(),
+            prompt: "hi".into(),
+            worktree: false,
+        });
+        assert!(matches!(unknown, Err(SourceError::Validation(_))));
+        // Nothing was inserted.
+        assert!(src.created().is_empty());
         assert_eq!(src.snapshot()[0].sessions.len(), 0);
     }
 }

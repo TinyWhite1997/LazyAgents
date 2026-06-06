@@ -1129,22 +1129,8 @@ fn render_modal(
             )));
             frame.render_widget(Paragraph::new(lines), inner);
         }
-        Modal::NewSession { project_id } => {
-            let area = centered(full, 60, 9);
-            frame.render_widget(Clear, area);
-            let body_text = format!(
-                "New session in project {project_id}\n\nBackend chooser lands with the daemon (M1.7).\nFor now this modal acknowledges the key binding so the\nUI path is reviewable.\n\n[⏎] close   [Esc] cancel"
-            );
-            let para = Paragraph::new(body_text)
-                .style(Style::default().fg(body))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("New session")
-                        .border_style(Style::default().fg(primary)),
-                )
-                .wrap(Wrap { trim: false });
-            frame.render_widget(para, area);
+        Modal::NewSession(draft) => {
+            render_new_session_modal(frame, full, draft, body, muted, primary, warn, err);
         }
         Modal::ConfirmEnableCron {
             cron_name,
@@ -1272,6 +1258,153 @@ fn centered(parent: Rect, width: u16, height: u16) -> Rect {
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
+}
+
+/// Render the WEK-94 / A2 New-session modal: backend picker + prompt
+/// buffer + worktree toggle, all driven from
+/// [`crate::app::NewSessionDraft`].
+#[allow(clippy::too_many_arguments)]
+fn render_new_session_modal(
+    frame: &mut Frame,
+    full: Rect,
+    draft: &crate::app::NewSessionDraft,
+    body: ratatui::style::Color,
+    muted: ratatui::style::Color,
+    primary: ratatui::style::Color,
+    warn: ratatui::style::Color,
+    err: ratatui::style::Color,
+) {
+    use crate::app::NewSessionField;
+    let area = centered(full, 72, 18);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            "New session — project {} {}",
+            draft.project_id,
+            if draft.project_dir.is_empty() {
+                "".to_string()
+            } else {
+                format!("({})", draft.project_dir)
+            }
+        ))
+        .border_style(Style::default().fg(primary));
+    frame.render_widget(block, area);
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // --- Backend row ----------------------------------------------------
+    let backend_focus = matches!(draft.field, NewSessionField::Backend);
+    let backend_label_style = if backend_focus {
+        Style::default().fg(primary).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(muted)
+    };
+    let mut backend_spans = vec![Span::styled("Backend  ", backend_label_style)];
+    if draft.backends.is_empty() {
+        backend_spans.push(Span::styled(
+            "(no available backend — start a backend first)",
+            Style::default().fg(err),
+        ));
+    } else {
+        for (i, b) in draft.backends.iter().enumerate() {
+            let style = if i == draft.backend_idx {
+                Style::default().fg(body).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(body)
+            };
+            backend_spans.push(Span::styled(format!(" {b} "), style));
+        }
+        if backend_focus {
+            backend_spans.push(Span::styled(
+                "   ←/→",
+                Style::default().fg(muted).add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+    lines.push(Line::from(backend_spans));
+    lines.push(Line::from(""));
+
+    // --- Prompt block ---------------------------------------------------
+    let prompt_focus = matches!(draft.field, NewSessionField::Prompt);
+    let prompt_label_style = if prompt_focus {
+        Style::default().fg(primary).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(muted)
+    };
+    lines.push(Line::from(vec![Span::styled(
+        "Prompt   ",
+        prompt_label_style,
+    )]));
+    if draft.prompt.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (type the prompt sent to the agent on start — Enter inserts a newline)",
+            Style::default().fg(muted).add_modifier(Modifier::DIM),
+        )));
+    } else {
+        for raw in draft.prompt.split('\n') {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(raw.to_string(), Style::default().fg(body)),
+            ]));
+        }
+    }
+    if prompt_focus {
+        // Cursor caret so the user sees where their next char lands.
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                "▌",
+                Style::default().fg(primary).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // --- Worktree toggle ------------------------------------------------
+    let wt_focus = matches!(draft.field, NewSessionField::Worktree);
+    let wt_label_style = if wt_focus {
+        Style::default().fg(primary).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(muted)
+    };
+    let wt_value = if draft.worktree { "[x]" } else { "[ ]" };
+    let mut wt_spans = vec![
+        Span::styled("Worktree ", wt_label_style),
+        Span::styled(
+            format!(" {wt_value} fresh git worktree for this session"),
+            Style::default().fg(body),
+        ),
+    ];
+    if wt_focus {
+        wt_spans.push(Span::styled(
+            "   space",
+            Style::default().fg(muted).add_modifier(Modifier::DIM),
+        ));
+    }
+    lines.push(Line::from(wt_spans));
+
+    // --- Error row (sticky) --------------------------------------------
+    if let Some(e) = draft.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("⚠ {e}"),
+            Style::default().fg(err).add_modifier(Modifier::BOLD),
+        )]));
+    }
+
+    // --- Hint row -------------------------------------------------------
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "[Tab] next field  [⇧Tab] prev  [Ctrl+⏎] create  [Esc] cancel",
+        Style::default().fg(warn).add_modifier(Modifier::DIM),
+    )]));
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// Convenience for callers that want to send a synthetic key event in

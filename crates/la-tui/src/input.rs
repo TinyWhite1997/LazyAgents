@@ -233,6 +233,11 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
             _ => AppMsg::ToggleCompact,
         });
     }
+    // WEK-94 / A2: NewSession owns its own field-edit routing — handled
+    // up-front so the closed-form match below can stay one-msg-per-arm.
+    if let Modal::NewSession(draft) = modal {
+        return translate_new_session_key(code, mods, draft);
+    }
     Some(match modal {
         Modal::ConfirmDelete { .. } => match code {
             KeyCode::Char('y') | KeyCode::Enter => AppMsg::Confirm,
@@ -244,11 +249,7 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
             KeyCode::Esc | KeyCode::Char('q') => AppMsg::Cancel,
             _ => return None,
         },
-        Modal::NewSession { .. } => match code {
-            KeyCode::Enter => AppMsg::Confirm,
-            KeyCode::Esc => AppMsg::Cancel,
-            _ => return None,
-        },
+        Modal::NewSession(_) => unreachable!("handled above"),
         Modal::ConfirmEnableCron { .. } | Modal::ConfirmDeleteCron { .. } => match code {
             KeyCode::Char('y') | KeyCode::Enter => AppMsg::Confirm,
             KeyCode::Char('n') | KeyCode::Esc => AppMsg::Cancel,
@@ -265,6 +266,64 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
             _ => return None,
         },
     })
+}
+
+/// Modal-key translator for [`Modal::NewSession`]. Split out of
+/// [`translate_modal_key`] because the form has its own field-edit
+/// matrix that doesn't fit the simple "one keystroke → confirm/cancel"
+/// shape used by the other modals.
+fn translate_new_session_key(
+    code: KeyCode,
+    mods: KeyModifiers,
+    draft: &crate::app::NewSessionDraft,
+) -> Option<AppMsg> {
+    use crate::app::NewSessionField;
+    // Ctrl+Enter unconditionally confirms — gives the user one
+    // unambiguous "create" gesture even when the prompt field is
+    // focused (where plain Enter inserts a newline).
+    if let KeyCode::Enter = code {
+        if mods.contains(KeyModifiers::CONTROL) {
+            return Some(AppMsg::Confirm);
+        }
+        if draft.field == NewSessionField::Prompt {
+            return Some(AppMsg::NewSessionPromptNewline);
+        }
+        return Some(AppMsg::Confirm);
+    }
+    match code {
+        KeyCode::Esc => Some(AppMsg::Cancel),
+        KeyCode::Tab => Some(AppMsg::NewSessionFocusNext),
+        KeyCode::BackTab => Some(AppMsg::NewSessionFocusPrev),
+        // ←/→ + Space + Backspace are translated unconditionally so
+        // the `?` overlay's hint list survives the cross-check in
+        // `every_advertised_modal_key_is_translatable`. The App's
+        // `try_apply_new_session_field` is the authority on which
+        // field actually reacts.
+        KeyCode::Left => Some(AppMsg::NewSessionBackendPrev),
+        KeyCode::Right => Some(AppMsg::NewSessionBackendNext),
+        KeyCode::Char(' ') if draft.field != NewSessionField::Prompt => {
+            // Space cycles the worktree flag from the Worktree row; on
+            // the Backend row it's a no-op at the App level (so the
+            // hint can advertise "Space" unconditionally and the
+            // `every_advertised_modal_key_is_translatable` cross-check
+            // keeps passing). On the Prompt row Space is a literal
+            // character — fall through to the printable-char arm.
+            Some(AppMsg::NewSessionToggleWorktree)
+        }
+        KeyCode::Backspace if draft.field == NewSessionField::Prompt => {
+            Some(AppMsg::NewSessionPromptBackspace)
+        }
+        KeyCode::Char(c) if draft.field == NewSessionField::Prompt => {
+            // Filter control-modified printable chars so chords like
+            // Ctrl+S don't sneak into the buffer. Ctrl+C was already
+            // intercepted at the top of `translate_modal_key`.
+            if mods.contains(KeyModifiers::CONTROL) {
+                return None;
+            }
+            Some(AppMsg::NewSessionPromptChar(c))
+        }
+        _ => None,
+    }
 }
 
 fn translate_mouse(event: crossterm::event::MouseEvent, hit: &HitBoxes) -> Option<AppMsg> {

@@ -162,12 +162,17 @@ impl HintRegistry {
                 Hint::new("n / Esc", "cancel", Importance::High),
             ],
             Modal::FullHints => vec![Hint::new("Esc / ?", "close", Importance::Primary)],
-            Modal::NewSession { .. } => vec![
-                Hint::new("⏎", "create", Importance::Primary),
+            Modal::NewSession(_) => vec![
+                // WEK-94 / A2: hints stay in sync with the live key
+                // routing in input::translate_modal_key. The advertised
+                // keys are exactly the ones the input layer translates
+                // for the modal — PRD §5.6 第 3 条 (hint == 真实绑定)
+                // is checked by `every_advertised_modal_key_is_translatable`.
+                Hint::new("Ctrl+⏎", "create", Importance::Primary),
+                Hint::new("Tab", "next field", Importance::High),
                 Hint::new("Esc", "cancel", Importance::High),
-                // PRD §5.6 第 3 条: hint 必须 == 当前真实绑定。Tab/Backend
-                // 选择在 M1.7 落 daemon 之前没有 handler，所以这里**不**
-                // advertise — 等 backend chooser 上线再加回来。
+                Hint::new("←/→", "backend", Importance::Medium),
+                Hint::new("Space", "worktree", Importance::Medium),
             ],
             Modal::ConfirmEnableCron { .. } => vec![
                 Hint::new("y", "enable cron", Importance::Primary),
@@ -478,9 +483,11 @@ mod tests {
                 session_id: "s1".into(),
             },
             Modal::FullHints,
-            Modal::NewSession {
-                project_id: "p1".into(),
-            },
+            Modal::NewSession(crate::app::NewSessionDraft::new(
+                "p1".into(),
+                "/p1".into(),
+                vec!["claude".into()],
+            )),
             Modal::ConfirmEnableCron {
                 cron_id: "c1".into(),
                 cron_name: "n".into(),
