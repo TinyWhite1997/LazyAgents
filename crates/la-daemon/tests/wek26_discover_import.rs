@@ -93,12 +93,7 @@ async fn client(socket: &std::path::Path) -> Connection<StreamPair> {
     conn
 }
 
-async fn call<T, R>(
-    conn: &mut Connection<StreamPair>,
-    id: i64,
-    method: &str,
-    params: T,
-) -> R
+async fn call<T, R>(conn: &mut Connection<StreamPair>, id: i64, method: &str, params: T) -> R
 where
     T: serde::Serialize,
     R: serde::de::DeserializeOwned,
@@ -132,8 +127,8 @@ fn write_codex_fixture(root: &std::path::Path, project_a: &std::path::Path) -> P
     let path = day.join("rollout-019e0000-0000-0000-0000-000000000aaa.jsonl");
     // serde_json::to_string handles backslash + quote escaping so the
     // Windows path form (`C:\Users\...`) embeds as a valid JSON string.
-    let cwd_lit = serde_json::to_string(&project_a.to_string_lossy().into_owned())
-        .expect("encode cwd");
+    let cwd_lit =
+        serde_json::to_string(&project_a.to_string_lossy().into_owned()).expect("encode cwd");
     std::fs::write(
         &path,
         format!(

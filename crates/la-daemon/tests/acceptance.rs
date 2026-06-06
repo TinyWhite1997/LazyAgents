@@ -603,12 +603,7 @@ async fn recv_response_for(
     }
 }
 
-async fn call<T, R>(
-    conn: &mut Connection<StreamPair>,
-    id: i64,
-    method: &str,
-    params: T,
-) -> R
+async fn call<T, R>(conn: &mut Connection<StreamPair>, id: i64, method: &str, params: T) -> R
 where
     T: serde::Serialize,
     R: serde::de::DeserializeOwned,

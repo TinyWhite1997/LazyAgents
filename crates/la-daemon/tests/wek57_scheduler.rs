@@ -292,10 +292,7 @@ fn rand_id() -> i64 {
 /// `enabled = true`. Most tests in this file do not exercise the token
 /// state machine itself — they just need an enabled cron — so this
 /// helper hides the round trip.
-async fn enable_cron(
-    conn: &mut Connection<StreamPair>,
-    cron_id: &str,
-) -> CronsSetEnabledResult {
+async fn enable_cron(conn: &mut Connection<StreamPair>, cron_id: &str) -> CronsSetEnabledResult {
     let first: CronsSetEnabledResult = call(
         conn,
         "crons.set_enabled",
