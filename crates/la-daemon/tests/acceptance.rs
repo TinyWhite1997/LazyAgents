@@ -16,14 +16,18 @@
 //! when `LAD_BIN` is unset so PR CI doesn't depend on `cargo build`
 //! having been run first.
 
-// Every fixture in this file uses the daemon's UDS path
-// (`tokio::net::UnixStream`). The Windows named-pipe path is exercised
-// by separate tests; gating the whole file to unix keeps the WEK-72
-// matrix CI green on windows-2022.
-#![cfg(unix)]
+// Talks to the daemon over the cross-platform IPC harness from
+// la_ipc::transport (UDS on Unix, Named Pipe on Windows). Tests that
+// drive `ShellAdapter` (a sh-script PTY child), fork via the `lad`
+// binary, send POSIX signals, or assert POSIX mode bits are gated
+// per-fn with `#[cfg(unix)]`. The ProbeOnly-adapter tests (M2.6 /
+// WEK-29 grey-state checks, WEK-36 cron delivery) run tri-OS.
+
+mod support;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +36,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use la_adapter::{AdapterDescriptor, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec};
 use la_daemon::{Daemon, DaemonConfig, SocketDiscovery};
-use la_ipc::transport::{connect, Endpoint};
+use la_ipc::transport::{connect, endpoint_for, StreamPair};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
 use la_proto::methods::{
@@ -50,10 +54,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Adapter that runs a temporary executable script. Avoids needing a real
 /// claude CLI inside CI without bypassing the shell-wrapper spawn guard.
+///
+/// Unix-only: writes a `#!/bin/sh` script and chmod 0o700. The Windows
+/// equivalent would need a Win32-portable scripted PTY child; the
+/// ShellAdapter-driven tests are gated `#[cfg(unix)]` to match.
+#[cfg(unix)]
 struct ShellAdapter {
     script: String,
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl AgentAdapter for ShellAdapter {
     fn descriptor(&self) -> AdapterDescriptor {
@@ -116,10 +126,12 @@ struct TestDaemon {
     _tempdir: TempDir,
 }
 
+#[cfg(unix)]
 async fn bootstrap_daemon(script: &str) -> TestDaemon {
     bootstrap_daemon_with(script, |_| {}).await
 }
 
+#[cfg(unix)]
 async fn bootstrap_daemon_with(
     script: &str,
     customize: impl FnOnce(&mut DaemonConfig),
@@ -130,7 +142,7 @@ async fn bootstrap_daemon_with(
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
 
-    let socket = runtime_dir.join("lad-1.sock");
+    let socket = support::unique_socket_path(&runtime_dir);
     let adapter: Arc<dyn AgentAdapter> = Arc::new(ShellAdapter {
         script: script.to_string(),
     });
@@ -153,7 +165,7 @@ async fn bootstrap_daemon_with(
     // already returned, but allow the accept loop one tick to spin up).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if connect(&Endpoint::uds(&socket)).await.is_ok() {
+        if connect(&endpoint_for(&socket)).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -191,6 +203,94 @@ async fn metrics_socket_uses_owner_only_permissions() {
         mode, 0o600,
         "main IPC socket must stay 0o600 (was the metrics socket's job before WEK-75)",
     );
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
+/// WEK-84 — Windows DACL sibling to `metrics_socket_uses_owner_only_permissions`.
+///
+/// On Unix the daemon's main socket is asserted at 0o600. The Windows
+/// equivalent owner-only contract lives in the Named Pipe's DACL +
+/// peer-SID verification path delivered by WEK-81 (see
+/// `la_ipc::transport::imp::current_user_sid` / `OwnerOnlySa` /
+/// `verify_peer_is_owner`). Cross-user denial needs a second local
+/// account and is covered by `crates/la-ipc/tests/named_pipe_acl.rs::
+/// cross_user_denied` behind `LA_TEST_WINDOWS_CROSS_USER`. Here we
+/// pin the invariants we can drive without a second user on every
+/// windows-2022 runner:
+///
+/// 1. `Daemon::bind` actually composes the owner-locked `ServerOptions`
+///    chain (first_pipe_instance + reject_remote_clients + owner-only
+///    SD). If any of those drop, bind itself fails.
+/// 2. Same-user `connect().await` succeeds, proving the DACL grants
+///    the owning user GENERIC_ALL.
+/// 3. After accept, the framed handshake round-trips — which means
+///    `verify_peer_is_owner` matched our own SID. A future refactor
+///    that accidentally swapped the cached owner SID for some other
+///    principal would surface here as a `PermissionDenied`.
+/// 4. The pipe name follows the `\\.\pipe\lazyagents-<stem>` mapping
+///    `endpoint_for` derives from the socket-shaped path. Naming drift
+///    between listener and connector would have already broken (2),
+///    but pinning the convention here keeps the assertion visible.
+#[cfg(windows)]
+#[tokio::test]
+async fn metrics_socket_uses_owner_only_dacl_on_windows() {
+    use la_ipc::transport::{endpoint_for, pipe_name_for, Endpoint};
+
+    let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
+    adapters.insert(
+        "codex".to_string(),
+        Arc::new(ProbeOnlyAdapter {
+            id: "codex",
+            probe_result: la_adapter::ProbeResult::Available {
+                version: "0.0".into(),
+            },
+        }),
+    );
+    let daemon = bootstrap_daemon_with_adapters(adapters).await;
+
+    // (1)/(2)/(3): bind already succeeded (bootstrap returned). Open
+    // a client and drive the handshake — that exercises both the
+    // owner-only DACL (CreateFileW would fail with ACCESS_DENIED
+    // otherwise) and `verify_peer_is_owner` on the daemon side.
+    let mut conn = client(&daemon.socket).await;
+    let _: la_proto::methods::SessionsListResult = call(
+        &mut conn,
+        1,
+        "sessions.list",
+        la_proto::methods::SessionsListParams {
+            project: None,
+            backend: None,
+            include_archived: true,
+        },
+    )
+    .await;
+
+    // (4): the pipe name `Daemon::bind` chose is the one
+    // `endpoint_for` would derive from the socket path. If the
+    // daemon ever bypassed `endpoint_for`, the listener and
+    // connector would no longer agree.
+    let ep = endpoint_for(&daemon.socket);
+    match ep {
+        Endpoint::NamedPipe(name) => {
+            let expected = pipe_name_for(&daemon.socket);
+            assert_eq!(
+                name, expected,
+                "endpoint_for must route through pipe_name_for so listener + connector agree",
+            );
+            assert!(
+                name.starts_with(r"\\.\pipe\lazyagents-"),
+                "owner-only daemon pipe must keep the lazyagents- prefix; got {name}",
+            );
+        }
+        Endpoint::Uds(p) => {
+            panic!(
+                "endpoint_for on Windows must return NamedPipe, got Uds({})",
+                p.display()
+            )
+        }
+    }
 
     daemon.handle.shutdown();
     let _ = timeout(Duration::from_secs(15), daemon.join).await;
@@ -461,8 +561,8 @@ async fn metrics_scrape_rpc_and_cli_expose_same_a9_surface() {
     let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
 
-async fn client(socket: &std::path::Path) -> Connection<tokio::net::UnixStream> {
-    let stream = connect(&Endpoint::uds(socket))
+async fn client(socket: &std::path::Path) -> Connection<StreamPair> {
+    let stream = connect(&endpoint_for(socket))
         .await
         .expect("client connect");
     let mut conn = Connection::new(stream);
@@ -474,7 +574,7 @@ async fn client(socket: &std::path::Path) -> Connection<tokio::net::UnixStream> 
 }
 
 async fn send_request<T: serde::Serialize>(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     id: i64,
     method: &str,
     params: T,
@@ -484,7 +584,7 @@ async fn send_request<T: serde::Serialize>(
 }
 
 async fn recv_response_for(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     expected_id: i64,
 ) -> serde_json::Value {
     loop {
@@ -504,7 +604,7 @@ async fn recv_response_for(
 }
 
 async fn call<T, R>(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     id: i64,
     method: &str,
     params: T,
@@ -518,7 +618,7 @@ where
 }
 
 async fn drain_output_until(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     needle: &[u8],
     timeout_duration: Duration,
 ) -> Vec<u8> {
@@ -543,6 +643,7 @@ async fn drain_output_until(
     seen
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn end_to_end_create_and_attach() {
     let project = tempfile::tempdir().expect("project tmp");
@@ -606,6 +707,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+#[cfg(unix)]
 async fn spawn_lad_binary(
     socket: &std::path::Path,
     state_dir: &std::path::Path,
@@ -629,7 +731,7 @@ async fn spawn_lad_binary(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
-        if connect(&Endpoint::uds(socket)).await.is_ok() {
+        if connect(&endpoint_for(socket)).await.is_ok() {
             return child;
         }
         if let Some(status) = child.try_wait().expect("poll lad") {
@@ -641,6 +743,7 @@ async fn spawn_lad_binary(
     panic!("lad socket did not become ready at {}", socket.display());
 }
 
+#[cfg(unix)]
 fn stop_child(child: &mut Child) {
     if child.try_wait().expect("poll child").is_none() {
         let _ = child.kill();
@@ -659,6 +762,8 @@ fn kill_pid(pid: i32, signal: i32) {
     }
 }
 
+// Unix-only: forks the `lad` binary and asserts on POSIX signal lifecycle.
+#[cfg(unix)]
 #[tokio::test]
 async fn lad_binary_m1_end_to_end_lifecycle() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1053,6 +1158,9 @@ done
     stop_child(&mut lad);
 }
 
+// Unix-only: forks the `lad` binary and uses POSIX kill/9 to model an
+// externally-reaped child.
+#[cfg(unix)]
 #[tokio::test]
 async fn lad_binary_restart_reaps_orphaned_session_rows() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1127,6 +1235,8 @@ async fn lad_binary_restart_reaps_orphaned_session_rows() {
     stop_child(&mut second);
 }
 
+// Unix-only: uses ShellAdapter (sh-script PTY child).
+#[cfg(unix)]
 #[tokio::test]
 async fn two_daemons_with_distinct_versions_coexist() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1157,8 +1267,8 @@ async fn two_daemons_with_distinct_versions_coexist() {
     let (sock_b, handle_b, join_b) = make("2", tempdir.path().to_path_buf()).await;
 
     // Both sockets are reachable independently.
-    let stream_a = connect(&Endpoint::uds(&sock_a)).await.expect("connect a");
-    let stream_b = connect(&Endpoint::uds(&sock_b)).await.expect("connect b");
+    let stream_a = connect(&endpoint_for(&sock_a)).await.expect("connect a");
+    let stream_b = connect(&endpoint_for(&sock_b)).await.expect("connect b");
     drop(stream_a);
     drop(stream_b);
 
@@ -1170,6 +1280,7 @@ async fn two_daemons_with_distinct_versions_coexist() {
     assert!(!sock_b.exists(), "socket b should be unlinked on shutdown");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cron_fired_notification_path_survives_tui_disconnect() {
     let daemon = bootstrap_daemon("sleep 1").await;
@@ -1246,6 +1357,7 @@ async fn cron_fired_notification_path_survives_tui_disconnect() {
     let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn shutdown_signals_live_sessions_within_deadline() {
     let project = tempfile::tempdir().expect("project tmp");
@@ -1284,6 +1396,8 @@ async fn shutdown_signals_live_sessions_within_deadline() {
 /// fail because the daemon ran two sequential 10 s windows — one for
 /// connection drain, one for session drain — so the SIGKILL escalation
 /// landed at ~20 s instead of within the §6.4 budget.
+// Unix-only: relies on POSIX SIGTERM/SIGKILL escalation semantics.
+#[cfg(unix)]
 #[tokio::test]
 async fn shutdown_kills_term_ignoring_child_within_hard_cap() {
     let project = tempfile::tempdir().expect("project tmp");
@@ -1327,6 +1441,7 @@ async fn shutdown_kills_term_ignoring_child_within_hard_cap() {
 /// (OOM killer, user kill -9, terminal crash). The output pump must observe
 /// the waiter exit, persist an `exited` state, drop the runtime, and keep the
 /// daemon responsive for later RPCs.
+#[cfg(unix)]
 #[tokio::test]
 async fn chaos_external_child_kill_exits_session_without_crashing_daemon() {
     let project = tempfile::tempdir().expect("project tmp");
@@ -1407,6 +1522,7 @@ async fn chaos_external_child_kill_exits_session_without_crashing_daemon() {
 
 /// WEK-38 / Story 3: closing a TUI is just an IPC disconnect. It must not
 /// stop the daemon-owned session runtime or the daemon-level cron event path.
+#[cfg(unix)]
 #[tokio::test]
 async fn chaos_ipc_disconnect_keeps_session_and_cron_events_alive() {
     let project = tempfile::tempdir().expect("project tmp");
@@ -1490,6 +1606,7 @@ async fn chaos_ipc_disconnect_keeps_session_and_cron_events_alive() {
 /// crashing the daemon process or poisoning unrelated IPC paths. Closing the
 /// test-owned pools is a deterministic CI-safe fault injection for the same
 /// error class as a transient SQLite I/O outage.
+#[cfg(unix)]
 #[tokio::test]
 async fn chaos_sqlite_io_error_surfaces_without_crashing_daemon() {
     let daemon = bootstrap_daemon("sleep 120").await;
@@ -1546,6 +1663,7 @@ async fn chaos_sqlite_io_error_surfaces_without_crashing_daemon() {
 /// SIGKILL escalation, which pushed the wall-clock to ~11 s on CI.
 /// Shrink the sweep interval so the loop is actively running, then
 /// shut down and assert the join completes well under the ceiling.
+#[cfg(unix)]
 #[tokio::test]
 async fn shutdown_finishes_within_cap_with_active_worktree_sweep_loop() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1683,6 +1801,7 @@ fn lad_daemonize_binary_smoke() {
 ///      - `seq` values are contiguous (no gap),
 ///      - no `session.gap` notification arrives,
 ///      - the catch-up bytes pick up where the first attach left off.
+#[cfg(unix)]
 #[tokio::test]
 async fn reattach_with_resume_from_seq_catches_up_without_double_delivery() {
     let project = tempfile::tempdir().expect("project tmp");
@@ -1869,6 +1988,7 @@ async fn reattach_with_resume_from_seq_catches_up_without_double_delivery() {
 ///   5. Assert: the first observed `seq` is strictly greater than the
 ///      `snapshot_seq` echoed in the attach response. If the daemon were
 ///      ring-replaying on `None`, we would instead see `seq <= snapshot_seq`.
+#[cfg(unix)]
 #[tokio::test]
 async fn first_attach_with_none_resume_is_live_only_no_ring_replay() {
     let project = tempfile::tempdir().expect("project tmp");
@@ -1992,7 +2112,7 @@ async fn bootstrap_daemon_with_adapters(
     let state_dir = tempdir.path().join("state");
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
-    let socket = runtime_dir.join("lad-1.sock");
+    let socket = support::unique_socket_path(&runtime_dir);
     let config = DaemonConfig {
         state_dir,
         socket_discovery: SocketDiscovery::with_override(socket.clone()),
@@ -2010,7 +2130,7 @@ async fn bootstrap_daemon_with_adapters(
     let (handle, join) = daemon.spawn();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if connect(&Endpoint::uds(&socket)).await.is_ok() {
+        if connect(&endpoint_for(&socket)).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2055,7 +2175,7 @@ async fn wait_for_health_snapshot(socket: &std::path::Path, expected_backends: u
 }
 
 async fn recv_error_for(
-    conn: &mut la_ipc::Connection<tokio::net::UnixStream>,
+    conn: &mut la_ipc::Connection<StreamPair>,
     expected_id: i64,
 ) -> la_proto::jsonrpc::RpcError {
     loop {
@@ -2076,6 +2196,9 @@ async fn recv_error_for(
     }
 }
 
+// Unix-only: the negative-control branch uses ShellAdapter to drive
+// the healthy-backend half of the assertion.
+#[cfg(unix)]
 #[tokio::test]
 async fn sessions_create_refuses_uninstalled_backend_with_business_code() {
     // Two adapters: a `codex` stand-in that probes NotInstalled, and a
@@ -2284,7 +2407,7 @@ async fn events_subscribe_immediately_pushes_cached_daemon_health_snapshot() {
     let state_dir = tempdir.path().join("state");
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
-    let socket = runtime_dir.join("lad-1.sock");
+    let socket = support::unique_socket_path(&runtime_dir);
     let config = DaemonConfig {
         state_dir,
         socket_discovery: SocketDiscovery::with_override(socket.clone()),
@@ -2300,7 +2423,7 @@ async fn events_subscribe_immediately_pushes_cached_daemon_health_snapshot() {
     let (handle, join) = daemon.spawn();
     let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < bootstrap_deadline {
-        if connect(&Endpoint::uds(&socket)).await.is_ok() {
+        if connect(&endpoint_for(&socket)).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
