@@ -1204,10 +1204,16 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
         }
         // Resolve the on-disk root for the project so the daemon
         // receives a real `project_dir`. Sidebar groups keep it in
-        // `root_path`; an empty string is allowed (the Mock source
-        // resolves the project by id instead, and the Rpc source
-        // bubbles up a friendly Validation error if the daemon needs
-        // a real path).
+        // `root_path`; when empty (the Rpc source can land here when
+        // the underlying session has no `worktree_path` — that's the
+        // common shape for non-worktree sessions, see
+        // la-core/src/manager.rs) we MUST NOT fall back to the
+        // project_id because the daemon's `sessions.create` interprets
+        // `project_dir` as a filesystem path and would either create a
+        // bogus project under that UUID string or refuse the spawn
+        // outright (review fix on PR #86: WEK-94 blocker). Keep the
+        // value empty so Confirm hits the `project_dir is missing`
+        // Validation branch and the user sees a precise error.
         let project_dir = self
             .sidebar
             .groups()
@@ -1228,14 +1234,9 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             .filter(|b| !b.is_unavailable())
             .map(|b| b.id.clone())
             .collect();
-        let project_dir_fallback = if project_dir.is_empty() {
-            project_id.clone()
-        } else {
-            project_dir
-        };
         self.modal = Some(Modal::NewSession(NewSessionDraft::new(
             project_id,
-            project_dir_fallback,
+            project_dir,
             backends,
         )));
     }
@@ -1627,6 +1628,72 @@ mod tests {
             .map(|t| t.contains("no available backend"))
             .unwrap_or(false));
         assert!(a.source().created().is_empty());
+    }
+
+    #[test]
+    fn empty_root_path_blocks_confirm_and_does_not_call_create() {
+        // WEK-94 / PR #86 review (Code Reviewer blocker): the Rpc source
+        // can land sessions whose `worktree_path` is None, which
+        // surfaces in the sidebar as a `ProjectGroup` with an empty
+        // `root_path`. The earlier draft fell back to `project_id`
+        // (commonly a UUID under the Rpc source) as `project_dir`,
+        // which the daemon would either turn into a bogus project under
+        // that UUID string or fail to spawn entirely. The fix is to
+        // keep `project_dir` empty so the Confirm path hits the
+        // `project directory missing` Validation arm before any RPC.
+        //
+        // Build a source whose project has a registered id but an
+        // empty `root_path` so the live Rpc shape is faithfully
+        // reproduced — the App treats both sources identically.
+        let mut src = MockSessionSource::new();
+        src.add_project("proj-a-uuid", "proj-a", "");
+        src.add_session(
+            "s1",
+            "proj-a-uuid",
+            "claude",
+            None,
+            crate::model::RunState::Idle,
+        );
+        let mut a = App::new(src);
+        use la_proto::notifications::BackendHealthStatus;
+        a.handle(AppMsg::BackendsUpdate(vec![BackendBadge {
+            id: "claude".into(),
+            display_name: "Claude".into(),
+            status: BackendHealthStatus::Available,
+            reason: None,
+            docs_url: None,
+            version: Some("2.1".into()),
+        }]));
+        a.handle(AppMsg::NewSession);
+        let Some(Modal::NewSession(ref draft)) = a.modal else {
+            panic!("expected NewSession modal, got {:?}", a.modal);
+        };
+        assert_eq!(
+            draft.project_dir, "",
+            "empty root_path must NOT fall back to project_id — that would smuggle a UUID into `sessions.create.project_dir`"
+        );
+        // Type a real prompt so the only blocker left is project_dir.
+        a.handle(AppMsg::NewSessionFocusNext);
+        for c in "go".chars() {
+            a.handle(AppMsg::NewSessionPromptChar(c));
+        }
+        a.handle(AppMsg::Confirm);
+        let Some(Modal::NewSession(ref draft)) = a.modal else {
+            panic!("modal must stay open on Validation refusal");
+        };
+        assert!(
+            draft
+                .error
+                .as_deref()
+                .map(|e| e.contains("project directory"))
+                .unwrap_or(false),
+            "expected project_directory Validation error, got {:?}",
+            draft.error
+        );
+        assert!(
+            a.source().created().is_empty(),
+            "create_session must NOT be called when project_dir is empty"
+        );
     }
 
     #[test]
