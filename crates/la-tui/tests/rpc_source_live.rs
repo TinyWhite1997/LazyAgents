@@ -26,9 +26,9 @@ use la_ipc::{server_handshake, Connection};
 use la_proto::jsonrpc::{Message, Response};
 use la_proto::methods::{
     Method, ServerCapabilities, SessionState, SessionSummary, SessionsArchive,
-    SessionsArchiveResult, SessionsList, SessionsListResult,
+    SessionsArchiveResult, SessionsCreate, SessionsList, SessionsListResult,
 };
-use la_tui::source::RpcSessionSource;
+use la_tui::source::{NewSessionRequest, RpcSessionSource, SourceError};
 use la_tui::SessionSource;
 use tokio::sync::Mutex;
 
@@ -259,5 +259,104 @@ async fn snapshot_returns_empty_when_daemon_is_offline() {
         snap.is_empty(),
         "expected empty snapshot for offline daemon, got {snap:?}"
     );
+    drop(dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_session_times_out_when_daemon_never_replies() {
+    // WEK-94 / PR #86 review: a wedged daemon (socket open, sessions.list
+    // works, sessions.create stalls) must NOT freeze the TUI. The
+    // RpcSessionSource::create_session call has to give up after a
+    // bounded wait so the modal can close with a Backend toast and the
+    // user can hit `Esc`. This test stands up a stub that completes
+    // the initial sessions.list (so the source is "healthy") but then
+    // silently drops the sessions.create request, and asserts the
+    // synchronous trait call returns Err(SourceError::Backend(...))
+    // referencing "timed out" within the override window.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("lad-rpc-src-4.sock");
+    let listener = Listener::bind(&Endpoint::uds(&socket))
+        .await
+        .expect("bind stub");
+
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.expect("accept");
+        let mut conn = Connection::new(stream);
+        handshake_stub(&mut conn).await;
+        loop {
+            let msg = match conn.recv().await {
+                Ok(Some(m)) => m,
+                _ => return,
+            };
+            let req = match msg {
+                Message::Request(r) => r,
+                _ => continue,
+            };
+            match req.method.as_str() {
+                m if m == SessionsList::NAME => {
+                    let resp = Response::success(
+                        req.id,
+                        &SessionsListResult {
+                            sessions: vec![make_summary("s1", "proj-a", SessionState::Running)],
+                        },
+                    )
+                    .expect("encode list");
+                    conn.send(&Message::Response(resp))
+                        .await
+                        .expect("send list");
+                }
+                m if m == SessionsCreate::NAME => {
+                    // Intentionally drop the request — never reply.
+                    // The TUI thread should time out, not wedge.
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let mut source = RpcSessionSource::connect(&socket);
+    // 800 ms override is long enough to be insensitive to scheduler
+    // jitter on loaded CI, short enough to keep the test well under
+    // 1 s of wall-clock.
+    source.set_create_timeout(Duration::from_millis(800));
+    let result = tokio::task::spawn_blocking(move || {
+        // Make sure the initial sessions.list landed so we know the
+        // bg loop is healthy and the timeout is exercising the create
+        // path, not a stuck handshake.
+        assert!(
+            source.wait_for_first_snapshot(Duration::from_secs(5)),
+            "first sessions.list never landed"
+        );
+        let started = Instant::now();
+        let res = source.create_session(NewSessionRequest {
+            project_dir: "/tmp/proj-a".into(),
+            backend: "claude".into(),
+            args: Vec::new(),
+            prompt: "hello".into(),
+            worktree: false,
+        });
+        (res, started.elapsed())
+    })
+    .await
+    .expect("blocking join");
+
+    let (res, elapsed) = result;
+    let err = res.expect_err("create_session must surface a Backend error on timeout");
+    match err {
+        SourceError::Backend(msg) => {
+            assert!(
+                msg.contains("timed out"),
+                "expected timeout reason in Backend error, got {msg:?}"
+            );
+        }
+        other => panic!("expected SourceError::Backend, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "create_session returned in {elapsed:?}, expected to honour the override"
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    let _ = std::fs::remove_file(&socket);
     drop(dir);
 }
