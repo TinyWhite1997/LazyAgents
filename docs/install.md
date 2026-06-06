@@ -165,6 +165,16 @@ status:         no daemon listening
 
 That last line is expected — `la` starts the daemon on first launch. Once the daemon is up, the same command will print the resolved socket and the listener version.
 
+### Where the socket actually lives
+
+The path printed by `lad doctor` is resolved at runtime; do not hard-code it. The lookup chain (see `crates/la-ipc/src/paths.rs`) is the same on every Unix host — Linux and macOS share the code path:
+
+1. `$LAZYAGENTS_RUNTIME_DIR` if set (test / sandbox override).
+2. `$XDG_RUNTIME_DIR/lazyagents` if set (typical on Linux, e.g. `/run/user/1000/lazyagents`).
+3. `$TMPDIR/lazyagents-<uid>` as the fallback. macOS does **not** set `XDG_RUNTIME_DIR` out of the box, so macOS lands here: `$TMPDIR` is the per-user directory derived from `confstr(_CS_DARWIN_USER_TEMP_DIR)` and looks like `/var/folders/<aa>/<bbbb>/T/lazyagents-<uid>/`. The directory is owner-only (`0700`) and the socket file is owner-only (`0600`), so other local users can neither traverse the parent nor open the socket.
+
+macOS users will **not** see the socket under `~/Library/Application Support/` — that location is part of the **config** fallback (entry 4 of the macOS config chain above) and is read-only for `lad config`, never used for sockets. Always read the actual path from `lad doctor`'s `✓ daemon socket reachable: <path>` line if you need to script against it.
+
 For ongoing production diagnostics — Prometheus metrics, JSON structured logs, the adapter-drift surface — see [`observability.md`](observability.md). `lad doctor` is the install-time gate; `lad metrics` is the runtime scrape surface.
 
 ## Update / uninstall
