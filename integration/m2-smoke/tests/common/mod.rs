@@ -98,11 +98,7 @@ impl AgentAdapter for FakeBackend {
                 .map_err(AdapterError::SpawnFailed)?;
             return Ok(SpawnSpec {
                 program: PathBuf::from("cmd.exe"),
-                args: vec![
-                    "/Q".into(),
-                    "/C".into(),
-                    script_path.to_string_lossy().into_owned(),
-                ],
+                args: vec!["/Q".into(), "/C".into(), script_path.into()],
                 env: req.env.clone(),
                 cwd: req.cwd.clone(),
                 pty: req.pty,
@@ -141,16 +137,25 @@ pub async fn bootstrap_daemon(backends: Vec<FakeBackend>) -> TestDaemon {
     let state_dir = tempdir.path().join("state");
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
-    // Unique file stem so concurrent test daemons in the same process do
-    // not collide on Windows: `endpoint_for` derives the Named Pipe name
-    // from the path's file stem, so two daemons that both pick `lad-1`
-    // would race for the same `\\.\pipe\lazyagents-lad-1`. The pid +
-    // monotonic counter combination is unique per call.
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let stem = format!("lad-test-{}-{nonce}", std::process::id());
+    // On Windows `endpoint_for` derives the Named Pipe name from the
+    // socket path's file stem, so two concurrent test daemons that both
+    // pick `lad-1.sock` would race for the same `\\.\pipe\lazyagents-lad-1`.
+    // Use a short, unique stem there. On Unix the tempdir is already
+    // unique per call AND the full path goes through `bind(2)`, which
+    // enforces `SUN_LEN` (104 bytes on macOS) — keep the canonical
+    // `lad-1.sock` name so the path stays well under the limit.
+    #[cfg(windows)]
+    let stem = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "lad-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    };
+    #[cfg(not(windows))]
+    let stem = "lad-1";
     let socket = runtime_dir.join(format!("{stem}.sock"));
 
     let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
