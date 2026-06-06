@@ -53,19 +53,16 @@ inherits = "release"
 
 # Config for 'dist' (formerly cargo-dist).
 #
-# Acceptance (WEK-76 / M4.3, supersedes WEK-41 acceptance):
-#   • 6-target release matrix per v1.1 addendum §A5.2 / A5.3:
-#       linux  x86_64-gnu / aarch64-gnu / x86_64-musl  (3)
-#       macos  x86_64 / aarch64                        (2)
-#       windows x86_64-msvc                            (1)
-#     `aarch64-unknown-linux-musl` is *intentionally* deferred to v1.x —
-#     tracked as follow-up issue WEK-80, reachable from the M4 epic
-#     WEK-63 — because the cargo-zigbuild + bundled-sqlite cross link is
-#     too expensive to land inside the M4 timebox while x86_64-musl
-#     already covers the alpine / glibc-less audience.
-#     `aarch64-pc-windows-msvc` (Windows-on-ARM) also
-#     stays out of v1: no contributor dogfoods it and GitHub's Windows-ARM
-#     runners are still preview.
+# Acceptance (WEK-76 / M4.3, expanded by WEK-80 v1.x follow-up):
+#   • 7-target release matrix per v1.1 addendum §A5.2 / A5.3:
+#       linux  x86_64-gnu / aarch64-gnu / x86_64-musl / aarch64-musl  (4)
+#       macos  x86_64 / aarch64                                       (2)
+#       windows x86_64-msvc                                            (1)
+#     `aarch64-unknown-linux-musl` landed in v1.x via WEK-80
+#     (cargo-zigbuild + bundled-sqlite + ring on native `ubuntu-22.04-arm`).
+#     `aarch64-pc-windows-msvc` (Windows-on-ARM) stays out of v1: no
+#     contributor dogfoods it and GitHub's Windows-ARM runners are still
+#     preview.
 #   • A5.3: runner pinning lives in `.github/workflows/release.yml` (the
 #     custom workflow), NOT in `dist.github-custom-runners`, because that
 #     setting only kicks in when dist generates the workflow itself. The
@@ -122,6 +119,7 @@ targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
