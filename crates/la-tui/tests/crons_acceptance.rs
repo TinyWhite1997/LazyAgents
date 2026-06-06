@@ -24,7 +24,7 @@ fn render(app: &App<MockSessionSource, MockCronSource>, w: u16, h: u16) -> Strin
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal
         .draw(|f| {
-            let _ = draw(f, app);
+            let _ = draw(f, app, None);
         })
         .expect("draw");
     let buf = terminal.backend().buffer().clone();

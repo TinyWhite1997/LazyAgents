@@ -206,7 +206,7 @@ fn real_main() -> io::Result<()> {
     // reconnect loop will keep trying, so once the user runs
     // `lad daemonize` in a sibling shell, the bar lights up on its own.
     let notif_rx = Some(la_tui::notif_sub::spawn(&location.socket_path));
-    la_tui::runner::run_with_notifs(app, notif_rx)
+    la_tui::runner::run_with_attach(app, notif_rx, Some(location.socket_path.clone()))
 }
 
 /// Outcome of the startup bootstrap. Carries enough info for the status

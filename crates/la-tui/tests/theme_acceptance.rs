@@ -47,7 +47,7 @@ fn render_with_prefs(prefs: UiPrefs) -> String {
     app.handle(AppMsg::SidebarDown);
     terminal
         .draw(|f| {
-            let _ = draw(f, &app);
+            let _ = draw(f, &app, None);
         })
         .expect("draw");
     buffer_text(terminal.backend().buffer())
@@ -265,7 +265,7 @@ fn key_hints_hidden_drops_bottom_row() {
     app.handle(AppMsg::SidebarDown);
     terminal
         .draw(|f| {
-            let _ = draw(f, &app);
+            let _ = draw(f, &app, None);
         })
         .expect("draw");
     let buf = terminal.backend().buffer().clone();
@@ -367,7 +367,7 @@ fn compact_mode_renders_single_color_backend_badges() {
     ]));
     terminal
         .draw(|f| {
-            let _ = draw(f, &app);
+            let _ = draw(f, &app, None);
         })
         .expect("draw");
     let buf = terminal.backend().buffer().clone();
@@ -477,7 +477,7 @@ fn dark_and_light_themes_actually_diverge_on_real_cells() {
         app.handle(AppMsg::SidebarDown);
         terminal
             .draw(|f| {
-                let _ = draw(f, &app);
+                let _ = draw(f, &app, None);
             })
             .expect("draw");
         terminal.backend().buffer().clone()
