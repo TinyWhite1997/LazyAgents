@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,6 +69,16 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 /// thread has completed its initial `sessions.list` round-trip.
 pub struct RpcSessionSource {
     cache: Arc<Mutex<Vec<ProjectGroup>>>,
+    /// Monotonic counter bumped by [`refresh_cache`] after every
+    /// successful `sessions.list` round-trip. The runner snapshots this
+    /// once per frame and dispatches [`crate::app::AppMsg::RefreshSessions`]
+    /// when the value changes, so daemon-side mutations (poll tick,
+    /// `sessions.create` follow-up refresh, A5's `sessions.changed` push
+    /// once it lands) reach the sidebar within one frame instead of
+    /// waiting for a user keystroke. Read-mostly, so `Relaxed` ordering
+    /// is enough: we only need the value to eventually become visible
+    /// to the TUI thread, not synchronise with anything else.
+    refresh_gen: Arc<AtomicU64>,
     /// Async sender used to post mutations to the bg loop. Dropping the
     /// last sender (i.e. dropping `RpcSessionSource`) causes the bg
     /// loop's `recv()` to return `None`, which triggers a clean exit.
@@ -98,7 +109,8 @@ enum Command {
         reply: std::sync::mpsc::SyncSender<Result<SessionId, SourceError>>,
     },
     /// Test-only: force a `sessions.list` refresh on the next loop turn.
-    #[cfg(test)]
+    /// Reachable only through [`RpcSessionSource::force_refresh`] (also
+    /// `#[doc(hidden)]`), which is the integration-test entry point.
     Refresh,
 }
 
@@ -123,8 +135,10 @@ impl RpcSessionSource {
     pub fn connect(socket: &Path) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
         let cache = Arc::new(Mutex::new(Vec::<ProjectGroup>::new()));
+        let refresh_gen = Arc::new(AtomicU64::new(0));
         let socket = socket.to_path_buf();
         let cache_bg = cache.clone();
+        let refresh_gen_bg = refresh_gen.clone();
 
         let handle = std::thread::Builder::new()
             .name("la-rpc-session-source".into())
@@ -141,13 +155,14 @@ impl RpcSessionSource {
                     }
                 };
                 rt.block_on(async move {
-                    reconnect_loop(socket, cache_bg, cmd_rx).await;
+                    reconnect_loop(socket, cache_bg, refresh_gen_bg, cmd_rx).await;
                 });
             })
             .expect("spawn la-rpc-session-source thread");
 
         Self {
             cache,
+            refresh_gen,
             cmd_tx,
             create_timeout: CREATE_TIMEOUT,
             _thread: ThreadGuard {
@@ -183,8 +198,12 @@ impl RpcSessionSource {
         false
     }
 
-    /// Test-only refresh trigger. See [`Command::Refresh`].
-    #[cfg(test)]
+    /// Force a `sessions.list` refresh on the next loop turn. Used by
+    /// the WEK-92-A4.1 integration tests (`tests/rpc_source_live.rs`)
+    /// to exercise the bg-refresh signal without waiting the full
+    /// [`POLL_INTERVAL`] of wall-clock — production callers should
+    /// rely on the periodic poll (or A5's `sessions.changed` push once
+    /// it lands) and not invoke this directly.
     #[doc(hidden)]
     pub fn force_refresh(&self) {
         let _ = self.cmd_tx.send(Command::Refresh);
@@ -194,6 +213,10 @@ impl RpcSessionSource {
 impl SessionSource for RpcSessionSource {
     fn snapshot(&self) -> Vec<ProjectGroup> {
         self.cache.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    fn refresh_generation(&self) -> u64 {
+        self.refresh_gen.load(Ordering::Relaxed)
     }
 
     fn archive(&mut self, session_id: &str) {
@@ -276,12 +299,13 @@ impl SessionSource for RpcSessionSource {
 async fn reconnect_loop(
     socket: PathBuf,
     cache: Arc<Mutex<Vec<ProjectGroup>>>,
+    refresh_gen: Arc<AtomicU64>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let mut connected = false;
-        match run_once(&socket, &cache, &mut cmd_rx, &mut connected).await {
+        match run_once(&socket, &cache, &refresh_gen, &mut cmd_rx, &mut connected).await {
             Ok(()) => {
                 // Sender side dropped — clean shutdown.
                 return;
@@ -301,6 +325,7 @@ async fn reconnect_loop(
 async fn run_once(
     socket: &Path,
     cache: &Arc<Mutex<Vec<ProjectGroup>>>,
+    refresh_gen: &Arc<AtomicU64>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
     connected: &mut bool,
 ) -> Result<(), String> {
@@ -321,7 +346,7 @@ async fn run_once(
     *connected = true;
 
     // Initial pull so the first snapshot the App reads is populated.
-    refresh_cache(&mut conn, cache).await?;
+    refresh_cache(&mut conn, cache, refresh_gen).await?;
 
     let mut next_id: i64 = 1;
     loop {
@@ -329,7 +354,7 @@ async fn run_once(
         let cmd = match tokio::time::timeout(POLL_INTERVAL, cmd_rx.recv()).await {
             // Tick fired without a command — periodic refresh.
             Err(_) => {
-                refresh_cache(&mut conn, cache).await?;
+                refresh_cache(&mut conn, cache, refresh_gen).await?;
                 continue;
             }
             // Sender dropped — clean exit.
@@ -433,8 +458,30 @@ async fn run_once(
                     match send_and_await_ack(&mut conn, req).await {
                         Ok(value) => match serde_json::from_value::<SessionsCreateResult>(value) {
                             Ok(r) => {
+                                // create→snapshot read-your-write: pull
+                                // a fresh `sessions.list` BEFORE acking
+                                // the caller. The TUI thread unblocks on
+                                // this reply and immediately calls
+                                // `snapshot()`; if we ack first the
+                                // sidebar shows the pre-create cache
+                                // for at least one frame (and at worst
+                                // until the next 2 s poll tick), making
+                                // the new row look like it didn't land.
+                                // Bubbling a refresh failure to the
+                                // reconnect loop is fine: the caller
+                                // still hears about it via the
+                                // SourceError::Backend below, and a
+                                // wedged conn would have died on the
+                                // next op anyway.
+                                if let Err(e) = refresh_cache(&mut conn, cache, refresh_gen).await {
+                                    let _ = reply.send(Err(SourceError::Backend(format!(
+                                        "create succeeded but follow-up refresh failed: {e}"
+                                    ))));
+                                    return Err(e);
+                                }
                                 let _ = reply.send(Ok(SessionId(r.session_id)));
-                                mutated = true;
+                                // The cache is already current; skip the
+                                // tail-of-loop refresh.
                             }
                             Err(e) => {
                                 let _ = reply.send(Err(SourceError::Backend(format!(
@@ -452,7 +499,6 @@ async fn run_once(
                         }
                     }
                 }
-                #[cfg(test)]
                 Command::Refresh => {
                     mutated = true;
                 }
@@ -460,7 +506,7 @@ async fn run_once(
         }
 
         if mutated {
-            refresh_cache(&mut conn, cache).await?;
+            refresh_cache(&mut conn, cache, refresh_gen).await?;
         }
     }
 }
@@ -497,9 +543,13 @@ async fn send_and_await_ack(
 }
 
 /// Single `sessions.list` round-trip; overwrite the cache on success.
+/// Bumps `refresh_gen` after a successful overwrite so the runner can
+/// observe that a fresh snapshot is available and dispatch
+/// [`crate::app::AppMsg::RefreshSessions`] on the next frame.
 async fn refresh_cache(
     conn: &mut Connection<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>,
     cache: &Arc<Mutex<Vec<ProjectGroup>>>,
+    refresh_gen: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     let req = Request::new(
         // The id collides across refreshes but the daemon doesn't care
@@ -521,6 +571,12 @@ async fn refresh_cache(
     if let Ok(mut guard) = cache.lock() {
         *guard = groups;
     }
+    // Order the bump AFTER the cache write so a runner reading
+    // `refresh_generation()` and then `snapshot()` sees the same view
+    // the daemon just returned. Relaxed is fine: the runner's
+    // try_recv-style loop tolerates a one-frame visibility delay, and
+    // the cache write itself is mutex-synchronised.
+    refresh_gen.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
