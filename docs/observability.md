@@ -1,8 +1,8 @@
 # Observability
 
 Single source of truth for LazyAgents' metric naming table, log field schema,
-and recommended external collectors. Pairs with architecture §9.3 and the
-WEK-75 brief; future metric additions go through an ADR plus a row in the
+and recommended external collectors. Pairs with architecture §9.3; future
+metric additions go through an ADR plus a row in the
 table below.
 
 > **Production deployment supplement.** This document is the runtime

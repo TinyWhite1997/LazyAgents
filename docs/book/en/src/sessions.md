@@ -26,9 +26,9 @@ Transitions you'll see day-to-day:
 
 ### From the TUI (v1 status)
 
-The Sessions tab in v1 ships the live navigation, sidebar, and modals — and as of **WEK-94 (WEK-92-A2)** the New-session form is wired end-to-end: pressing **`n`** on a project opens a modal that lets you pick a backend, type the initial prompt, and toggle the worktree flag, then **`Ctrl+Enter`** calls `sessions.create` on the daemon. The freshly minted session appears on the sidebar within the next ~2 s refresh tick.
+The Sessions tab in v1 ships the live navigation, sidebar, and modals — and the **New-session form is wired end-to-end**: pressing **`n`** on a project opens a modal that lets you pick a backend, type the initial prompt, and toggle the worktree flag, then **`Ctrl+Enter`** calls `sessions.create` on the daemon. The freshly minted session appears on the sidebar within the next ~2 s refresh tick.
 
-**Live attach landed in WEK-92-A3:** highlighting a session row and pressing **`Enter`** opens a live PTY pane backed by `sessions.attach { acquire_input: true }`. The daemon streams `session.output` chunks straight into the transcript, and every keystroke you type goes back through `sessions.write`.
+**Live attach is wired:** highlighting a session row and pressing **`Enter`** opens a live PTY pane backed by `sessions.attach { acquire_input: true }`. The daemon streams `session.output` chunks straight into the transcript, and every keystroke you type goes back through `sessions.write`.
 
 The New-session modal field map:
 

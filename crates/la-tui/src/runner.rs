@@ -792,7 +792,7 @@ Once a project appears here, press `n` to start more sessions inside it."
             format!("Group: {project_id}\n\nPress ⏎ to fold/expand, j/k to navigate.")
         }
         Selection::Session { session_id, .. } => {
-            format!("Session: {session_id}\n\nPress ⏎ to attach to the live PTY (WEK-92-A3).")
+            format!("Session: {session_id}\n\nPress ⏎ to attach to the live PTY.")
         }
     };
     let para = Paragraph::new(body)
