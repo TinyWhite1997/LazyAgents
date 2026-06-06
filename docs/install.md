@@ -187,6 +187,21 @@ For ongoing production diagnostics — Prometheus metrics, JSON structured logs,
 
 To upgrade between releases, re-run the installer script for your platform — the script overwrites in place. The full upgrade path (including v1.x → v1.y and the v1 → v2 multi-version coexistence plan) is in [`upgrade.md`](upgrade.md).
 
+### Forks / air-gapped networks: `LAZYAGENTS_UPDATE_MANIFEST_URL`
+
+`la --check-update` queries `https://api.github.com/repos/TinyWhite1997/LazyAgents/releases/latest` by default. If you maintain a self-hosted fork, or your machines cannot reach `api.github.com` (corporate proxy, isolated network), set `LAZYAGENTS_UPDATE_MANIFEST_URL` to point at your own mirror. The endpoint must return a JSON document compatible with the GitHub Releases API — at minimum the fields `tag_name`, `html_url`, and `prerelease`; the optional `name` field is honoured for display.
+
+```sh
+# Permanently — drop into your shell profile.
+export LAZYAGENTS_UPDATE_MANIFEST_URL=https://git.internal.example.com/api/v4/projects/12/releases/latest
+
+# Or one-shot, against a Gitea / Forgejo mirror that proxies your fork's releases.
+LAZYAGENTS_UPDATE_MANIFEST_URL=https://forge.example.com/api/v1/repos/team/LazyAgents/releases/latest \
+  la --check-update
+```
+
+Network failures are non-fatal — `la --check-update` prints a short stderr note and exits `0` (see `crates/la-tui/src/update_check.rs`), so a wrapper script that bakes the flag in will not start failing the moment your mirror is unreachable.
+
 To remove LazyAgents entirely:
 
 ```sh

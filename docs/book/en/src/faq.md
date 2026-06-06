@@ -31,6 +31,10 @@ The Homebrew formula is generated on every release, but the `TinyWhite1997/homeb
 
 No. `la --check-update` queries GitHub Releases and tells you when there's a newer build — re-run the installer to upgrade. Auto-update via cargo-dist is explicitly disabled (`install-updater = false`).
 
+### I run a self-hosted fork / my network can't reach `api.github.com`
+
+Set `LAZYAGENTS_UPDATE_MANIFEST_URL` to point at your own mirror's GitHub-Releases-compatible endpoint, and `la --check-update` will query that instead. The endpoint just needs to return JSON with `tag_name`, `html_url`, and `prerelease`. See [`docs/install.md#forks--air-gapped-networks-lazyagents_update_manifest_url`](../../../install.md#forks--air-gapped-networks-lazyagents_update_manifest_url) for the full example.
+
 ### How do I verify the binary I downloaded?
 
 ```sh

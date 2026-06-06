@@ -799,6 +799,17 @@ jobs:
             echo
             echo "\`aarch64-unknown-linux-musl\` is **not** in this release; it is tracked for v1.x via [WEK-80](https://github.com/TinyWhite1997/LazyAgents/issues) (推 v1.x)."
             echo
+            echo "## Self-hosted fork / air-gapped networks (WEK-67)"
+            echo
+            echo "\`la --check-update\` queries the GitHub Releases API by default. Forks and isolated networks can redirect it at any GitHub-compatible mirror via the \`LAZYAGENTS_UPDATE_MANIFEST_URL\` environment variable — the endpoint just needs to return JSON with \`tag_name\` / \`html_url\` / \`prerelease\` fields."
+            echo
+            echo "\`\`\`sh"
+            echo "export LAZYAGENTS_UPDATE_MANIFEST_URL=https://forge.example.com/api/v1/repos/team/LazyAgents/releases/latest"
+            echo "la --check-update"
+            echo "\`\`\`"
+            echo
+            echo "Full install path is in [\`docs/install.md\`](https://github.com/TinyWhite1997/LazyAgents/blob/main/docs/install.md#forks--air-gapped-networks-lazyagents_update_manifest_url)."
+            echo
             echo "## Artifact sizes (stripped, soft goal: < 30 MiB — A5.1 WARN-only)"
             echo
             echo "| target | binary | size |"
