@@ -70,7 +70,7 @@ cargo install --path crates/la-tui    --locked
 
 `lad` runs perfectly well in the foreground (`lad start`) or as a daemonized child (`lad daemonize`), but in production you almost certainly want the OS to keep it alive across logouts and reboots. The `lad install --service <mode>` command writes the unit / plist / task XML, and three independent verbs control the lifecycle.
 
-**Critical contract (M4 brief A2 — "三端动词表").** The three install-time verbs are **always independent**. Do **not** chain `install + enable + start` into a single platform-native invocation (the systemd-only `systemctl --user enable --now` shorthand mixes "register" and "start now" into one verb, which makes the resulting docs unportable). Use the dedicated `lad install` flags below, or the per-platform verbs in the same row.
+**Critical contract ("三端动词表").** The three install-time verbs are **always independent**. Do **not** chain `install + enable + start` into a single platform-native invocation (the systemd-only `systemctl --user enable --now` shorthand mixes "register" and "start now" into one verb, which makes the resulting docs unportable). Use the dedicated `lad install` flags below, or the per-platform verbs in the same row.
 
 | Verb | What it does | systemd (Linux) | launchd (macOS) | Windows Scheduled Task |
 |---|---|---|---|---|
@@ -117,7 +117,7 @@ lad install --service windows-task --enable --start
 
 **Where `lad` writes a fresh default to** (when the daemon has to materialise one): always **entry 3** on POSIX (`$HOME/.config/lazyagents/config.toml`, regardless of `$XDG_CONFIG_HOME`), and entry 2 on Windows (`%APPDATA%\lazyagents\config.toml`). Dotfile sync stays trivial — XDG-honouring and vanilla users end up writing to the same place.
 
-### macOS configuration fallback chain (M4 brief addendum A4)
+### macOS configuration fallback chain
 
 On macOS, the fallback chain is purposely longer than the Linux chain. The order matters; the **first existing file wins**:
 

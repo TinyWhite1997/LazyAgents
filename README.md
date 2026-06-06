@@ -32,7 +32,7 @@ cargo install --path crates/la-daemon --locked
 cargo install --path crates/la-tui    --locked
 ```
 
-Then launch the TUI — you should land on the **Crons** tab (M3 scheduler), and the status bar at the bottom should read `daemon @ <socket-path>`:
+Then launch the TUI — you should land on the **Crons** tab, and the status bar at the bottom should read `daemon @ <socket-path>`:
 
 ```sh
 la

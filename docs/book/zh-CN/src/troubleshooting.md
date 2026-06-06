@@ -103,7 +103,7 @@ v1 在这里完成验证。遇到 bug 请附 `lad doctor` 输出与 `LAZYAGENTS_
 
 ### Windows
 
-发布流水线产出 `x86_64-pc-windows-msvc`。Windows ARM 在 v1 内刻意不支持。M0 spike 报告记下的已知问题：
+发布流水线产出 `x86_64-pc-windows-msvc`。Windows ARM 在 v1 内刻意不支持。初期 spike 报告记下的已知问题：
 
 - **EOF 上报延迟。** Unix PTY 在子进程退出后能立即报 EOF；Windows ConPTY 在 GitHub-hosted runner（也可能不止）上会让 reader 在子进程结束后还开着一阵。会话短暂看起来 "还在跑"。
 - **`Signal::Interrupt` 可能杀不掉子进程。** `GenerateConsoleCtrlEvent(CTRL_C_EVENT)` 可能返回成功但 ConPTY 子进程并未实际退出。Ctrl-C 没停下 agent 时，跟上一个 `Signal::Kill`（TUI 的 "force kill" 路径）。

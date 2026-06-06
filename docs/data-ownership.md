@@ -67,7 +67,7 @@ If you delete the backend's session file from disk, the corresponding
 LazyAgents row will still exist but resume will fail (the backend
 itself owns the data).
 
-## Resume semantics (M2.4+)
+## Resume semantics (planned)
 
 Resuming an imported session does **not** take over the backend's
 existing PTY or process — that one is long gone. Instead the daemon

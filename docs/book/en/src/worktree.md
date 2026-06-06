@@ -37,7 +37,7 @@ If git is missing, you'll see `the git binary was not found on $PATH` — instal
 
 ## Review the diff
 
-From the TUI session view (specifically the worktree pane added in M2.5), you have seven commands:
+From the TUI session view (specifically the worktree pane), you have seven commands:
 
 | Command | Effect |
 |---|---|

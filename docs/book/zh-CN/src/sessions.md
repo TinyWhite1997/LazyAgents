@@ -123,7 +123,7 @@ LazyAgents 把每个 PTY 块 —— 你的输入、agent 的输出，甚至 adap
 
 LazyAgents 能把你直接用 `claude`、`codex`、`opencode` 启动的会话呈现出来 —— 不会拷贝任何东西。discover walk 是只读的。
 
-daemon 一侧完整接入（`adapters.discover` + `sessions.import`），TUI 在 `i` 键上发出 `ImportDiscovered` action —— 真正的导入浮层与上面 New-session 表单属于同一组 M1.7 工作。在那之前请通过 JSON-RPC 触发导入。
+daemon 一侧完整接入（`adapters.discover` + `sessions.import`），TUI 在 `i` 键上发出 `ImportDiscovered` action —— 真正的导入浮层与上面 New-session 表单属于同一批 UI 工作。在那之前请通过 JSON-RPC 触发导入。
 
 导入后，会话与原生 LazyAgents 会话并列展示，"resume"（计划在同一里程碑落地）时 daemon 会用对应后端的 resume 标志拉起一个全新的进程，指向原始脚本文件（LazyAgents 从不改写它）。
 

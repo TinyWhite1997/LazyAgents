@@ -123,9 +123,9 @@ Both refuse to touch a session that's still in the active registry — you must 
 
 LazyAgents can surface sessions you started directly with `claude`, `codex`, or `opencode` — without copying anything. The discovery walk is read-only.
 
-The daemon side is fully wired (`adapters.discover` + `sessions.import`), and the TUI emits an `ImportDiscovered` action on the `i` key — the live import overlay is the same M1.7 work as the New-session form. Until then, drive the import over JSON-RPC.
+The daemon side is fully wired (`adapters.discover` + `sessions.import`), and the TUI emits an `ImportDiscovered` action on the `i` key — the live import overlay is the same UI work as the New-session form. Until then, drive the import over JSON-RPC.
 
-After import, the session shows up alongside native LazyAgents sessions, and "resuming" it (planned for the same milestone) will spawn a fresh backend process with the right resume flag, pointed at the original transcript file (which LazyAgents never modifies).
+After import, the session shows up alongside native LazyAgents sessions, and "resuming" it (planned for the same release) will spawn a fresh backend process with the right resume flag, pointed at the original transcript file (which LazyAgents never modifies).
 
 Discovery roots (and how to override them):
 

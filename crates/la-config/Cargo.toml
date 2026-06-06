@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "LazyAgents config schema (`config.toml`) + load precedence + cross-platform path resolution (WEK-71 / M4.2)."
+description = "LazyAgents config schema (`config.toml`) + load precedence + cross-platform path resolution."
 
 [dependencies]
 serde = { workspace = true }

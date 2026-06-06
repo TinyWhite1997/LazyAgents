@@ -778,12 +778,14 @@ fn render_content_placeholder(
 ) {
     let body = match selection {
         Selection::Empty => {
-            // The daemon (M1.7) is the only authority that can create the
-            // first project; until it lands, `n` is a no-op on an empty
-            // workspace (see [`crate::app::App::on_new_session`]). Surface
-            // that so the user is not waiting for a key that does nothing.
-            "No sessions yet.\n\nThe `la` daemon (M1.7) creates projects from your working directory on first attach. \
-Once a project exists, press `n` here to start a session inside it."
+            // The daemon is the only authority that can create the
+            // first project; the TUI does not yet have a "new project"
+            // flow, so `n` is a no-op on an empty workspace (see
+            // [`crate::app::App::on_new_session`]). Surface that so the
+            // user is not waiting for a key that does nothing.
+            "No sessions yet.\n\nThe `la` TUI lists projects and sessions managed by the daemon, but it cannot yet create the first project from this view. \
+Start the first session by calling `sessions.create` against the daemon's JSON-RPC socket — the daemon will create the project from the directory you pass it. \
+Once a project appears here, press `n` to start more sessions inside it."
                 .to_string()
         }
         Selection::Group { project_id } => {

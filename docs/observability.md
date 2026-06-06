@@ -1,4 +1,4 @@
-# Observability (M4.5 / WEK-75)
+# Observability
 
 Single source of truth for LazyAgents' metric naming table, log field schema,
 and recommended external collectors. Pairs with architecture §9.3 and the
@@ -78,7 +78,7 @@ Pinned contract. Additions go through an ADR; renames are wire breaks.
 | `lad_runs_archive_pruned_total` | counter | — | Rows the daily runs-archive job deletes from SQLite. |
 | `lad_scheduler_queue_depth` | gauge | — | Global count of cron fires waiting in the scheduler heap. |
 | `lad_scheduler_clock_skew_seconds` | gauge | — | Most recently observed wall-clock jump (signed seconds). |
-| `lad_adapter_drift_total` | counter | `backend` | Adapter protocol-drift events (replaces the M3 `tracing::error!(target="adapter_drift")` as the canonical surface; the log event is preserved for Loki/Grafana log ingest). |
+| `lad_adapter_drift_total` | counter | `backend` | Adapter protocol-drift events (replaces the earlier `tracing::error!(target="adapter_drift")` as the canonical surface; the log event is preserved for Loki/Grafana log ingest). |
 
 ## Log field schema
 
