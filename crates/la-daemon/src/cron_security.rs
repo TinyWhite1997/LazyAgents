@@ -3,8 +3,10 @@
 //! UI confirmation is advisory. The daemon owns the token lifecycle and the
 //! decision to enable, disable, or require reconfirmation.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 pub const CONFIRMATION_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
@@ -63,6 +65,45 @@ impl CronSecuritySnapshot {
             });
         }
         Ok(())
+    }
+
+    /// Stable 64-bit fingerprint of every sensitive field on this snapshot
+    /// (the Rev2 §B4 eight). Bound into the confirmation token at issue
+    /// time and re-checked at confirm time so a sensitive-field upsert
+    /// landing between the two RPCs invalidates the token even when the
+    /// cron stayed disabled and so `requires_reconfirmation` would not
+    /// have fired on its own. See WEK-53 review thread for the TOCTOU
+    /// this closes.
+    pub fn sensitive_fingerprint(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        // Fields hashed in the same order as `SENSITIVE_CRON_FIELDS` so
+        // any reordering of the allowlist also reorders the hash input,
+        // which is what we want — the test
+        // `sensitive_fields_match_brief_rev2_b4` will trip if the set
+        // drifts.
+        self.prompt.hash(&mut h);
+        self.backend_id.hash(&mut h);
+        // serde_json::Value isn't Hash; canonicalise to bytes first. We
+        // rely on serde_json's deterministic key ordering for objects
+        // (BTreeMap-backed in `serde_json::Map` when the
+        // `preserve_order` feature is off, which is the default for this
+        // workspace).
+        let spawn_bytes = serde_json::to_vec(&self.spawn_args).unwrap_or_default();
+        spawn_bytes.hash(&mut h);
+        self.cron_expr.hash(&mut h);
+        self.tz.hash(&mut h);
+        self.catchup_mode.hash(&mut h);
+        self.max_runs_per_day.hash(&mut h);
+        // f64 isn't Hash; use the bit pattern. We treat `None` and
+        // `Some(0.0)` as distinct (different on the wire too).
+        match self.cost_budget_usd_per_day {
+            None => 0_u64.hash(&mut h),
+            Some(v) => {
+                1_u64.hash(&mut h);
+                v.to_bits().hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     pub fn changed_sensitive_fields(&self, next: &Self) -> Vec<CronSensitiveField> {
@@ -168,6 +209,12 @@ struct PendingConfirmation {
     cron_id: String,
     expires_at: Instant,
     summary: ConfirmationSummary,
+    /// Fingerprint of the sensitive snapshot the user was shown when
+    /// this token was issued. The confirm path refuses the token if
+    /// the cron's current sensitive snapshot no longer matches — that
+    /// closes the window between "user sees A, asks for token" and
+    /// "user echoes token after attacker upserts B".
+    sensitive_fingerprint: u64,
 }
 
 #[derive(Debug, Default)]
@@ -184,6 +231,7 @@ impl ConfirmationTokens {
         &mut self,
         cron_id: impl Into<String>,
         summary: ConfirmationSummary,
+        sensitive_fingerprint: u64,
         now: Instant,
     ) -> Result<ConfirmationToken, CronSecurityError> {
         self.prune_expired(now);
@@ -194,6 +242,7 @@ impl ConfirmationTokens {
                 cron_id: cron_id.into(),
                 expires_at: now + CONFIRMATION_TOKEN_TTL,
                 summary,
+                sensitive_fingerprint,
             },
         );
         Ok(ConfirmationToken {
@@ -201,16 +250,28 @@ impl ConfirmationTokens {
         })
     }
 
+    /// Two-step enable gate.
+    ///
+    /// `sensitive_fingerprint` is the fingerprint of the cron's current
+    /// sensitive snapshot at the moment of this call. On the issue path
+    /// it is bound into the new token; on the confirm path the call is
+    /// rejected with [`CronSecurityError::SensitiveSnapshotChanged`] if
+    /// the cron's current fingerprint no longer matches the one the
+    /// token was issued against. That is the WEK-53 TOCTOU fix: a
+    /// sensitive upsert between issue and confirm makes the old token
+    /// unredeemable regardless of whether the cron was enabled or
+    /// disabled at issue time.
     pub fn require_or_confirm(
         &mut self,
         cron_id: &str,
         token: Option<&str>,
         summary: ConfirmationSummary,
+        sensitive_fingerprint: u64,
         now: Instant,
     ) -> Result<SetEnabledGate, CronSecurityError> {
         let Some(token) = token else {
             self.prune_expired(now);
-            let issued = self.issue(cron_id, summary.clone(), now)?;
+            let issued = self.issue(cron_id, summary.clone(), sensitive_fingerprint, now)?;
             return Ok(SetEnabledGate::RequiresConfirmation {
                 token: issued,
                 summary,
@@ -226,6 +287,13 @@ impl ConfirmationTokens {
         }
         if pending.cron_id != cron_id {
             return Err(CronSecurityError::TokenCronMismatch);
+        }
+        if pending.sensitive_fingerprint != sensitive_fingerprint {
+            // Drop every pending token for this cron — they were all
+            // issued against the now-stale snapshot. The caller must
+            // restart the two-step flow against the new content.
+            self.pending.retain(|_, p| p.cron_id != cron_id);
+            return Err(CronSecurityError::SensitiveSnapshotChanged);
         }
         Ok(SetEnabledGate::Confirmed {
             summary: pending.summary,
@@ -268,6 +336,8 @@ pub enum CronSecurityError {
     ExpiredConfirmationToken,
     #[error("confirmation token belongs to a different cron")]
     TokenCronMismatch,
+    #[error("cron sensitive content changed since this token was issued")]
+    SensitiveSnapshotChanged,
     #[error("random token generation failed")]
     RandomToken,
 }
@@ -392,8 +462,9 @@ mod tests {
     fn confirmation_token_is_single_use() {
         let mut tokens = ConfirmationTokens::new();
         let now = Instant::now();
+        let fp = snapshot("p").sensitive_fingerprint();
         let first = tokens
-            .require_or_confirm("cron-a", None, summary(), now)
+            .require_or_confirm("cron-a", None, summary(), fp, now)
             .unwrap();
         let token = match first {
             SetEnabledGate::RequiresConfirmation { token, .. } => token,
@@ -402,14 +473,14 @@ mod tests {
 
         assert!(matches!(
             tokens
-                .require_or_confirm("cron-a", Some(token.expose_secret()), summary(), now)
+                .require_or_confirm("cron-a", Some(token.expose_secret()), summary(), fp, now)
                 .unwrap(),
             SetEnabledGate::Confirmed { .. }
         ));
         assert_eq!(tokens.pending_len(), 0);
         assert_eq!(
             tokens
-                .require_or_confirm("cron-a", Some(token.expose_secret()), summary(), now)
+                .require_or_confirm("cron-a", Some(token.expose_secret()), summary(), fp, now)
                 .unwrap_err(),
             CronSecurityError::InvalidConfirmationToken
         );
@@ -419,8 +490,9 @@ mod tests {
     fn confirmation_token_cannot_enable_a_different_cron() {
         let mut tokens = ConfirmationTokens::new();
         let now = Instant::now();
+        let fp = snapshot("p").sensitive_fingerprint();
         let token = match tokens
-            .require_or_confirm("cron-a", None, summary(), now)
+            .require_or_confirm("cron-a", None, summary(), fp, now)
             .unwrap()
         {
             SetEnabledGate::RequiresConfirmation { token, .. } => token,
@@ -429,7 +501,7 @@ mod tests {
 
         assert_eq!(
             tokens
-                .require_or_confirm("cron-b", Some(token.expose_secret()), summary(), now)
+                .require_or_confirm("cron-b", Some(token.expose_secret()), summary(), fp, now)
                 .unwrap_err(),
             CronSecurityError::TokenCronMismatch
         );
@@ -440,8 +512,9 @@ mod tests {
     fn expired_confirmation_token_reports_expired() {
         let mut tokens = ConfirmationTokens::new();
         let now = Instant::now();
+        let fp = snapshot("p").sensitive_fingerprint();
         let token = match tokens
-            .require_or_confirm("cron-a", None, summary(), now)
+            .require_or_confirm("cron-a", None, summary(), fp, now)
             .unwrap()
         {
             SetEnabledGate::RequiresConfirmation { token, .. } => token,
@@ -454,6 +527,7 @@ mod tests {
                     "cron-a",
                     Some(token.expose_secret()),
                     summary(),
+                    fp,
                     now + CONFIRMATION_TOKEN_TTL + Duration::from_secs(1),
                 )
                 .unwrap_err(),
@@ -466,10 +540,91 @@ mod tests {
     fn sensitive_upsert_invalidates_existing_tokens_for_that_cron() {
         let mut tokens = ConfirmationTokens::new();
         let now = Instant::now();
-        let _ = tokens.issue("cron-a", summary(), now).unwrap();
-        let _ = tokens.issue("cron-b", summary(), now).unwrap();
+        let fp = snapshot("p").sensitive_fingerprint();
+        let _ = tokens.issue("cron-a", summary(), fp, now).unwrap();
+        let _ = tokens.issue("cron-b", summary(), fp, now).unwrap();
 
         assert_eq!(tokens.invalidate_cron("cron-a"), 1);
         assert_eq!(tokens.pending_len(), 1);
+    }
+
+    #[test]
+    fn sensitive_fingerprint_changes_when_any_sensitive_field_moves() {
+        let base = snapshot("p");
+        let baseline = base.sensitive_fingerprint();
+
+        // Every sensitive field must change the fingerprint.
+        let mut changed = snapshot("p");
+        changed.prompt = "different".into();
+        assert_ne!(changed.sensitive_fingerprint(), baseline, "prompt");
+
+        let mut changed = snapshot("p");
+        changed.backend_id = "codex".into();
+        assert_ne!(changed.sensitive_fingerprint(), baseline, "backend_id");
+
+        let mut changed = snapshot("p");
+        changed.spawn_args = serde_json::json!(["--model", "opus"]);
+        assert_ne!(changed.sensitive_fingerprint(), baseline, "spawn_args");
+
+        let mut changed = snapshot("p");
+        changed.cron_expr = "*/5 * * * *".into();
+        assert_ne!(changed.sensitive_fingerprint(), baseline, "cron_expr");
+
+        let mut changed = snapshot("p");
+        changed.tz = "America/Los_Angeles".into();
+        assert_ne!(changed.sensitive_fingerprint(), baseline, "tz");
+
+        let mut changed = snapshot("p");
+        changed.catchup_mode = "skip".into();
+        assert_ne!(changed.sensitive_fingerprint(), baseline, "catchup_mode");
+
+        let mut changed = snapshot("p");
+        changed.max_runs_per_day = 12;
+        assert_ne!(
+            changed.sensitive_fingerprint(),
+            baseline,
+            "max_runs_per_day"
+        );
+
+        let mut changed = snapshot("p");
+        changed.cost_budget_usd_per_day = Some(2.5);
+        assert_ne!(
+            changed.sensitive_fingerprint(),
+            baseline,
+            "cost_budget_usd_per_day"
+        );
+
+        // Non-sensitive: identical snapshot must produce the same fingerprint.
+        assert_eq!(snapshot("p").sensitive_fingerprint(), baseline);
+    }
+
+    #[test]
+    fn confirm_path_rejects_token_when_sensitive_snapshot_changed() {
+        // Models the WEK-53 review TOCTOU: token issued against snapshot A,
+        // the cron's sensitive content has since become snapshot B, the
+        // user echoes the original token. Must fail and drop every
+        // pending token for that cron.
+        let mut tokens = ConfirmationTokens::new();
+        let now = Instant::now();
+        let fp_a = snapshot("a").sensitive_fingerprint();
+        let token = match tokens
+            .require_or_confirm("cron-a", None, summary(), fp_a, now)
+            .unwrap()
+        {
+            SetEnabledGate::RequiresConfirmation { token, .. } => token,
+            SetEnabledGate::Confirmed { .. } => panic!("expected token"),
+        };
+
+        let fp_b = snapshot("b").sensitive_fingerprint();
+        assert_ne!(fp_a, fp_b);
+        assert_eq!(
+            tokens
+                .require_or_confirm("cron-a", Some(token.expose_secret()), summary(), fp_b, now)
+                .unwrap_err(),
+            CronSecurityError::SensitiveSnapshotChanged
+        );
+        // Stale-snapshot rejection drops every pending token for this
+        // cron — they were all issued against the old content.
+        assert_eq!(tokens.pending_len(), 0);
     }
 }
