@@ -644,6 +644,131 @@ jobs:
           mv "$out.tmp" "$out"
           cat "$out"
 
+      # Runtime smoke — extracted-archive `la --version` + `lad --help`.
+      # This is the "every shipped binary actually launches" check that
+      # WEK-66 review surfaced as missing: the size + ldd inspections
+      # above prove the binaries are the right shape, but they never
+      # exec the bytes a user downloads. Each shipped tarball / zip
+      # has been extracted into `target/distrib/_extracted/<target>/`
+      # by the step above; we walk it for the per-target `la`/`lad`
+      # entry points and call them.
+      #
+      # Native targets (linux-gnu x86_64, both darwins, windows-msvc,
+      # and linux-musl which is x86_64 on an x86_64 runner) exec
+      # directly — runner ABI matches binary ABI.
+      #
+      # aarch64-unknown-linux-gnu cannot exec on the x86_64 ubuntu
+      # runner: this branch installs `qemu-user-static` (binfmt_misc
+      # auto-routes ./la → qemu-aarch64 once the package is in place
+      # on ubuntu-22.04) and re-runs the same `--version` / `--help`
+      # invocations. B2 (a dedicated `ubuntu-24.04-arm` smoke job
+      # downloading the archive artifact) is the architect's preferred
+      # long-term shape; the qemu route here is the WEK-66 B1 trade-off
+      # that lands smoke coverage in the same `build` job without
+      # adding a new matrix leg.
+      #
+      # `la --version` exits 0 with `la <version>`; `lad --help`
+      # exits 0 with the daemon's USAGE block (see
+      # crates/la-daemon/src/main.rs `print_help`). Anything else
+      # fails the release build, which is the point.
+      - name: install qemu-user-static + aarch64 sysroot (aarch64-linux smoke)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # `qemu-user-static` alone is NOT enough for the gnu (dynamic)
+          # leg — `aarch64-unknown-linux-gnu` ships dynamically-linked
+          # PIE binaries whose interpreter is `/lib/ld-linux-aarch64.so.1`
+          # (confirmed against rc.1's la-daemon-aarch64-unknown-linux-gnu
+          # archive). Without an aarch64 glibc loader on the x86_64
+          # runner, `qemu-aarch64-static ./lad --help` errors with
+          # "Could not open '/lib/ld-linux-aarch64.so.1': No such file
+          # or directory" before user-space ever starts. `libc6-arm64-cross`
+          # drops the aarch64 sysroot under `/usr/aarch64-linux-gnu/`,
+          # and `qemu-aarch64-static -L <prefix>` then resolves the
+          # interpreter inside that prefix. We always pair the two so
+          # the same invocation works for either dynamic (gnu) or
+          # static (musl, though musl runs on x86_64 here) binaries.
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static \
+            libc6-arm64-cross
+          command -v qemu-aarch64-static
+          qemu-aarch64-static --version | head -1
+          # Sanity check the sysroot — if a future ubuntu image
+          # repackages the cross libc the smoke step's `-L` prefix
+          # would silently miss and we'd be back at "interpreter
+          # not found".
+          test -f /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1
+      - name: runtime smoke (la --version / lad --help)
+        shell: bash
+        run: |
+          set -euo pipefail
+          extracted="target/distrib/_extracted/${{ matrix.target }}"
+          # Per-target emulator + arg prefix. Only the aarch64-linux
+          # leg on the x86_64 ubuntu runner needs qemu; the sysroot
+          # `-L` flag is required for the gnu (dynamic) target so
+          # qemu can find /lib/ld-linux-aarch64.so.1. The array is
+          # expanded via `${runner[@]+"${runner[@]}"}` (the bash 3.2
+          # safe form) so an empty `runner=()` doesn't trip
+          # `set -u` on the macOS legs (bash 3.2.57 treats
+          # `"${empty[@]}"` as an unbound expansion on some patch
+          # levels).
+          runner=()
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              runner=(qemu-aarch64-static -L /usr/aarch64-linux-gnu)
+              ;;
+          esac
+          # Collect every shipped la* / lad* entry point. WEK-78
+          # hotfix #2 pattern — bash 3-compatible while-read, since
+          # the same snippet shape is used on macOS runners (bash 3.2).
+          bins=()
+          while IFS= read -r line; do
+            bins+=("$line")
+          done < <(find "$extracted" -type f \( -name la -o -name lad -o -name la.exe -o -name lad.exe \))
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "::error::no la/lad binary inside extracted archives for ${{ matrix.target }}"
+            exit 1
+          fi
+          # Helper: run argv under `set -e`, capturing exit status
+          # without using `! cmd` (which inverts $? so the failure
+          # branch would otherwise print exit=0). Caller pattern:
+          #   status=0; run_one "${argv[@]}" || status=$?
+          run_one() {
+            "$@"
+          }
+          fail=0
+          for bin in "${bins[@]}"; do
+            name=$(basename "$bin")
+            case "$name" in
+              la|la.exe)
+                argv=(${runner[@]+"${runner[@]}"} "$bin" --version)
+                echo "=== ${argv[*]} ==="
+                status=0
+                run_one "${argv[@]}" || status=$?
+                if [[ $status -ne 0 ]]; then
+                  echo "::error::${argv[*]} failed (exit $status)"
+                  fail=1
+                fi
+                ;;
+              lad|lad.exe)
+                # `lad --help` on a fresh runner has no daemon to talk
+                # to but the help path is pure stdout — no socket,
+                # no config probe — so it returns 0 anywhere.
+                argv=(${runner[@]+"${runner[@]}"} "$bin" --help)
+                echo "=== ${argv[*]} ==="
+                status=0
+                run_one "${argv[@]}" || status=$?
+                if [[ $status -ne 0 ]]; then
+                  echo "::error::${argv[*]} failed (exit $status)"
+                  fail=1
+                fi
+                ;;
+            esac
+          done
+          exit "$fail"
+
       # Clean up the inspection scratch dir so it can't be uploaded into
       # the release artifact bundle below.
       - name: drop inspection scratch dir
@@ -798,6 +923,16 @@ jobs:
             echo "This release ships a statically-linked \`x86_64-unknown-linux-musl\` artifact alongside the GNU Linux targets, per v1.1 扩展架构 §13. Suitable for Alpine / glibc-less environments."
             echo
             echo "\`aarch64-unknown-linux-musl\` is **not** in this release; it is tracked for v1.x via [WEK-80](https://github.com/TinyWhite1997/LazyAgents/issues) (推 v1.x)."
+            echo
+            echo "## Verifying release artifacts (sigstore / GitHub Attestations)"
+            echo
+            echo "All published archives, binaries, and installer scripts are signed via keyless sigstore through [actions/attest-build-provenance](https://github.com/actions/attest-build-provenance). Verify any asset before installing:"
+            echo
+            echo "\`\`\`sh"
+            echo "gh attestation verify <file> --repo TinyWhite1997/LazyAgents"
+            echo "\`\`\`"
+            echo
+            echo "This uses \`gh attestation\` (sigstore SLSA provenance via Fulcio + Rekor) — **not** \`cosign verify-blob\`. cargo-dist switched from standalone cosign to GitHub Attestations starting with this release line; the trust root is identical (sigstore public-good), and the \`gh\` CLI ships verification offline-capable via \`gh attestation download\` + \`gh attestation verify --bundle\`. A successful run prints the workflow ref (\`refs/tags/v0.X.Y\`), commit SHA, and runner environment that produced the artifact — confirm those match the tag you intended to install before trusting the binary."
             echo
             echo "## Fork / internal-mirror escape hatch — \`LAZYAGENTS_UPDATE_MANIFEST_URL\`"
             echo
