@@ -1385,6 +1385,13 @@ fn default_pause_on_failures() -> u32 {
 #[schemars(rename = "CronsUpsertResult")]
 pub struct CronsUpsertResult {
     pub cron: CronEntry,
+    /// WEK-53: `true` when this upsert touched at least one sensitive field
+    /// (see `cron_security::SENSITIVE_CRON_FIELDS`) on an already-enabled
+    /// cron. The daemon force-disables the cron and invalidates any pending
+    /// confirmation token; the caller must call `crons.set_enabled` again
+    /// (which will issue a fresh token) to re-enable.
+    #[serde(default)]
+    pub requires_reconfirmation: bool,
 }
 
 impl Method for CronsUpsert {
@@ -1424,12 +1431,42 @@ pub enum CronsSetEnabled {}
 pub struct CronsSetEnabledParams {
     pub cron_id: String,
     pub enabled: bool,
+    /// WEK-53: confirmation token issued by a prior
+    /// `crons.set_enabled { enabled: true, token: None }` call. Required on
+    /// any enable request — the first call with `token: None` issues one
+    /// and returns `requires_confirmation`; the second call must echo it.
+    /// Ignored when `enabled = false` (disable is always allowed without a
+    /// token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_token: Option<String>,
+}
+
+/// WEK-53: short, non-secret summary of what enabling this cron would do
+/// next. Shown alongside the confirmation token so a UX layer can render
+/// "are you sure?" with concrete impact (next fire time, daily budget,
+/// prompt preview) before the user echoes the token.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "CronEnableConfirmation")]
+pub struct CronEnableConfirmation {
+    pub confirmation_token: String,
+    pub prompt_preview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cost_budget: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[schemars(rename = "CronsSetEnabledResult")]
 pub struct CronsSetEnabledResult {
     pub cron: CronEntry,
+    /// WEK-53: when the daemon refuses to enable in one step (i.e. caller
+    /// supplied no `confirmation_token`), this carries the freshly-issued
+    /// token plus a summary. `cron.enabled` stays unchanged. The caller
+    /// must re-issue `crons.set_enabled` with `confirmation_token` set to
+    /// complete the enable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_confirmation: Option<CronEnableConfirmation>,
 }
 
 impl Method for CronsSetEnabled {

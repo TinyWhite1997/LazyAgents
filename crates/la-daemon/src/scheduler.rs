@@ -48,7 +48,7 @@ use la_scheduler::{
     quota::backoff::FailureBackoff, AdmissionDecision, CronQuota, CronSpec, FireEvent, GlobalQuota,
     QuotaSnapshot, Scheduler, SchedulerHandle,
 };
-use la_storage::{Cron, CronUpsert, NewRejectedRun, NewRun, RunFinish, RunRecord, Storage};
+use la_storage::{Cron, NewRejectedRun, NewRun, RunFinish, RunRecord, Storage};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
@@ -108,6 +108,11 @@ impl Default for SchedulerConfig {
 /// shutdown sequence can drain `executor_loop`.
 pub struct SchedulerServices {
     pub handle: SchedulerHandle,
+    /// WEK-53: the single serializer for every `crons.*` IPC write. The
+    /// IPC dispatcher MUST route through this — the `crons` table cannot
+    /// be touched by handlers any other way. See `cron_control.rs` for
+    /// the invariants this enforces.
+    pub control: crate::cron_control::CronControl,
     /// Hard ceiling on global running cron-spawned runs. Read by RPC
     /// handlers that surface the admission decision (e.g. `crons.run_now`).
     pub config: SchedulerConfig,
@@ -283,8 +288,11 @@ impl SchedulerServices {
             shutdown_flag: scheduler_health_shutdown_flag.clone(),
         });
 
+        let control = crate::cron_control::CronControl::new(storage.clone(), handle.clone());
+
         Ok(Self {
             handle,
+            control,
             config,
             queue_depth,
             running_global,
@@ -399,6 +407,43 @@ fn parse_cron_spec(cron: &Cron) -> Result<(CronSpec, CatchupMode, ChronoDuration
     // user that catches up after a long suspend doesn't crash the loop
     // with zero-spaced fires.
     Ok((spec, mode, REPLAY_INTERVAL_FLOOR))
+}
+
+/// Public re-export of [`parse_cron_spec`] for [`crate::cron_control`].
+/// Kept module-private otherwise so external crates can't misuse the
+/// helper as a backdoor around the control channel.
+pub(crate) fn parse_cron_spec_public(
+    cron: &Cron,
+) -> Result<(CronSpec, CatchupMode, ChronoDuration), String> {
+    parse_cron_spec(cron)
+}
+
+/// Public re-export of [`parse_sqlite_lexical_utc`] for
+/// [`crate::cron_control`].
+pub(crate) fn parse_sqlite_lexical_utc_public(s: &str) -> Option<DateTime<Utc>> {
+    parse_sqlite_lexical_utc(s)
+}
+
+/// Public re-export of [`REPLAY_INTERVAL_FLOOR`] for
+/// [`crate::cron_control`].
+pub(crate) const REPLAY_INTERVAL_FLOOR_PUBLIC: ChronoDuration = REPLAY_INTERVAL_FLOOR;
+
+/// Build a [`crate::cron_security::CronSecuritySnapshot`] from a stored
+/// cron row. Used by [`crate::cron_control`] when comparing an upsert
+/// against the existing row to spot sensitive-field edits.
+pub(crate) fn cron_to_security_snapshot(cron: &Cron) -> crate::cron_security::CronSecuritySnapshot {
+    let spawn_args: serde_json::Value =
+        serde_json::from_str(&cron.spawn_args).unwrap_or(serde_json::json!({}));
+    crate::cron_security::CronSecuritySnapshot {
+        backend_id: cron.backend_id.clone(),
+        spawn_args,
+        prompt: cron.prompt.clone(),
+        cron_expr: cron.cron_expr.clone(),
+        tz: cron.tz.clone(),
+        catchup_mode: cron.catchup_mode.clone(),
+        max_runs_per_day: cron.max_runs_per_day,
+        cost_budget_usd_per_day: cron.cost_budget_usd_per_day,
+    }
 }
 
 async fn seed_crons_into_scheduler(
@@ -1376,94 +1421,14 @@ async fn snapshot_errors_last_5m(window: &Arc<Mutex<VecDeque<Instant>>>) -> u32 
 // every cron mutation goes through one place that ALSO drives the heap.
 // ===========================================================================
 
-/// Apply a [`CronUpsert`] to storage AND re-install the entry in the
-/// scheduler heap. Failures roll back neither side; the scheduler error is
-/// surfaced so the dispatcher can return `CRON_INVALID_EXPR` /
-/// `CRON_INVALID_TZ` as appropriate.
-pub async fn upsert_cron(
-    services: &SchedulerServices,
-    storage: &Storage,
-    upsert: CronUpsert,
-) -> Result<Cron, CronOpError> {
-    // Pre-parse so a bad expr/tz never lands a heap-less row.
-    let spec = CronSpec::parse(&upsert.cron_expr, &upsert.tz).map_err(|err| match err {
-        la_scheduler::Error::InvalidExpr { reason, .. } => CronOpError::InvalidExpr(reason),
-        la_scheduler::Error::InvalidTimezone(tz) => CronOpError::InvalidTz(tz),
-        other => CronOpError::Other(other.to_string()),
-    })?;
-    let mode = match upsert.catchup_mode.as_str() {
-        "skip" => CatchupMode::Skip,
-        "replay" => CatchupMode::Replay,
-        _ => CatchupMode::Coalesce,
-    };
-    let enabled = upsert.enabled;
-    let cron = storage.crons().upsert(upsert).await?;
-    if enabled {
-        services
-            .handle
-            .upsert(
-                cron.id.clone(),
-                spec,
-                mode,
-                REPLAY_INTERVAL_FLOOR,
-                cron.last_fired_at
-                    .as_deref()
-                    .and_then(parse_sqlite_lexical_utc),
-            )
-            .await
-            .map_err(|e| CronOpError::Other(e.to_string()))?;
-    } else {
-        let _ = services.handle.delete(cron.id.clone()).await;
-    }
-    Ok(cron)
-}
+// NOTE: the legacy `upsert_cron`, `delete_cron`, and `set_enabled` helpers
+// that used to live here have been removed in favour of
+// [`crate::cron_control::CronControl`]. That serializer owns the
+// `cron_security` state machine and is the only path from an IPC handler
+// to a write on the `crons` table (WEK-53). `run_now` stays here — it
+// reads from `crons` but never writes; the executor is the one that
+// touches `runs`.
 
-pub async fn delete_cron(
-    services: &SchedulerServices,
-    storage: &Storage,
-    cron_id: &str,
-) -> Result<bool, CronOpError> {
-    let removed = storage.crons().delete(cron_id).await?;
-    let _ = services.handle.delete(cron_id.to_string()).await;
-    Ok(removed)
-}
-
-pub async fn set_enabled(
-    services: &SchedulerServices,
-    storage: &Storage,
-    cron_id: &str,
-    enabled: bool,
-) -> Result<Cron, CronOpError> {
-    let _ = storage.crons().set_enabled(cron_id, enabled).await?;
-    let cron = storage
-        .crons()
-        .get(cron_id)
-        .await?
-        .ok_or_else(|| CronOpError::NotFound(cron_id.to_string()))?;
-    if enabled {
-        let (spec, mode, throttle) = parse_cron_spec(&cron).map_err(CronOpError::Other)?;
-        services
-            .handle
-            .upsert(
-                cron.id.clone(),
-                spec,
-                mode,
-                throttle,
-                cron.last_fired_at
-                    .as_deref()
-                    .and_then(parse_sqlite_lexical_utc),
-            )
-            .await
-            .map_err(|e| CronOpError::Other(e.to_string()))?;
-    } else {
-        let _ = services.handle.delete(cron.id.clone()).await;
-    }
-    Ok(cron)
-}
-
-/// Fire a cron immediately, going through the same admission gate as a
-/// scheduled fire. Returns the new run_id when admitted; `None` (with the
-/// reason) when refused.
 pub async fn run_now(
     services: &SchedulerServices,
     storage: &Storage,

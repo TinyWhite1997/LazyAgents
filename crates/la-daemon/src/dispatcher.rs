@@ -1572,10 +1572,11 @@ fn core_to_proto_hunk(h: la_core::Hunk) -> la_proto::methods::Hunk {
 // ===========================================================================
 
 use la_proto::methods::{
-    CronEntry, CronsDeleteParams, CronsDeleteResult, CronsDryRunParams, CronsDryRunResult,
-    CronsGetParams, CronsGetResult, CronsListParams, CronsListResult, CronsRunNowParams,
-    CronsRunNowResult, CronsSetEnabledParams, CronsSetEnabledResult, CronsUpsertParams,
-    CronsUpsertResult, RunEntry, RunsGetParams, RunsGetResult, RunsListParams, RunsListResult,
+    CronEnableConfirmation, CronEntry, CronsDeleteParams, CronsDeleteResult, CronsDryRunParams,
+    CronsDryRunResult, CronsGetParams, CronsGetResult, CronsListParams, CronsListResult,
+    CronsRunNowParams, CronsRunNowResult, CronsSetEnabledParams, CronsSetEnabledResult,
+    CronsUpsertParams, CronsUpsertResult, RunEntry, RunsGetParams, RunsGetResult, RunsListParams,
+    RunsListResult,
 };
 
 fn cron_op_to_rpc(err: crate::scheduler::CronOpError) -> RpcError {
@@ -1590,6 +1591,43 @@ fn cron_op_to_rpc(err: crate::scheduler::CronOpError) -> RpcError {
             format!("invalid timezone: {tz}"),
         ),
         E::Storage(e) => storage_to_rpc(e),
+        E::Other(s) => RpcError::new(error_codes::INTERNAL_ERROR, s),
+    }
+}
+
+fn cron_control_to_rpc(err: crate::cron_control::CronControlError) -> RpcError {
+    use crate::cron_control::CronControlError as E;
+    use crate::cron_security::CronSecurityError as SecErr;
+    match err {
+        E::NotFound(id) => {
+            RpcError::new(error_codes::CRON_NOT_FOUND, format!("cron {id} not found"))
+        }
+        E::InvalidExpr(reason) => RpcError::new(error_codes::CRON_INVALID_EXPR, reason),
+        E::InvalidTz(tz) => RpcError::new(
+            error_codes::CRON_INVALID_TZ,
+            format!("invalid timezone: {tz}"),
+        ),
+        E::Storage(e) => storage_to_rpc(e),
+        E::Security(SecErr::PromptTooLarge { actual, limit }) => RpcError::new(
+            error_codes::CRON_PROMPT_TOO_LARGE,
+            format!("prompt is {actual} bytes; max is {limit}"),
+        ),
+        E::Security(SecErr::InvalidConfirmationToken) => RpcError::new(
+            error_codes::CRON_CONFIRMATION_REQUIRED,
+            "invalid confirmation token; restart the two-step enable flow",
+        ),
+        E::Security(SecErr::ExpiredConfirmationToken) => RpcError::new(
+            error_codes::CRON_CONFIRMATION_REQUIRED,
+            "confirmation token expired; restart the two-step enable flow",
+        ),
+        E::Security(SecErr::TokenCronMismatch) => RpcError::new(
+            error_codes::CRON_CONFIRMATION_REQUIRED,
+            "confirmation token does not belong to this cron",
+        ),
+        E::Security(SecErr::RandomToken) => RpcError::new(
+            error_codes::INTERNAL_ERROR,
+            "failed to generate confirmation token",
+        ),
         E::Other(s) => RpcError::new(error_codes::INTERNAL_ERROR, s),
     }
 }
@@ -1650,7 +1688,9 @@ async fn handle_crons_upsert(
     }
     let id = params.id.unwrap_or_else(la_storage::new_id);
     // Preserve existing counter / last_fired_at on update so a TUI tweak
-    // doesn't reset the cron's history.
+    // doesn't reset the cron's history. The control channel will replace
+    // `enabled` according to the security decision; the value we put here
+    // is intentionally ignored by `CronControl::upsert`.
     let existing = state
         .manager
         .storage()
@@ -1667,7 +1707,10 @@ async fn handle_crons_upsert(
     let upsert = la_storage::CronUpsert {
         id,
         name: params.name,
-        enabled: existing.as_ref().map(|c| c.enabled != 0).unwrap_or(false),
+        // Carried by CronControl::upsert; it overwrites this from the
+        // security decision (new crons stay disabled; sensitive-field
+        // edits force-disable; non-sensitive edits preserve).
+        enabled: false,
         project_id: params.project_id,
         backend_id: params.backend,
         spawn_args: params.spawn_args,
@@ -1685,11 +1728,15 @@ async fn handle_crons_upsert(
         last_fired_at,
         next_fire_at: None,
     };
-    let cron = crate::scheduler::upsert_cron(&ctx.scheduler, state.manager.storage(), upsert)
+    let outcome = ctx
+        .scheduler
+        .control
+        .upsert(upsert)
         .await
-        .map_err(cron_op_to_rpc)?;
+        .map_err(cron_control_to_rpc)?;
     ok(CronsUpsertResult {
-        cron: crate::scheduler::cron_to_wire(cron),
+        cron: crate::scheduler::cron_to_wire(outcome.cron),
+        requires_reconfirmation: outcome.requires_reconfirmation,
     })
 }
 
@@ -1698,10 +1745,13 @@ async fn handle_crons_delete(
     ctx: &ConnectionContext,
     params: CronsDeleteParams,
 ) -> Result<serde_json::Value, RpcError> {
-    let deleted =
-        crate::scheduler::delete_cron(&ctx.scheduler, state.manager.storage(), &params.cron_id)
-            .await
-            .map_err(cron_op_to_rpc)?;
+    let _ = state; // storage access lives behind ctx.scheduler.control
+    let deleted = ctx
+        .scheduler
+        .control
+        .delete(&params.cron_id)
+        .await
+        .map_err(cron_control_to_rpc)?;
     ok(CronsDeleteResult { deleted })
 }
 
@@ -1710,17 +1760,38 @@ async fn handle_crons_set_enabled(
     ctx: &ConnectionContext,
     params: CronsSetEnabledParams,
 ) -> Result<serde_json::Value, RpcError> {
-    let cron = crate::scheduler::set_enabled(
-        &ctx.scheduler,
-        state.manager.storage(),
-        &params.cron_id,
-        params.enabled,
-    )
-    .await
-    .map_err(cron_op_to_rpc)?;
-    ok(CronsSetEnabledResult {
-        cron: crate::scheduler::cron_to_wire(cron),
-    })
+    let _ = state;
+    let now = std::time::Instant::now();
+    let outcome = ctx
+        .scheduler
+        .control
+        .set_enabled(
+            &params.cron_id,
+            params.enabled,
+            params.confirmation_token.as_deref(),
+            now,
+        )
+        .await
+        .map_err(cron_control_to_rpc)?;
+    match outcome {
+        crate::cron_control::SetEnabledOutcome::Applied { cron } => ok(CronsSetEnabledResult {
+            cron: crate::scheduler::cron_to_wire(cron),
+            requires_confirmation: None,
+        }),
+        crate::cron_control::SetEnabledOutcome::RequiresConfirmation {
+            cron,
+            token,
+            summary,
+        } => ok(CronsSetEnabledResult {
+            cron: crate::scheduler::cron_to_wire(cron),
+            requires_confirmation: Some(CronEnableConfirmation {
+                confirmation_token: token.expose_secret().to_string(),
+                prompt_preview: summary.prompt_preview,
+                next_fire_at: summary.next_fire_at,
+                daily_cost_budget: summary.budget,
+            }),
+        }),
+    }
 }
 
 async fn handle_crons_run_now(

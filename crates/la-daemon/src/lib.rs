@@ -23,6 +23,7 @@
 //! without going through the binary's CLI parser.
 
 pub mod config_cmd;
+pub mod cron_control;
 pub mod cron_security;
 pub mod daemonize;
 pub mod dispatcher;

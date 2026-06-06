@@ -1046,6 +1046,14 @@ fn error_kind_to_code_table_is_pinned() {
         ),
         (ErrorKind::CronInvalidTz, error_codes::CRON_INVALID_TZ),
         (
+            ErrorKind::CronConfirmationRequired,
+            error_codes::CRON_CONFIRMATION_REQUIRED,
+        ),
+        (
+            ErrorKind::CronPromptTooLarge,
+            error_codes::CRON_PROMPT_TOO_LARGE,
+        ),
+        (
             ErrorKind::WorktreeUnavailable,
             error_codes::WORKTREE_UNAVAILABLE,
         ),

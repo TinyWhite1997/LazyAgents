@@ -272,6 +272,43 @@ fn rand_id() -> i64 {
     REQ_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
+/// WEK-53: enable a cron through the two-step confirmation flow. First
+/// call returns a token; second call echoes it to actually flip
+/// `enabled = true`. Most tests in this file do not exercise the token
+/// state machine itself — they just need an enabled cron — so this
+/// helper hides the round trip.
+async fn enable_cron(
+    conn: &mut Connection<tokio::net::UnixStream>,
+    cron_id: &str,
+) -> CronsSetEnabledResult {
+    let first: CronsSetEnabledResult = call(
+        conn,
+        "crons.set_enabled",
+        &CronsSetEnabledParams {
+            cron_id: cron_id.to_string(),
+            enabled: true,
+            confirmation_token: None,
+        },
+    )
+    .await;
+    let token = first
+        .requires_confirmation
+        .as_ref()
+        .map(|c| c.confirmation_token.clone())
+        .expect("first set_enabled should return a confirmation token");
+    assert!(!first.cron.enabled, "first call must not enable");
+    call(
+        conn,
+        "crons.set_enabled",
+        &CronsSetEnabledParams {
+            cron_id: cron_id.to_string(),
+            enabled: true,
+            confirmation_token: Some(token),
+        },
+    )
+    .await
+}
+
 /// Insert a project + cron straight through storage so the test can drive
 /// the daemon's cron RPC without first walking sessions.create.
 async fn seed_project_row(state_dir: &std::path::Path, root: &str) -> String {
@@ -351,15 +388,7 @@ async fn crons_upsert_list_dry_run_round_trip() {
     // Upsert starts as disabled until set_enabled.
     assert!(!upserted.cron.enabled);
 
-    let enabled: CronsSetEnabledResult = call(
-        &mut conn,
-        "crons.set_enabled",
-        &CronsSetEnabledParams {
-            cron_id: upserted.cron.id.clone(),
-            enabled: true,
-        },
-    )
-    .await;
+    let enabled = enable_cron(&mut conn, &upserted.cron.id).await;
     assert!(enabled.cron.enabled);
 
     let listed: CronsListResult = call(
@@ -417,15 +446,7 @@ async fn crons_run_now_admits_through_admission_lock_with_global_cap_one() {
             },
         )
         .await;
-        let _ = call::<_, CronsSetEnabledResult>(
-            &mut conn,
-            "crons.set_enabled",
-            &CronsSetEnabledParams {
-                cron_id: up.cron.id.clone(),
-                enabled: true,
-            },
-        )
-        .await;
+        let _ = enable_cron(&mut conn, &up.cron.id).await;
         cron_ids.push(up.cron.id);
     }
 
@@ -599,15 +620,7 @@ async fn graceful_shutdown_drains_pending_fires_into_runs_table() {
         },
     )
     .await;
-    let _ = call::<_, CronsSetEnabledResult>(
-        &mut conn,
-        "crons.set_enabled",
-        &CronsSetEnabledParams {
-            cron_id: up.cron.id.clone(),
-            enabled: true,
-        },
-    )
-    .await;
+    let _ = enable_cron(&mut conn, &up.cron.id).await;
     let r: CronsRunNowResult = call(
         &mut conn,
         "crons.run_now",

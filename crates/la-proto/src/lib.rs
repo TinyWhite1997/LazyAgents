@@ -222,6 +222,15 @@ pub mod error_codes {
     pub const CRON_BUDGET_EXCEEDED: i32 = -33303;
     /// `-33304` — invalid IANA timezone in `tz`.
     pub const CRON_INVALID_TZ: i32 = -33304;
+    /// `-33305` — `crons.set_enabled { enabled: true }` was called with a
+    /// confirmation token that is unknown, expired, or belongs to a
+    /// different cron. The caller must restart the two-step flow by
+    /// issuing the same RPC with `confirmation_token = None`.
+    pub const CRON_CONFIRMATION_REQUIRED: i32 = -33305;
+    /// `-33306` — sensitive cron field (prompt / backend / spawn args /
+    /// schedule / timezone / catch-up / max runs / cost budget) violates
+    /// a backend constraint (today: prompt exceeds the 64 KiB cap).
+    pub const CRON_PROMPT_TOO_LARGE: i32 = -33306;
 }
 
 /// Classifies an internal error before it crosses the IPC boundary, so
@@ -288,6 +297,8 @@ pub enum ErrorKind {
     CronInvalidExpr,
     CronBudgetExceeded,
     CronInvalidTz,
+    CronConfirmationRequired,
+    CronPromptTooLarge,
 }
 
 impl ErrorKind {
@@ -337,6 +348,8 @@ impl ErrorKind {
             ErrorKind::CronInvalidExpr => CRON_INVALID_EXPR,
             ErrorKind::CronBudgetExceeded => CRON_BUDGET_EXCEEDED,
             ErrorKind::CronInvalidTz => CRON_INVALID_TZ,
+            ErrorKind::CronConfirmationRequired => CRON_CONFIRMATION_REQUIRED,
+            ErrorKind::CronPromptTooLarge => CRON_PROMPT_TOO_LARGE,
         }
     }
 }
