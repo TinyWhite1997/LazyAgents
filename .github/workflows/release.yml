@@ -644,6 +644,113 @@ jobs:
           mv "$out.tmp" "$out"
           cat "$out"
 
+      # Runtime smoke — extracted-archive `la --version` + `lad --help`.
+      # This is the "every shipped binary actually launches" check that
+      # WEK-66 review surfaced as missing: the size + ldd inspections
+      # above prove the binaries are the right shape, but they never
+      # exec the bytes a user downloads. Each shipped tarball / zip
+      # has been extracted into `target/distrib/_extracted/<target>/`
+      # by the step above; we walk it for the per-target `la`/`lad`
+      # entry points and call them.
+      #
+      # Native targets (linux-gnu x86_64, both darwins, windows-msvc,
+      # and linux-musl which is x86_64 on an x86_64 runner) exec
+      # directly — runner ABI matches binary ABI.
+      #
+      # aarch64-unknown-linux-gnu cannot exec on the x86_64 ubuntu
+      # runner: this branch installs `qemu-user-static` (binfmt_misc
+      # auto-routes ./la → qemu-aarch64 once the package is in place
+      # on ubuntu-22.04) and re-runs the same `--version` / `--help`
+      # invocations. B2 (a dedicated `ubuntu-24.04-arm` smoke job
+      # downloading the archive artifact) is the architect's preferred
+      # long-term shape; the qemu route here is the WEK-66 B1 trade-off
+      # that lands smoke coverage in the same `build` job without
+      # adding a new matrix leg.
+      #
+      # `la --version` exits 0 with `la <version>`; `lad --help`
+      # exits 0 with the daemon's USAGE block (see
+      # crates/la-daemon/src/main.rs `print_help`). Anything else
+      # fails the release build, which is the point.
+      - name: install qemu-user-static (aarch64-linux smoke)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          # We exec the aarch64 binary via an explicit
+          # `qemu-aarch64-static` wrapper rather than relying on
+          # binfmt_misc auto-routing; the apt post-install does
+          # register binfmt entries on ubuntu, but the explicit
+          # wrapper keeps the smoke deterministic across runner
+          # image refreshes and makes the failure mode obvious in
+          # logs (no "Exec format error" mystery).
+          command -v qemu-aarch64-static
+          qemu-aarch64-static --version | head -1
+      - name: runtime smoke (la --version / lad --help)
+        shell: bash
+        run: |
+          set -euo pipefail
+          extracted="target/distrib/_extracted/${{ matrix.target }}"
+          # Need-emulation flag — only the aarch64-linux leg on the
+          # x86_64 ubuntu runner needs qemu. All other targets (native
+          # gnu/musl x86_64, native macOS arm64/x86_64, native
+          # windows-msvc) exec directly.
+          runner=""
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu) runner="qemu-aarch64-static" ;;
+          esac
+          # Collect every shipped la* / lad* entry point. WEK-78
+          # hotfix #2 pattern — bash 3-compatible while-read, since
+          # the same snippet shape is used on macOS runners (bash 3.2).
+          bins=()
+          while IFS= read -r line; do
+            bins+=("$line")
+          done < <(find "$extracted" -type f \( -name la -o -name lad -o -name la.exe -o -name lad.exe \))
+          if [[ ${#bins[@]} -eq 0 ]]; then
+            echo "::error::no la/lad binary inside extracted archives for ${{ matrix.target }}"
+            exit 1
+          fi
+          fail=0
+          for bin in "${bins[@]}"; do
+            name=$(basename "$bin")
+            # Build the argv: [<emulator>] <bin> --version|--help.
+            case "$name" in
+              la|la.exe)
+                echo "=== ${runner:+$runner }$bin --version ==="
+                if [[ -n "$runner" ]]; then
+                  if ! "$runner" "$bin" --version; then
+                    echo "::error::$runner $bin --version failed (exit $?)"
+                    fail=1
+                  fi
+                else
+                  if ! "$bin" --version; then
+                    echo "::error::$bin --version failed (exit $?)"
+                    fail=1
+                  fi
+                fi
+                ;;
+              lad|lad.exe)
+                # `lad --help` on a fresh runner has no daemon to talk
+                # to but the help path is pure stdout — no socket,
+                # no config probe — so it returns 0 anywhere.
+                echo "=== ${runner:+$runner }$bin --help ==="
+                if [[ -n "$runner" ]]; then
+                  if ! "$runner" "$bin" --help; then
+                    echo "::error::$runner $bin --help failed (exit $?)"
+                    fail=1
+                  fi
+                else
+                  if ! "$bin" --help; then
+                    echo "::error::$bin --help failed (exit $?)"
+                    fail=1
+                  fi
+                fi
+                ;;
+            esac
+          done
+          exit "$fail"
+
       # Clean up the inspection scratch dir so it can't be uploaded into
       # the release artifact bundle below.
       - name: drop inspection scratch dir
@@ -798,6 +905,16 @@ jobs:
             echo "This release ships a statically-linked \`x86_64-unknown-linux-musl\` artifact alongside the GNU Linux targets, per v1.1 扩展架构 §13. Suitable for Alpine / glibc-less environments."
             echo
             echo "\`aarch64-unknown-linux-musl\` is **not** in this release; it is tracked for v1.x via [WEK-80](https://github.com/TinyWhite1997/LazyAgents/issues) (推 v1.x)."
+            echo
+            echo "## Verifying release artifacts (sigstore / GitHub Attestations)"
+            echo
+            echo "All published archives, binaries, and installer scripts are signed via keyless sigstore through [actions/attest-build-provenance](https://github.com/actions/attest-build-provenance). Verify any asset before installing:"
+            echo
+            echo "\`\`\`sh"
+            echo "gh attestation verify <file> --repo TinyWhite1997/LazyAgents"
+            echo "\`\`\`"
+            echo
+            echo "This uses \`gh attestation\` (sigstore SLSA provenance via Fulcio + Rekor) — **not** \`cosign verify-blob\`. cargo-dist switched from standalone cosign to GitHub Attestations starting with this release line; the trust root is identical (sigstore public-good), and the \`gh\` CLI ships verification offline-capable via \`gh attestation download\` + \`gh attestation verify --bundle\`. A successful run prints the workflow ref (\`refs/tags/v0.X.Y\`), commit SHA, and runner environment that produced the artifact — confirm those match the tag you intended to install before trusting the binary."
             echo
             echo "## Fork / internal-mirror escape hatch — \`LAZYAGENTS_UPDATE_MANIFEST_URL\`"
             echo
