@@ -10,10 +10,10 @@
 //! - A second import call is idempotent — same `session_id` comes back,
 //!   no duplicate row.
 
-// Daemon IPC is UDS-only on unix; the Windows named-pipe path is
-// covered by separate tests. Gating the whole file keeps the WEK-72
-// matrix CI green without piecemeal `#[cfg(unix)]` annotations.
-#![cfg(unix)]
+// Talks to the daemon over the cross-platform IPC harness from
+// la_ipc::transport (UDS on Unix, Named Pipe on Windows).
+
+mod support;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ use std::time::Duration;
 use la_adapter::codex::{CodexAdapter, SESSIONS_DIR_ENV};
 use la_adapter::AgentAdapter;
 use la_daemon::{Daemon, DaemonConfig, DaemonHandle, SocketDiscovery};
-use la_ipc::transport::{connect, Endpoint};
+use la_ipc::transport::{connect, endpoint_for, StreamPair};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
 use la_proto::methods::{
@@ -53,7 +53,7 @@ async fn bootstrap(adapters: HashMap<String, Arc<dyn AgentAdapter>>) -> TestDaem
     let state_dir = tempdir.path().join("state");
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
-    let socket = runtime_dir.join("lad-1.sock");
+    let socket = support::unique_socket_path(&runtime_dir);
     let config = DaemonConfig {
         state_dir,
         socket_discovery: SocketDiscovery::with_override(socket.clone()),
@@ -65,7 +65,7 @@ async fn bootstrap(adapters: HashMap<String, Arc<dyn AgentAdapter>>) -> TestDaem
     let (handle, join) = daemon.spawn();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if connect(&Endpoint::uds(&socket)).await.is_ok() {
+        if connect(&endpoint_for(&socket)).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -78,8 +78,8 @@ async fn bootstrap(adapters: HashMap<String, Arc<dyn AgentAdapter>>) -> TestDaem
     }
 }
 
-async fn client(socket: &std::path::Path) -> Connection<tokio::net::UnixStream> {
-    let stream = connect(&Endpoint::uds(socket)).await.expect("connect");
+async fn client(socket: &std::path::Path) -> Connection<StreamPair> {
+    let stream = connect(&endpoint_for(socket)).await.expect("connect");
     let mut conn = Connection::new(stream);
     let info = client_handshake(
         &mut conn,
@@ -93,12 +93,7 @@ async fn client(socket: &std::path::Path) -> Connection<tokio::net::UnixStream> 
     conn
 }
 
-async fn call<T, R>(
-    conn: &mut Connection<tokio::net::UnixStream>,
-    id: i64,
-    method: &str,
-    params: T,
-) -> R
+async fn call<T, R>(conn: &mut Connection<StreamPair>, id: i64, method: &str, params: T) -> R
 where
     T: serde::Serialize,
     R: serde::de::DeserializeOwned,
@@ -130,11 +125,14 @@ fn write_codex_fixture(root: &std::path::Path, project_a: &std::path::Path) -> P
     let day = root.join("2026").join("06").join("03");
     std::fs::create_dir_all(&day).unwrap();
     let path = day.join("rollout-019e0000-0000-0000-0000-000000000aaa.jsonl");
+    // serde_json::to_string handles backslash + quote escaping so the
+    // Windows path form (`C:\Users\...`) embeds as a valid JSON string.
+    let cwd_lit =
+        serde_json::to_string(&project_a.to_string_lossy().into_owned()).expect("encode cwd");
     std::fs::write(
         &path,
         format!(
-            "{{\"timestamp\":\"2026-06-03T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019e0000-0000-0000-0000-000000000aaa\",\"timestamp\":\"2026-06-03T08:00:00Z\",\"cwd\":\"{}\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.135.0\"}}}}\n",
-            project_a.display()
+            "{{\"timestamp\":\"2026-06-03T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019e0000-0000-0000-0000-000000000aaa\",\"timestamp\":\"2026-06-03T08:00:00Z\",\"cwd\":{cwd_lit},\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.135.0\"}}}}\n"
         ),
     )
     .unwrap();
@@ -271,7 +269,7 @@ async fn discover_then_import_lands_external_row_and_is_idempotent() {
 }
 
 async fn call_for_error<T>(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     id: i64,
     method: &str,
     params: T,
@@ -414,11 +412,12 @@ async fn re_import_returns_snapshot_created_at_even_if_payload_drifts() {
     let day = codex_root.path().join("2026").join("06").join("03");
     std::fs::create_dir_all(&day).unwrap();
     let path = day.join("rollout-019e0000-0000-0000-0000-000000000eee.jsonl");
+    let cwd_lit = serde_json::to_string(&project_a.path().to_string_lossy().into_owned())
+        .expect("encode cwd");
     std::fs::write(
         &path,
         format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019e0000-0000-0000-0000-000000000eee\",\"timestamp\":\"2026-06-03T08:00:00Z\",\"cwd\":\"{}\"}}}}\n",
-            project_a.path().display()
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019e0000-0000-0000-0000-000000000eee\",\"timestamp\":\"2026-06-03T08:00:00Z\",\"cwd\":{cwd_lit}}}}}\n"
         ),
     )
     .unwrap();
@@ -464,11 +463,12 @@ async fn re_import_returns_snapshot_created_at_even_if_payload_drifts() {
 
     // Rewrite the backend's payload with a different timestamp,
     // simulating the backend changing how it records start time.
+    let cwd_lit = serde_json::to_string(&project_a.path().to_string_lossy().into_owned())
+        .expect("encode cwd");
     std::fs::write(
         &path,
         format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019e0000-0000-0000-0000-000000000eee\",\"timestamp\":\"2099-12-31T23:59:59Z\",\"cwd\":\"{}\"}}}}\n",
-            project_a.path().display()
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019e0000-0000-0000-0000-000000000eee\",\"timestamp\":\"2099-12-31T23:59:59Z\",\"cwd\":{cwd_lit}}}}}\n"
         ),
     )
     .unwrap();

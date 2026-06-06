@@ -12,9 +12,12 @@
 //! 5. Graceful shutdown: buffered fires drain into `runs` before
 //!    `Daemon::accept_loop` returns; no admission writes are lost.
 
-// Talks to the daemon over UDS; gated to unix for the WEK-72 matrix
-// CI. The Windows pipe path has its own coverage.
-#![cfg(unix)]
+// Talks to the daemon over the cross-platform IPC harness from
+// la_ipc::transport (UDS on Unix, Named Pipe on Windows). Tests that
+// actually spawn a `sh` script (cron run_now, graceful drain) are gated
+// per-fn with `#[cfg(unix)]`; the upsert/list/error paths run tri-OS.
+
+mod support;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,7 +28,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use la_adapter::{AdapterDescriptor, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec};
 use la_daemon::{Daemon, DaemonConfig, SchedulerConfig, SocketDiscovery};
-use la_ipc::transport::{connect, Endpoint};
+use la_ipc::transport::{connect, endpoint_for, StreamPair};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
 use la_proto::methods::{
@@ -64,13 +67,13 @@ impl AgentAdapter for EchoAdapter {
     fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, la_adapter::AdapterError> {
         // Build a tiny script that exits quickly. Using `sh -c "true"` keeps
         // the cron run lifecycle fully contained inside the test.
-        let script_dir = std::env::temp_dir().join("lazyagents-wek57-scripts");
-        std::fs::create_dir_all(&script_dir).map_err(la_adapter::AdapterError::SpawnFailed)?;
-        let script_path = script_dir.join(format!("{}.sh", la_storage::new_id()));
-        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n")
-            .map_err(la_adapter::AdapterError::SpawnFailed)?;
         #[cfg(unix)]
         {
+            let script_dir = std::env::temp_dir().join("lazyagents-wek57-scripts");
+            std::fs::create_dir_all(&script_dir).map_err(la_adapter::AdapterError::SpawnFailed)?;
+            let script_path = script_dir.join(format!("{}.sh", la_storage::new_id()));
+            std::fs::write(&script_path, "#!/bin/sh\nexit 0\n")
+                .map_err(la_adapter::AdapterError::SpawnFailed)?;
             use std::os::unix::fs::PermissionsExt as _;
             let mut perm = std::fs::metadata(&script_path)
                 .map_err(la_adapter::AdapterError::SpawnFailed)?
@@ -78,15 +81,22 @@ impl AgentAdapter for EchoAdapter {
             perm.set_mode(0o700);
             std::fs::set_permissions(&script_path, perm)
                 .map_err(la_adapter::AdapterError::SpawnFailed)?;
+            Ok(SpawnSpec {
+                program: script_path,
+                args: vec![],
+                env: req.env.clone(),
+                cwd: req.cwd.clone(),
+                pty: req.pty,
+                stdin_mode: req.stdin_mode,
+            })
         }
-        Ok(SpawnSpec {
-            program: script_path,
-            args: vec![],
-            env: req.env.clone(),
-            cwd: req.cwd.clone(),
-            pty: req.pty,
-            stdin_mode: req.stdin_mode,
-        })
+        #[cfg(not(unix))]
+        {
+            let _ = req;
+            // Only the cron `run_now` tests (Unix-only per-fn gated) exercise
+            // spawn — never called on Windows.
+            unreachable!("EchoAdapter::spawn_spec is only exercised by Unix-only tests")
+        }
     }
 
     fn encode_user_input(&self, text: &str) -> Bytes {
@@ -119,14 +129,14 @@ impl AgentAdapter for SleepAdapter {
     }
 
     fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, la_adapter::AdapterError> {
-        let secs = self.seconds;
-        let script_dir = std::env::temp_dir().join("lazyagents-wek57-sleep-scripts");
-        std::fs::create_dir_all(&script_dir).map_err(la_adapter::AdapterError::SpawnFailed)?;
-        let script_path = script_dir.join(format!("{}.sh", la_storage::new_id()));
-        std::fs::write(&script_path, format!("#!/bin/sh\nsleep {secs}\nexit 0\n"))
-            .map_err(la_adapter::AdapterError::SpawnFailed)?;
         #[cfg(unix)]
         {
+            let secs = self.seconds;
+            let script_dir = std::env::temp_dir().join("lazyagents-wek57-sleep-scripts");
+            std::fs::create_dir_all(&script_dir).map_err(la_adapter::AdapterError::SpawnFailed)?;
+            let script_path = script_dir.join(format!("{}.sh", la_storage::new_id()));
+            std::fs::write(&script_path, format!("#!/bin/sh\nsleep {secs}\nexit 0\n"))
+                .map_err(la_adapter::AdapterError::SpawnFailed)?;
             use std::os::unix::fs::PermissionsExt as _;
             let mut perm = std::fs::metadata(&script_path)
                 .map_err(la_adapter::AdapterError::SpawnFailed)?
@@ -134,15 +144,20 @@ impl AgentAdapter for SleepAdapter {
             perm.set_mode(0o700);
             std::fs::set_permissions(&script_path, perm)
                 .map_err(la_adapter::AdapterError::SpawnFailed)?;
+            Ok(SpawnSpec {
+                program: script_path,
+                args: vec![],
+                env: req.env.clone(),
+                cwd: req.cwd.clone(),
+                pty: req.pty,
+                stdin_mode: req.stdin_mode,
+            })
         }
-        Ok(SpawnSpec {
-            program: script_path,
-            args: vec![],
-            env: req.env.clone(),
-            cwd: req.cwd.clone(),
-            pty: req.pty,
-            stdin_mode: req.stdin_mode,
-        })
+        #[cfg(not(unix))]
+        {
+            let _ = (req, self.seconds);
+            unreachable!("SleepAdapter::spawn_spec is only exercised by Unix-only tests")
+        }
     }
 
     fn encode_user_input(&self, text: &str) -> Bytes {
@@ -163,7 +178,7 @@ async fn bootstrap(adapter: Arc<dyn AgentAdapter>, scheduler_cfg: SchedulerConfi
     let state_dir = tempdir.path().join("state");
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
-    let socket = runtime_dir.join("lad-1.sock");
+    let socket = support::unique_socket_path(&runtime_dir);
     let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
     adapters.insert("shtest".into(), adapter);
 
@@ -180,7 +195,7 @@ async fn bootstrap(adapter: Arc<dyn AgentAdapter>, scheduler_cfg: SchedulerConfi
     // Wait briefly for the accept loop.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if connect(&Endpoint::uds(&socket)).await.is_ok() {
+        if connect(&endpoint_for(&socket)).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -193,8 +208,8 @@ async fn bootstrap(adapter: Arc<dyn AgentAdapter>, scheduler_cfg: SchedulerConfi
     }
 }
 
-async fn client(socket: &std::path::Path) -> Connection<tokio::net::UnixStream> {
-    let stream = connect(&Endpoint::uds(socket)).await.expect("connect");
+async fn client(socket: &std::path::Path) -> Connection<StreamPair> {
+    let stream = connect(&endpoint_for(socket)).await.expect("connect");
     let mut conn = Connection::new(stream);
     let _ = client_handshake(&mut conn, "wek57", "0.0.0", &[la_proto::PROTOCOL_VERSION])
         .await
@@ -202,7 +217,7 @@ async fn client(socket: &std::path::Path) -> Connection<tokio::net::UnixStream> 
     conn
 }
 
-async fn call<T, R>(conn: &mut Connection<tokio::net::UnixStream>, method: &str, params: &T) -> R
+async fn call<T, R>(conn: &mut Connection<StreamPair>, method: &str, params: &T) -> R
 where
     T: serde::Serialize,
     R: serde::de::DeserializeOwned,
@@ -237,7 +252,7 @@ where
 }
 
 async fn call_raw(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, la_proto::jsonrpc::RpcError> {
@@ -277,10 +292,7 @@ fn rand_id() -> i64 {
 /// `enabled = true`. Most tests in this file do not exercise the token
 /// state machine itself — they just need an enabled cron — so this
 /// helper hides the round trip.
-async fn enable_cron(
-    conn: &mut Connection<tokio::net::UnixStream>,
-    cron_id: &str,
-) -> CronsSetEnabledResult {
+async fn enable_cron(conn: &mut Connection<StreamPair>, cron_id: &str) -> CronsSetEnabledResult {
     let first: CronsSetEnabledResult = call(
         conn,
         "crons.set_enabled",
@@ -406,6 +418,10 @@ async fn crons_upsert_list_dry_run_round_trip() {
     let _ = timeout(Duration::from_secs(5), td.join).await;
 }
 
+// Unix-only: actually spawns the sh-script EchoAdapter/SleepAdapter
+// through the daemon's executor + PTY layer. Windows replacement would
+// need a Win32-portable spawn fixture; tracked separately.
+#[cfg(unix)]
 #[tokio::test]
 async fn crons_run_now_admits_through_admission_lock_with_global_cap_one() {
     // Global cap = 1 so even concurrent run_now calls cannot both spawn.
@@ -577,6 +593,9 @@ async fn invalid_cron_expr_returns_cron_invalid_expr() {
     let _ = timeout(Duration::from_secs(5), td.join).await;
 }
 
+// Unix-only: relies on the sh-script EchoAdapter actually spawning a
+// PTY child for the cron run. Windows replacement deferred.
+#[cfg(unix)]
 #[tokio::test]
 async fn graceful_shutdown_drains_pending_fires_into_runs_table() {
     // Boot a daemon, seed a cron, fire run_now → confirm `runs` row

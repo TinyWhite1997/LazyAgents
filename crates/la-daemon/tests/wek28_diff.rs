@@ -9,10 +9,13 @@
 //! > Story 'Agent edited 10 files' reviews smoothly
 //! > Discard has 二次确认 (double confirmation)
 
-// Talks to the daemon over UDS; the Windows pipe path is exercised
-// by separate Windows-specific tests. Gating the whole file keeps
-// the WEK-72 matrix CI green on windows-2022.
-#![cfg(unix)]
+// Talks to the daemon over the cross-platform IPC harness from
+// la_ipc::transport (UDS on Unix, Named Pipe on Windows). The full
+// diff round-trip tests still spawn a `sh` script for the long-running
+// idle session and are gated per-fn with `#[cfg(unix)]`; the IPC layer
+// itself is tri-OS.
+
+mod support;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +28,7 @@ use la_adapter::{
     AdapterDescriptor, AdapterError, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec,
 };
 use la_daemon::{Daemon, DaemonConfig, DaemonHandle, SocketDiscovery};
-use la_ipc::transport::{connect, Endpoint};
+use la_ipc::transport::{connect, endpoint_for, StreamPair};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId, ResponseOutcome, RpcError};
 use la_proto::methods::{
@@ -61,27 +64,41 @@ impl AgentAdapter for IdleShell {
     }
 
     fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, AdapterError> {
-        // `sleep` keeps the PTY alive long enough for our RPC calls to
-        // land; the test cleans up by dropping the daemon at end of run.
-        let script_dir = std::env::temp_dir().join("lazyagents-wek28-test-scripts");
-        std::fs::create_dir_all(&script_dir).map_err(AdapterError::SpawnFailed)?;
-        let script_path = script_dir.join(format!("{}.sh", la_storage::new_id()));
-        std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n").map_err(AdapterError::SpawnFailed)?;
+        // Keep the PTY alive long enough for our RPC calls to land. The
+        // m2-smoke harness already established `ping.exe -n 61 127.0.0.1`
+        // as the Windows long-running fixture that sidesteps la-pty's
+        // shell-wrapper rejection; mirror it here.
+        #[cfg(windows)]
+        {
+            return Ok(SpawnSpec {
+                program: PathBuf::from("ping.exe"),
+                args: vec!["-n".into(), "61".into(), "127.0.0.1".into()],
+                env: req.env.clone(),
+                cwd: req.cwd.clone(),
+                pty: req.pty,
+                stdin_mode: req.stdin_mode,
+            });
+        }
         #[cfg(unix)]
         {
+            let script_dir = std::env::temp_dir().join("lazyagents-wek28-test-scripts");
+            std::fs::create_dir_all(&script_dir).map_err(AdapterError::SpawnFailed)?;
+            let script_path = script_dir.join(format!("{}.sh", la_storage::new_id()));
+            std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n")
+                .map_err(AdapterError::SpawnFailed)?;
             use std::os::unix::fs::PermissionsExt;
 
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
                 .map_err(AdapterError::SpawnFailed)?;
+            Ok(SpawnSpec {
+                program: script_path,
+                args: Vec::new(),
+                env: req.env.clone(),
+                cwd: req.cwd.clone(),
+                pty: req.pty,
+                stdin_mode: req.stdin_mode,
+            })
         }
-        Ok(SpawnSpec {
-            program: script_path,
-            args: Vec::new(),
-            env: req.env.clone(),
-            cwd: req.cwd.clone(),
-            pty: req.pty,
-            stdin_mode: req.stdin_mode,
-        })
     }
 
     fn encode_user_input(&self, text: &str) -> Bytes {
@@ -102,7 +119,7 @@ async fn bootstrap() -> TestDaemon {
     let state_dir = tempdir.path().join("state");
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
-    let socket = runtime_dir.join("lad-1.sock");
+    let socket = support::unique_socket_path(&runtime_dir);
     let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
     adapters.insert("idle".to_string(), Arc::new(IdleShell));
     let config = DaemonConfig {
@@ -116,7 +133,7 @@ async fn bootstrap() -> TestDaemon {
     let (handle, join) = daemon.spawn();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if connect(&Endpoint::uds(&socket)).await.is_ok() {
+        if connect(&endpoint_for(&socket)).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -129,8 +146,8 @@ async fn bootstrap() -> TestDaemon {
     }
 }
 
-async fn client(socket: &Path) -> Connection<tokio::net::UnixStream> {
-    let stream = connect(&Endpoint::uds(socket)).await.expect("connect");
+async fn client(socket: &Path) -> Connection<StreamPair> {
+    let stream = connect(&endpoint_for(socket)).await.expect("connect");
     let mut conn = Connection::new(stream);
     let info = client_handshake(
         &mut conn,
@@ -149,12 +166,7 @@ async fn client(socket: &Path) -> Connection<tokio::net::UnixStream> {
     conn
 }
 
-async fn call<T, R>(
-    conn: &mut Connection<tokio::net::UnixStream>,
-    id: i64,
-    method: &str,
-    params: T,
-) -> R
+async fn call<T, R>(conn: &mut Connection<StreamPair>, id: i64, method: &str, params: T) -> R
 where
     T: serde::Serialize,
     R: serde::de::DeserializeOwned,
@@ -180,7 +192,7 @@ where
 }
 
 async fn call_expect_err(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     id: i64,
     method: &str,
     params: impl serde::Serialize,
@@ -242,6 +254,10 @@ async fn make_project_repo() -> (TempDir, PathBuf) {
     (td, repo)
 }
 
+// Unix-only: drives the daemon's sh-script IdleShell adapter to keep a
+// PTY session alive. Windows equivalent needs a Win32-portable
+// long-lived session fixture; tracked separately.
+#[cfg(unix)]
 #[tokio::test]
 async fn wek28_full_diff_review_round_trip() {
     let (_proj, repo) = make_project_repo().await;
@@ -408,6 +424,9 @@ async fn wek28_full_diff_review_round_trip() {
     assert_eq!(contents, "line0\nline1\nline2\n");
 }
 
+// Tri-OS: only exercises `sessions.create` + `worktree.status`'s
+// error path. IdleShell ports to Windows via `ping.exe -n 61 127.0.0.1`,
+// and the worktree-unavailable check is pure RPC.
 #[tokio::test]
 async fn wek28_status_on_nonworktree_session_returns_unavailable() {
     let (_proj, repo) = make_project_repo().await;
