@@ -142,14 +142,16 @@ jobs:
     env:
       # PR-only stand-in for the resolved tag. `dist build` requires the
       # tag's version to match the workspace's actual published version
-      # (currently 0.1.0-rc.1 — see crates/la-daemon/Cargo.toml; bumped
-      # from 0.1.0 in PR #62 / WEK-78). Bump this in lock-step with
-      # `[package] version` whenever the workspace version changes
-      # (full-repo `git grep -nE '0\.[0-9]+\.[0-9]+' .github/workflows/`
-      # before tagging is the next-to-last gate); otherwise `dist build`
-      # errors with "This workspace doesn't have anything for dist to
-      # Release". Never pushed; only used by `dist build --tag=`.
-      PR_DRYRUN_TAG: "v0.1.0-rc.1"
+      # (currently 0.1.0 — see crates/la-daemon/Cargo.toml; bumped from
+      # 0.1.0-rc.1 in WEK-91 follow-up alongside the v0.1.0 GA cut, and
+      # from 0.1.0 to 0.1.0-rc.1 in PR #62 / WEK-78 before that). Bump
+      # this in lock-step with `[package] version` whenever the
+      # workspace version changes (full-repo
+      # `git grep -nE '0\.[0-9]+\.[0-9]+' .github/workflows/` before
+      # tagging is the next-to-last gate); otherwise `dist build` errors
+      # with "This workspace doesn't have anything for dist to Release".
+      # Never pushed; only used by `dist build --tag=`.
+      PR_DRYRUN_TAG: "v0.1.0"
     steps:
       - uses: actions/checkout@v4
         with:
