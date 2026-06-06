@@ -58,6 +58,7 @@ GLOBAL FLAGS:
     --log-format <fmt> json|compact (default json).
     --config <path>    Override the config file (default = resolve_config_path()).
     -h, --help         Show this help.
+    -V, --version      Print version and exit (also accepted as `version`).
 
 INSTALL FLAGS (install / uninstall):
     --service <mode>   systemd | launchd | windows-task   (required)
@@ -110,6 +111,7 @@ enum Command {
     Install(InstallSpec),
     Uninstall(UninstallSpec),
     Help,
+    Version,
 }
 
 #[derive(Default)]
@@ -160,6 +162,11 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         "install" => Command::Install(InstallSpec::default()),
         "uninstall" => Command::Uninstall(UninstallSpec::default()),
         "-h" | "--help" | "help" => Command::Help,
+        // WEK-91: `--version` / `-V` mirrors la (TUI); also lets the
+        // WEK-80 aarch64-musl smoke step in .github/workflows/release.yml
+        // probe a clean binary load without invoking a doctor path that
+        // depends on a workspace/state-dir layout.
+        "-V" | "--version" | "version" => Command::Version,
         other => return Err(format!("unknown command: {other}")),
     };
 
@@ -354,6 +361,10 @@ fn run(p: Parsed) -> ExitCode {
     match &p.cmd {
         Command::Help => {
             println!("{HELP}");
+            ExitCode::SUCCESS
+        }
+        Command::Version => {
+            println!("lad {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Command::Config { sub } => run_config(sub, &p),
