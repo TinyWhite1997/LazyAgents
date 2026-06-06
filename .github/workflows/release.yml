@@ -947,6 +947,82 @@ jobs:
       # WEK-64 follow-up.
       - name: build global installers
         run: dist build --tag="${RELEASE_TAG}" --artifacts=global
+      # WEK-91: aggregator installers `lazyagents-installer.{sh,ps1}`.
+      # cargo-dist 0.32 treats each binary-bearing crate as its own
+      # "app" and emits one installer per crate (la-daemon, la-tui,
+      # la-adapter, la-ipc, la-proto). The README + docs install line
+      # has always pointed at a single `lazyagents-installer.*`, which
+      # 404s today because cargo-dist never produces it from the
+      # per-crate shape. Rather than restructure all crates into a
+      # single-app release (which would also collapse versioning across
+      # crates and break the M4 brief's per-crate install semantics),
+      # forge a thin wrapper here that chains the two user-facing
+      # installers — `la-daemon` (`lad`) and `la-tui` (`la`) — both
+      # baked to THIS release tag so the wrapper resolves alongside its
+      # peers under `releases/download/<tag>/`.
+      #
+      # The wrapper trusts the per-crate cargo-dist installers it
+      # invokes — each one verifies its own GitHub Artifact Attestation
+      # via the existing cargo-dist code path. The wrapper itself is
+      # also signed by the `attest` job below (its glob already covers
+      # `*.sh` / `*.ps1` under `target/distrib/`), so a user verifying
+      # `lazyagents-installer.sh` with `gh attestation verify` gets a
+      # chained-trust path: wrapper attestation → per-crate installer
+      # attestation → tarball attestation.
+      #
+      # Adapter / IPC / proto crates ship `mock-cli`, `la-ipc-cat`,
+      # `la-proto-gen-schema` — dev-only binaries that an end user
+      # installing `la` + `lad` does NOT need on `$PATH`. They stay
+      # available as per-crate installers (`la-adapter-installer.sh`
+      # etc.) for contributors who do need them; they are intentionally
+      # omitted from the aggregator.
+      #
+      # The wrapper bodies live in checked-in templates under
+      # `.github/installers/` so they are reviewable on PR. This step
+      # only substitutes the tag placeholders + does the sanity check
+      # that the per-crate installers exist — keeping the YAML readable
+      # and avoiding heredoc-inside-`run:|` indentation traps.
+      - name: forge aggregator installers (lazyagents-installer.{sh,ps1})
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/distrib
+          # Sanity: confirm the per-crate installers we're about to
+          # delegate to actually got built. If `dist build --artifacts=
+          # global` shape changes upstream, fail loudly here rather than
+          # ship a wrapper that 404s at install time.
+          for required in la-daemon-installer.sh la-daemon-installer.ps1 la-tui-installer.sh la-tui-installer.ps1; do
+            if [[ ! -f "target/distrib/${required}" ]]; then
+              echo "::error::aggregator forge: missing per-crate installer target/distrib/${required} — cargo-dist shape changed"
+              ls -la target/distrib/ || true
+              exit 1
+            fi
+          done
+
+          # Substitute the release tag + version into the checked-in
+          # templates via the dedicated renderer
+          # (.github/installers/render-aggregator-installer.py). It uses
+          # pure Python `str.replace()` — not `sed` — because sed's
+          # replacement DSL would interpret `&` as the match backref
+          # and break on the delimiter character. SemVer tags don't
+          # contain those characters today, but a workflow_dispatch run
+          # with a stray tag value should still fail loud rather than
+          # emit a half-substituted script. The renderer also fails on
+          # any unsubstituted `__RELEASE_*__` marker, catching template
+          # drift before the artifact is uploaded.
+          export RELEASE_TAG="${RELEASE_TAG}"
+          export RELEASE_VERSION="${RELEASE_TAG#v}"
+          .github/installers/render-aggregator-installer.py sh
+          .github/installers/render-aggregator-installer.py ps1
+          chmod +x target/distrib/lazyagents-installer.sh
+
+          # Smoke: parse + show the resolved URLs so a release pipeline
+          # failure surfaces here, not at `gh release upload` time.
+          sh -n target/distrib/lazyagents-installer.sh
+          echo "--- lazyagents-installer.sh (first 40 lines) ---"
+          sed -n '1,40p' target/distrib/lazyagents-installer.sh
+          echo "--- lazyagents-installer.ps1 (first 40 lines) ---"
+          sed -n '1,40p' target/distrib/lazyagents-installer.ps1
       - name: upload global artifacts
         uses: actions/upload-artifact@v4
         with:
