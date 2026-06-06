@@ -52,6 +52,7 @@
 //! The binary entry point is in `src/bin/la.rs`.
 
 pub mod app;
+pub mod attach_pump;
 pub mod bootstrap;
 pub mod composer;
 pub mod crons;
@@ -74,6 +75,7 @@ pub mod update_check;
 pub mod vte_term;
 
 pub use app::{App, AppMsg, Focus, Tab};
+pub use attach_pump::{AttachCommand, AttachEvent, AttachPump};
 pub use composer::{Composer, ComposerAction, ComposerView};
 pub use crons::{Cron, CronPreview, CronSource, CronsState, EditField, FieldEdit, MockCronSource};
 pub use detach_notice::{DetachNotice, DetachNoticeView};

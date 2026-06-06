@@ -8,6 +8,7 @@
 //! crossterm I/O to those layers.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -26,7 +27,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 
-use crate::app::{App, AppMsg, AppOutcome, Focus, Modal, Tab};
+use crate::app::{App, AppMsg, AppOutcome, AttachStatus, Focus, Modal, Tab};
+use crate::attach_pump::{AttachEvent, AttachPump};
 use crate::crons::{human_label, CronSource, CronsState, EditField};
 use crate::input::{translate, HitBoxes};
 use crate::key_hints::{format_hint_bar, Hint, HintRegistry, Importance};
@@ -36,6 +38,7 @@ use crate::source::SessionSource;
 use crate::status::{render_status_compact, render_status_themed};
 use crate::tabs::render_tabs;
 use crate::theme::{Accent, KeyHintsMode, Palette};
+use crate::transcript::{Transcript, TranscriptView};
 
 /// Back-compat re-export — pre-WEK-36 callers spelled this as
 /// `crate::health_sub::HealthEvent`. New code should use [`NotifEvent`].
@@ -54,11 +57,23 @@ pub fn run<S: SessionSource, C: CronSource>(app: App<S, C>) -> io::Result<()> {
 /// `BackendsUpdate` / `HealthUpdate` / `CronFiredEvent` / `DaemonOffline`
 /// messages, plus to refresh the cron preview each frame.
 pub fn run_with_notifs<S: SessionSource, C: CronSource>(
-    mut app: App<S, C>,
+    app: App<S, C>,
     notif_rx: Option<Receiver<NotifEvent>>,
 ) -> io::Result<()> {
+    run_with_attach(app, notif_rx, None)
+}
+
+/// WEK-92-A3 entry: same as [`run_with_notifs`] but also threads the
+/// daemon socket path used to spawn per-session [`AttachPump`]s. The
+/// `la` binary calls this so pressing Enter on a session row actually
+/// opens a live PTY pane.
+pub fn run_with_attach<S: SessionSource, C: CronSource>(
+    mut app: App<S, C>,
+    notif_rx: Option<Receiver<NotifEvent>>,
+    attach_socket: Option<PathBuf>,
+) -> io::Result<()> {
     let mut terminal = setup_terminal()?;
-    let res = event_loop(&mut terminal, &mut app, notif_rx);
+    let res = event_loop(&mut terminal, &mut app, notif_rx, attach_socket);
     restore_terminal(&mut terminal)?;
     res
 }
@@ -100,6 +115,7 @@ fn event_loop<S: SessionSource, C: CronSource>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<S, C>,
     notif_rx: Option<Receiver<NotifEvent>>,
+    attach_socket: Option<PathBuf>,
 ) -> io::Result<()> {
     let mut hit = HitBoxes {
         tabs: Vec::new(),
@@ -109,6 +125,10 @@ fn event_loop<S: SessionSource, C: CronSource>(
         tab: Tab::Sessions,
         focus: Focus::Sidebar,
     };
+    // WEK-92-A3: per-session attach runtime. The App owns the *state*
+    // (`app.attached`), the runner owns the *I/O* (pump thread,
+    // transcript buffer, Ctrl+B detach-prefix latch).
+    let mut attach: Option<AttachRuntime> = None;
     loop {
         // Push a fresh `now` into the Crons state so the inline
         // "今日/明日" labels refresh each frame without the user typing.
@@ -120,8 +140,20 @@ fn event_loop<S: SessionSource, C: CronSource>(
         // the editor pane is showing. Picks the soonest enabled cron's
         // next fire across the full snapshot.
         app.status.next_cron_label = derive_next_cron_label(&app.crons, now);
+
+        // Reconcile attach state with the App.
+        //
+        // * App wants an attach (Some) and we have none → spawn a pump.
+        // * App cleared its attach (None) and we still own a pump → tell
+        //   the pump to detach and drop it.
+        // * App switched sessions while a pump is alive → tear down the
+        //   old pump (this should be rare: on_enter() refuses re-entry
+        //   into the same session, but a future flow that programmatically
+        //   switches sessions would land here).
+        reconcile_attach(&mut attach, app, attach_socket.as_deref());
+
         terminal.draw(|frame| {
-            hit = draw(frame, app);
+            hit = draw(frame, app, attach.as_mut());
         })?;
         // Drain any pending notifications between renders so a fresh
         // health / cron pulse is reflected on the very next frame.
@@ -143,6 +175,13 @@ fn event_loop<S: SessionSource, C: CronSource>(
                 }
             }
         }
+        // Drain attach pump events between renders. Bytes go straight
+        // into the runner-owned transcript; status changes are
+        // forwarded into the App as AppMsg variants so unit-tested
+        // state lives in one place.
+        if let Some(rt) = attach.as_mut() {
+            drain_attach(rt, app);
+        }
         // Poll so the screen refreshes periodically; the 250ms cap also
         // bounds how long a notification can sit in the channel before
         // the next frame consumes it.
@@ -155,15 +194,272 @@ fn event_loop<S: SessionSource, C: CronSource>(
         if let Event::Resize(_, _) = ev {
             continue;
         }
+        // While the transcript pane is focused, raw key events route to
+        // the daemon's PTY via `sessions.write` — they do NOT go through
+        // the App's normal modal/key translator. The exception is the
+        // detach prefix Ctrl+B (see `AttachRuntime::feed_key`).
+        if app.focus == Focus::Transcript && app.modal.is_none() {
+            if let (Some(rt), Event::Key(k)) = (attach.as_mut(), &ev) {
+                match rt.feed_key(*k) {
+                    KeyOutcome::Consumed => continue,
+                    KeyOutcome::Detach => {
+                        let _ = app.handle(AppMsg::Detach);
+                        continue;
+                    }
+                    KeyOutcome::FallThrough => {}
+                }
+            }
+        }
         let msg = match translate(ev, app.modal.as_ref(), &hit) {
             Some(m) => m,
             None => continue,
         };
         match app.handle(msg) {
             AppOutcome::Continue => {}
-            AppOutcome::Quit => return Ok(()),
+            AppOutcome::Quit => {
+                // Best-effort detach so the daemon eagerly releases our
+                // input ownership; the pump thread will close on its
+                // own when the channel goes away.
+                if let Some(rt) = attach.take() {
+                    rt.pump.stop();
+                }
+                return Ok(());
+            }
         }
     }
+}
+
+/// Per-attach runtime state owned by the runner. Holds the pump, the
+/// transcript ring + VTE parser, and the Ctrl+B detach-prefix latch.
+pub struct AttachRuntime {
+    pub session_id: String,
+    pub pump: AttachPump,
+    pub transcript: Transcript,
+    /// True after the user pressed Ctrl+B; the next keystroke is the
+    /// detach action (or `Ctrl+B` to send a literal Ctrl+B byte).
+    detach_armed: bool,
+}
+
+/// What the runner should do after a raw key event landed in the
+/// transcript pane.
+enum KeyOutcome {
+    /// The byte was forwarded (or absorbed by the detach prefix latch).
+    Consumed,
+    /// The user typed the detach gesture (Ctrl+B then `d` / Esc / `.`).
+    Detach,
+    /// The key has no transcript meaning — fall through to the App's
+    /// normal translator.
+    FallThrough,
+}
+
+impl AttachRuntime {
+    /// Translate a key event into the right side effect:
+    ///   * Ctrl+B → arm detach prefix
+    ///   * Ctrl+B then `d` / `Esc` / `.` → detach
+    ///   * Ctrl+B then Ctrl+B → send a literal Ctrl+B byte
+    ///   * any other key → encode and forward to the daemon
+    fn feed_key(&mut self, k: KeyEvent) -> KeyOutcome {
+        // Detach prefix takes priority. We only arm on Ctrl+B (not on
+        // `Ctrl+b`'s lowercase shadow because crossterm normalizes both
+        // to KeyCode::Char('b') with CONTROL set).
+        if self.detach_armed {
+            self.detach_armed = false;
+            match k.code {
+                KeyCode::Char('d') | KeyCode::Esc | KeyCode::Char('.') => {
+                    return KeyOutcome::Detach;
+                }
+                KeyCode::Char('b') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // User asked for a literal Ctrl+B byte (0x02).
+                    self.pump.write(vec![0x02]);
+                    return KeyOutcome::Consumed;
+                }
+                _ => {
+                    // Any other key cancels the prefix and is dropped
+                    // (so an accidental Ctrl+B doesn't fire a stray
+                    // character into the agent).
+                    return KeyOutcome::Consumed;
+                }
+            }
+        }
+        if let KeyCode::Char('b') = k.code {
+            if k.modifiers.contains(KeyModifiers::CONTROL) {
+                self.detach_armed = true;
+                return KeyOutcome::Consumed;
+            }
+        }
+        let bytes = match encode_key(k) {
+            Some(b) => b,
+            None => return KeyOutcome::FallThrough,
+        };
+        self.pump.write(bytes);
+        KeyOutcome::Consumed
+    }
+}
+
+fn reconcile_attach<S: SessionSource, C: CronSource>(
+    attach: &mut Option<AttachRuntime>,
+    app: &App<S, C>,
+    socket: Option<&Path>,
+) {
+    match (&app.attached, attach.as_ref()) {
+        (Some(att), None) => {
+            // App wants an attach and we have none. Need a socket to spawn.
+            let Some(socket) = socket else { return };
+            let pump = AttachPump::spawn(socket, &att.session_id);
+            *attach = Some(AttachRuntime {
+                session_id: att.session_id.clone(),
+                pump,
+                transcript: Transcript::default(),
+                detach_armed: false,
+            });
+        }
+        (Some(att), Some(rt)) if att.session_id != rt.session_id => {
+            // Session changed under the runner. Tear down the old pump
+            // and spawn a fresh one.
+            if let Some(old) = attach.take() {
+                old.pump.stop();
+            }
+            if let Some(socket) = socket {
+                let pump = AttachPump::spawn(socket, &att.session_id);
+                *attach = Some(AttachRuntime {
+                    session_id: att.session_id.clone(),
+                    pump,
+                    transcript: Transcript::default(),
+                    detach_armed: false,
+                });
+            }
+        }
+        (None, Some(_)) => {
+            // App cleared the attach (user pressed Ctrl+B d, or the
+            // pump emitted Closed and the App ran the AttachClosed
+            // handler). Tell the pump to stop and drop it.
+            if let Some(old) = attach.take() {
+                old.pump.stop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn drain_attach<S: SessionSource, C: CronSource>(rt: &mut AttachRuntime, app: &mut App<S, C>) {
+    // Pull every pending event before returning so the next render
+    // reflects the freshest bytes. The pump pushes everything through
+    // an mpsc channel so try_recv() is cheap.
+    while let Ok(ev) = rt.pump.rx.try_recv() {
+        match ev {
+            AttachEvent::Connected {
+                session_id,
+                snapshot_seq,
+                input_acquired,
+            } => {
+                let _ = app.handle(AppMsg::AttachConnected {
+                    session_id,
+                    snapshot_seq,
+                    input_acquired,
+                });
+            }
+            AttachEvent::Bytes { bytes, .. } => {
+                rt.transcript.feed(&bytes);
+            }
+            AttachEvent::Gap {
+                from_seq,
+                to_seq,
+                dropped_bytes,
+                ..
+            } => {
+                // The transcript widget already renders a "…N lines
+                // dropped" hint when the scrollback cap evicts old
+                // bytes; for a wire-level gap we surface a short toast
+                // so the user knows the stream skipped, then keep going.
+                rt.transcript.feed(
+                    format!(
+                        "\n── gap: skipped {dropped_bytes} bytes (seq {from_seq}..={to_seq}) ──\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            AttachEvent::State { state, reason, .. } => {
+                let line = match reason {
+                    Some(r) => format!("\n── state: {state} ({r}) ──\n"),
+                    None => format!("\n── state: {state} ──\n"),
+                };
+                rt.transcript.feed(line.as_bytes());
+            }
+            AttachEvent::Disconnected {
+                reason,
+                will_reconnect,
+            } => {
+                let _ = app.handle(AppMsg::AttachDisconnected {
+                    session_id: rt.session_id.clone(),
+                    reason,
+                    will_reconnect,
+                });
+            }
+            AttachEvent::Closed => {
+                let _ = app.handle(AppMsg::AttachClosed);
+            }
+        }
+    }
+}
+
+/// Translate a crossterm [`KeyEvent`] into the byte sequence the daemon
+/// should write into the PTY master. Returns `None` for keys with no
+/// terminal meaning (function keys, media keys, etc.); the caller falls
+/// through to the App's normal translator so global keys still work.
+fn encode_key(k: KeyEvent) -> Option<Vec<u8>> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    let mut out: Vec<u8> = Vec::new();
+    if alt {
+        out.push(0x1b);
+    }
+    match k.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                // Ctrl maps ASCII letters and a few symbols to their
+                // 0x01..0x1f counterpart; non-letter Ctrl chords fall
+                // through unmodified.
+                let lower = c.to_ascii_lowercase();
+                if lower.is_ascii_alphabetic() {
+                    out.push((lower as u8) - b'`');
+                } else {
+                    match c {
+                        '@' => out.push(0x00),
+                        '[' => out.push(0x1b),
+                        '\\' => out.push(0x1c),
+                        ']' => out.push(0x1d),
+                        '^' => out.push(0x1e),
+                        '_' => out.push(0x1f),
+                        ' ' => out.push(0x00),
+                        _ => {
+                            let mut buf = [0u8; 4];
+                            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                }
+            } else {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        KeyCode::Enter => out.push(b'\r'),
+        KeyCode::Backspace => out.push(0x7f),
+        KeyCode::Tab => out.push(b'\t'),
+        KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
+        KeyCode::Esc => out.push(0x1b),
+        KeyCode::Left => out.extend_from_slice(b"\x1b[D"),
+        KeyCode::Right => out.extend_from_slice(b"\x1b[C"),
+        KeyCode::Up => out.extend_from_slice(b"\x1b[A"),
+        KeyCode::Down => out.extend_from_slice(b"\x1b[B"),
+        KeyCode::Home => out.extend_from_slice(b"\x1b[H"),
+        KeyCode::End => out.extend_from_slice(b"\x1b[F"),
+        KeyCode::PageUp => out.extend_from_slice(b"\x1b[5~"),
+        KeyCode::PageDown => out.extend_from_slice(b"\x1b[6~"),
+        KeyCode::Delete => out.extend_from_slice(b"\x1b[3~"),
+        KeyCode::Insert => out.extend_from_slice(b"\x1b[2~"),
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// Walk the cron snapshot for the soonest enabled cron whose
@@ -204,7 +500,15 @@ fn derive_next_cron_label(
 
 /// Lay out the screen and render every pane. Returns the hit boxes the
 /// event loop needs to translate mouse clicks.
-pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S, C>) -> HitBoxes {
+///
+/// `attach` is the runner-owned attach runtime (transcript + pump), if any.
+/// When `Some` and the App is on Sessions with `app.attached` set, the
+/// content area renders the transcript instead of the placeholder.
+pub fn draw<S: SessionSource, C: CronSource>(
+    frame: &mut Frame<'_>,
+    app: &App<S, C>,
+    attach: Option<&mut AttachRuntime>,
+) -> HitBoxes {
     let size = frame.area();
 
     // WEK-42 / M4.3: bottom row layout depends on `[ui]`.
@@ -302,7 +606,19 @@ pub fn draw<S: SessionSource, C: CronSource>(frame: &mut Frame<'_>, app: &App<S,
                 app.focus == Focus::Sidebar,
                 &palette,
             );
-            render_content_placeholder(frame, content_area, &app.sidebar.selection(), &palette);
+            match (app.attached.as_ref(), attach) {
+                (Some(att), Some(rt)) if att.session_id == rt.session_id => {
+                    render_attach_pane(frame, content_area, att, rt, &palette);
+                }
+                _ => {
+                    render_content_placeholder(
+                        frame,
+                        content_area,
+                        &app.sidebar.selection(),
+                        &palette,
+                    );
+                }
+            }
         }
         Tab::Crons => {
             render_crons(
@@ -421,9 +737,9 @@ Once a project exists, press `n` here to start a session inside it."
         Selection::Group { project_id } => {
             format!("Group: {project_id}\n\nPress ⏎ to fold/expand, j/k to navigate.")
         }
-        Selection::Session { session_id, .. } => format!(
-            "Session: {session_id}\n\nConversation pane lands in M1.6. Press ⏎ to (eventually) open."
-        ),
+        Selection::Session { session_id, .. } => {
+            format!("Session: {session_id}\n\nPress ⏎ to attach to the live PTY (WEK-92-A3).")
+        }
     };
     let para = Paragraph::new(body)
         .block(
@@ -435,6 +751,104 @@ Once a project exists, press `n` here to start a session inside it."
         .style(Style::default().fg(palette.color(Accent::Body)))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
+}
+
+/// Render the live transcript pane for an active attach (WEK-92-A3).
+/// Top: status header (`session-id · connected / connecting / 已断开`).
+/// Body: [`TranscriptView`] over the runner-owned transcript ring.
+/// Bottom hint inside the block: detach gesture.
+fn render_attach_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    att: &crate::app::AttachedSession,
+    rt: &mut AttachRuntime,
+    palette: &Palette,
+) {
+    let muted = palette.color(Accent::Muted);
+    let primary = palette.color(Accent::Primary);
+    let ok = palette.color(Accent::Ok);
+    let warn = palette.color(Accent::Warn);
+    let err = palette.color(Accent::Error);
+    let body_color = palette.color(Accent::Body);
+    let (status_label, status_color) = match &att.status {
+        AttachStatus::Connecting => ("连接中…", muted),
+        AttachStatus::Connected {
+            input_acquired: true,
+        } => ("connected · input owned", ok),
+        AttachStatus::Connected {
+            input_acquired: false,
+        } => ("connected · read-only", warn),
+        AttachStatus::Disconnected {
+            reason,
+            will_reconnect,
+        } => {
+            let label = if *will_reconnect {
+                format!("已断开 ({reason}) · 重试中…")
+            } else {
+                format!("已断开 ({reason}) · Ctrl+B d to detach")
+            };
+            // Leak the string into a static slot via a closure: ratatui
+            // titles want `&str`. We render header lines directly instead
+            // so we can keep ownership.
+            let _ = label;
+            ("已断开", err)
+        }
+    };
+    let detached_extra: Option<String> = match &att.status {
+        AttachStatus::Disconnected {
+            reason,
+            will_reconnect,
+        } => Some(if *will_reconnect {
+            format!(" — {reason} (重试中…)")
+        } else {
+            format!(" — {reason}")
+        }),
+        _ => None,
+    };
+    let title = format!("Session {} [{}]", short_id(&att.session_id), status_label);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(
+            if matches!(att.status, AttachStatus::Connected { .. }) {
+                primary
+            } else {
+                status_color
+            },
+        ));
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    frame.render_widget(block, area);
+
+    // Header line above the transcript: status + detach hint.
+    if inner.height >= 1 {
+        let mut spans = vec![Span::styled(
+            status_label.to_string(),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if let Some(extra) = detached_extra {
+            spans.push(Span::styled(extra, Style::default().fg(muted)));
+        }
+        spans.push(Span::styled(
+            "   Ctrl+B d 退出",
+            Style::default().fg(muted).add_modifier(Modifier::DIM),
+        ));
+        let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
+        frame.render_widget(Paragraph::new(Line::from(spans)), header_area);
+    }
+    if inner.height >= 2 {
+        let body_area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+        let widget = TranscriptView::new(&mut rt.transcript).style(Style::default().fg(body_color));
+        frame.render_widget(widget, body_area);
+    }
+}
+
+fn short_id(s: &str) -> String {
+    s.chars().take(8).collect()
 }
 
 fn render_crons(

@@ -15,7 +15,7 @@ fn render_to_buffer(width: u16, height: u16) -> ratatui::buffer::Buffer {
     let mut app = App::new(MockSessionSource::fixture());
     terminal
         .draw(|f| {
-            let _ = draw(f, &app);
+            let _ = draw(f, &app, None);
         })
         .expect("first draw");
     // Move down once so a session is selected — the hint bar should then
@@ -23,7 +23,7 @@ fn render_to_buffer(width: u16, height: u16) -> ratatui::buffer::Buffer {
     app.handle(AppMsg::SidebarDown);
     terminal
         .draw(|f| {
-            let _ = draw(f, &app);
+            let _ = draw(f, &app, None);
         })
         .expect("second draw");
     terminal.backend().buffer().clone()
@@ -121,7 +121,7 @@ fn backends_panel_renders_grey_state_with_reason_and_docs_url() {
     app.handle(AppMsg::BackendsUpdate(badges));
     terminal
         .draw(|f| {
-            let _ = draw(f, &app);
+            let _ = draw(f, &app, None);
         })
         .expect("draw with backends snapshot");
     let buf = terminal.backend().buffer().clone();

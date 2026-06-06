@@ -56,10 +56,16 @@ impl Tab {
 /// The Crons tab (M3.4) reuses the same enum: `Sidebar` == cron list,
 /// `Main` == editor form. Keeping the two tabs on the same Focus state
 /// is enough because at any moment the user is on exactly one tab.
+///
+/// WEK-92-A3 adds `Transcript`: when the Sessions tab has an active
+/// attach, focus moves to the transcript / composer pane and keystrokes
+/// route into the daemon via [`crate::attach_pump`]. Detach drops focus
+/// back to `Sidebar` and clears the attach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Sidebar,
     Main,
+    Transcript,
 }
 
 /// Modal overlays. At most one open at a time.
@@ -109,6 +115,38 @@ pub struct ErrorRow {
     pub status_label: String,
     pub reason: Option<String>,
     pub docs_url: Option<String>,
+}
+
+/// Status of the live attach pump (WEK-92-A3).
+///
+/// The App owns no I/O; the runner owns the actual [`crate::AttachPump`]
+/// thread and translates its events into [`AppMsg::Attach*`] variants
+/// that update this state. The renderer reads it each frame to decide
+/// the title chrome of the transcript pane and to render the bottom
+/// banner ("已断开, 重试中…").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachStatus {
+    /// `sessions.attach` is in flight — the catch-up frame has not yet
+    /// arrived. The transcript pane is rendered but empty.
+    Connecting,
+    /// The attach handshake completed. Live bytes are streaming.
+    Connected { input_acquired: bool },
+    /// The pump lost its connection. `will_reconnect` mirrors the
+    /// pump's auto-retry budget: `true` means one attempt is queued,
+    /// `false` means the user must detach + re-enter.
+    Disconnected {
+        reason: String,
+        will_reconnect: bool,
+    },
+}
+
+/// One live attach. Tracked on the App so the renderer + key router
+/// can react without touching the pump thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedSession {
+    pub session_id: String,
+    pub project_id: String,
+    pub status: AttachStatus,
 }
 
 /// All input the App reacts to. The input layer translates raw events
@@ -237,6 +275,41 @@ pub enum AppMsg {
     /// status + hint row into one line and dims backend badges to a
     /// single colour.
     ToggleCompact,
+
+    // --- Attach (WEK-92-A3) ----------------------------------------
+    //
+    // The App receives these as state updates from the runner-owned
+    // attach pump. The pump itself is spawned by the runner when the
+    // user presses Enter on a [`Selection::Session`] row; the App
+    // simply records intent and reacts to the pump's status changes.
+    /// User asked to attach to the selected session. The App flips
+    /// focus to `Transcript` and records the session id; the runner
+    /// observes [`App::attached`] becoming `Some(Connecting)` and
+    /// spawns the pump.
+    BeginAttach {
+        session_id: String,
+        project_id: String,
+    },
+    /// Pump finished its attach handshake.
+    AttachConnected {
+        session_id: String,
+        snapshot_seq: u64,
+        input_acquired: bool,
+    },
+    /// Pump lost its connection.
+    AttachDisconnected {
+        session_id: String,
+        reason: String,
+        will_reconnect: bool,
+    },
+    /// Pump exited permanently (user detach or second reconnect
+    /// failure). The App clears `attached` and returns focus to the
+    /// sidebar.
+    AttachClosed,
+    /// User asked to detach (Ctrl+B then `d`, see runner). Clears the
+    /// attach state on the App; the runner emits the actual `detach`
+    /// command on the pump.
+    Detach,
 }
 
 /// What the runner should do after a message has been handled.
@@ -278,6 +351,11 @@ pub struct App<S: SessionSource, C: CronSource = crate::crons::MockCronSource> {
     /// persistence (default for in-process tests; production wires
     /// [`crate::ui_prefs::default_config_path`]).
     pub ui_prefs_path: Option<PathBuf>,
+    /// Live attach state, if any (WEK-92-A3). `Some` while a session
+    /// pane is open; cleared on detach / close. The runner reads this
+    /// each frame to decide whether to render the transcript pane and
+    /// where to forward keystrokes.
+    pub attached: Option<AttachedSession>,
 }
 
 impl<S: SessionSource> App<S, crate::crons::MockCronSource> {
@@ -309,6 +387,7 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             last_toast: None,
             ui_prefs: UiPrefs::default(),
             ui_prefs_path: None,
+            attached: None,
         };
         app.refresh_sessions();
         app
@@ -530,6 +609,71 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 // when it matches one of the three UI-pref variants.
                 let _ = self.try_apply_ui_pref(msg);
             }
+
+            // --- Attach dispatch (WEK-92-A3) -------------------------
+            AppMsg::BeginAttach {
+                session_id,
+                project_id,
+            } => {
+                if self
+                    .attached
+                    .as_ref()
+                    .is_some_and(|a| a.session_id == session_id)
+                {
+                    return AppOutcome::Continue;
+                }
+                self.attached = Some(AttachedSession {
+                    session_id,
+                    project_id,
+                    status: AttachStatus::Connecting,
+                });
+                self.focus = Focus::Transcript;
+            }
+            AppMsg::AttachConnected {
+                session_id,
+                snapshot_seq: _,
+                input_acquired,
+            } => {
+                if let Some(att) = self.attached.as_mut() {
+                    if att.session_id == session_id {
+                        att.status = AttachStatus::Connected { input_acquired };
+                    }
+                }
+            }
+            AppMsg::AttachDisconnected {
+                session_id,
+                reason,
+                will_reconnect,
+            } => {
+                if let Some(att) = self.attached.as_mut() {
+                    if att.session_id == session_id {
+                        att.status = AttachStatus::Disconnected {
+                            reason: reason.clone(),
+                            will_reconnect,
+                        };
+                        self.last_toast = Some(if will_reconnect {
+                            format!("attach: {reason} — 重试中…")
+                        } else {
+                            format!("attach: {reason}")
+                        });
+                    }
+                }
+            }
+            AppMsg::AttachClosed => {
+                self.attached = None;
+                self.focus = Focus::Sidebar;
+            }
+            AppMsg::Detach => {
+                // The App clears its state immediately so the renderer
+                // returns to the sidebar on the next frame; the runner
+                // tears down the pump asynchronously after observing
+                // `attached == None`.
+                if self.attached.is_some() {
+                    self.attached = None;
+                    self.focus = Focus::Sidebar;
+                    self.last_toast = Some("detached".into());
+                }
+            }
         }
         AppOutcome::Continue
     }
@@ -688,27 +832,47 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
     }
 
     fn on_enter(&mut self) {
-        // M1.5: entering a session does not yet open a conversation pane
-        // (that's M1.6); we leave the hook here so the binding is wired and
-        // the key bar can claim "⏎ open" correctly. The actual `sessions.
-        // attach` call will live in this branch once la-core lands.
-        if let Selection::Group { .. } = self.sidebar.selection() {
-            // On a group header, Enter toggles fold/expand for parity with
-            // file-tree muscle memory.
-            let was_expanded = self
-                .sidebar
-                .groups()
-                .iter()
-                .find(|g| Some(g.project_id.as_str()) == self.sidebar.selection().project_id())
-                .map(|g| g.expanded)
-                .unwrap_or(true);
-            if was_expanded {
-                self.sidebar.collapse();
-            } else {
-                self.sidebar.expand();
+        match self.sidebar.selection() {
+            Selection::Group { .. } => {
+                // On a group header, Enter toggles fold/expand for parity with
+                // file-tree muscle memory.
+                let was_expanded = self
+                    .sidebar
+                    .groups()
+                    .iter()
+                    .find(|g| Some(g.project_id.as_str()) == self.sidebar.selection().project_id())
+                    .map(|g| g.expanded)
+                    .unwrap_or(true);
+                if was_expanded {
+                    self.sidebar.collapse();
+                } else {
+                    self.sidebar.expand();
+                }
             }
+            Selection::Session {
+                project_id,
+                session_id,
+            } => {
+                // WEK-92-A3: attach to the session. Record the intent on
+                // the App; the runner observes `attached = Some(Connecting)`
+                // and spawns the pump. We refuse re-entry into the same
+                // session (the pump would mis-acquire input).
+                if self
+                    .attached
+                    .as_ref()
+                    .is_some_and(|a| a.session_id == session_id)
+                {
+                    return;
+                }
+                self.attached = Some(AttachedSession {
+                    session_id,
+                    project_id,
+                    status: AttachStatus::Connecting,
+                });
+                self.focus = Focus::Transcript;
+            }
+            Selection::Empty => {}
         }
-        // Session selection: actual attach is a TODO for M1.6 + M1.7.
     }
 
     fn on_delete(&mut self) {
@@ -1278,5 +1442,130 @@ mod tests {
             .flat_map(|g| g.sessions.iter())
             .any(|s| s.session_id == sid);
         assert!(in_project, "row landed under its real project");
+    }
+
+    // -----------------------------------------------------------------
+    // WEK-92-A3: attach state machine on the App
+    // -----------------------------------------------------------------
+
+    fn navigate_to_first_session(app: &mut App<MockSessionSource>) -> String {
+        loop {
+            app.handle(AppMsg::SidebarDown);
+            if let Selection::Session { session_id, .. } = app.sidebar.selection() {
+                return session_id;
+            }
+            if matches!(app.sidebar.selection(), Selection::Empty) {
+                panic!("no session in fixture");
+            }
+        }
+    }
+
+    #[test]
+    fn enter_on_session_row_starts_attach_and_flips_focus() {
+        let mut a = app();
+        let sid = navigate_to_first_session(&mut a);
+        a.handle(AppMsg::Enter);
+        let att = a.attached.as_ref().expect("attach state present");
+        assert_eq!(att.session_id, sid);
+        assert_eq!(att.status, AttachStatus::Connecting);
+        assert_eq!(a.focus, Focus::Transcript);
+    }
+
+    #[test]
+    fn enter_twice_on_same_session_is_idempotent() {
+        let mut a = app();
+        let _ = navigate_to_first_session(&mut a);
+        a.handle(AppMsg::Enter);
+        let snap1 = a.attached.clone();
+        a.handle(AppMsg::Enter);
+        assert_eq!(
+            a.attached, snap1,
+            "re-entering same session must not reset state"
+        );
+    }
+
+    #[test]
+    fn attach_connected_updates_status_but_keeps_focus() {
+        let mut a = app();
+        let sid = navigate_to_first_session(&mut a);
+        a.handle(AppMsg::Enter);
+        a.handle(AppMsg::AttachConnected {
+            session_id: sid.clone(),
+            snapshot_seq: 42,
+            input_acquired: true,
+        });
+        let att = a.attached.as_ref().expect("still attached");
+        assert_eq!(
+            att.status,
+            AttachStatus::Connected {
+                input_acquired: true
+            }
+        );
+        assert_eq!(a.focus, Focus::Transcript);
+    }
+
+    #[test]
+    fn attach_disconnected_flips_status_and_surfaces_toast() {
+        let mut a = app();
+        let sid = navigate_to_first_session(&mut a);
+        a.handle(AppMsg::Enter);
+        a.handle(AppMsg::AttachDisconnected {
+            session_id: sid,
+            reason: "daemon gone".into(),
+            will_reconnect: true,
+        });
+        let att = a.attached.as_ref().expect("still attached");
+        assert!(matches!(
+            att.status,
+            AttachStatus::Disconnected {
+                will_reconnect: true,
+                ..
+            }
+        ));
+        assert!(
+            a.last_toast
+                .as_deref()
+                .is_some_and(|t| t.contains("重试中")),
+            "expected retry toast, got {:?}",
+            a.last_toast
+        );
+    }
+
+    #[test]
+    fn attach_closed_clears_state_and_returns_focus_to_sidebar() {
+        let mut a = app();
+        let _ = navigate_to_first_session(&mut a);
+        a.handle(AppMsg::Enter);
+        a.handle(AppMsg::AttachClosed);
+        assert!(a.attached.is_none());
+        assert_eq!(a.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn detach_msg_drops_state_immediately() {
+        let mut a = app();
+        let _ = navigate_to_first_session(&mut a);
+        a.handle(AppMsg::Enter);
+        a.handle(AppMsg::Detach);
+        assert!(a.attached.is_none());
+        assert_eq!(a.focus, Focus::Sidebar);
+        assert_eq!(a.last_toast.as_deref(), Some("detached"));
+    }
+
+    #[test]
+    fn attach_messages_for_unrelated_session_are_ignored() {
+        let mut a = app();
+        let _ = navigate_to_first_session(&mut a);
+        a.handle(AppMsg::Enter);
+        let before = a.attached.clone();
+        a.handle(AppMsg::AttachConnected {
+            session_id: "some-other-session".into(),
+            snapshot_seq: 0,
+            input_acquired: true,
+        });
+        assert_eq!(
+            a.attached, before,
+            "stray pump events must not mutate state"
+        );
     }
 }

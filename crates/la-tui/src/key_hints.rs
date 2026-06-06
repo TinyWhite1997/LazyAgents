@@ -87,6 +87,10 @@ impl HintRegistry {
     }
 
     fn for_sessions(focus: Focus, selection: &Selection) -> Vec<Hint> {
+        // WEK-92-A3: transcript focus has its own bottom-bar palette.
+        if matches!(focus, Focus::Transcript) {
+            return Self::for_attach();
+        }
         let mut out = Vec::new();
 
         if matches!(focus, Focus::Sidebar) {
@@ -230,7 +234,28 @@ impl HintRegistry {
                 out.sort_by_key(|h| std::cmp::Reverse(h.importance));
                 out
             }
+            // Transcript focus is unreachable from the Crons tab — the
+            // attach pane lives only on Sessions. Return the editor hints
+            // so the bar isn't blank if a stray state combination shows
+            // up; the runner already gates `Transcript` to Tab::Sessions.
+            Focus::Transcript => Self::for_attach(),
         }
+    }
+
+    /// Hints surfaced while a session attach is live. The bottom bar
+    /// shows the detach prefix (Ctrl+B) and the universal scroll keys;
+    /// printable bytes go to the daemon so they're intentionally NOT
+    /// advertised.
+    fn for_attach() -> Vec<Hint> {
+        let mut out = vec![
+            Hint::new("Ctrl+B d", "detach", Importance::Primary),
+            Hint::new("Ctrl+B Ctrl+B", "send literal Ctrl+B", Importance::Low),
+            Hint::new("PgUp/PgDn", "scroll transcript", Importance::Medium),
+            Hint::new("G", "follow tail", Importance::Low),
+        ];
+        out.extend(Self::globals());
+        out.sort_by_key(|h| std::cmp::Reverse(h.importance));
+        out
     }
 
     fn globals() -> Vec<Hint> {
