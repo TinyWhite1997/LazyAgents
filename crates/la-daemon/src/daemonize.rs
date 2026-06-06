@@ -155,11 +155,11 @@ fn apply_detached_flags(cmd: &mut std::process::Command) {
 
 /// Translate the Unix-style socket path we get from
 /// `SocketDiscovery::resolve()` into the Win32 named-pipe name the
-/// daemon binds — mirrors `runtime::endpoint_for`.
+/// daemon binds. Delegates to `la_ipc::transport::pipe_name_for` so the
+/// listener and this readiness probe always agree on the convention.
 #[cfg(windows)]
 fn pipe_name_from_socket_path(path: &Path) -> String {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("lad");
-    format!(r"\\.\pipe\lazyagents-{stem}")
+    la_ipc::transport::pipe_name_for(path)
 }
 
 /// On Windows the "is it ready?" probe is a `WaitNamedPipeW` against

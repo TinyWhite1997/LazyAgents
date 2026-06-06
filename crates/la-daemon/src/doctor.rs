@@ -481,7 +481,7 @@ pub fn probe_daemon_reachable(socket: &Path) -> bool {
         Err(_) => return false,
     };
     rt.block_on(async {
-        let endpoint = endpoint_for(socket);
+        let endpoint = la_ipc::transport::endpoint_for(socket);
         matches!(
             tokio::time::timeout(
                 Duration::from_millis(250),
@@ -491,21 +491,6 @@ pub fn probe_daemon_reachable(socket: &Path) -> bool {
             Ok(Ok(_))
         )
     })
-}
-
-fn endpoint_for(socket: &Path) -> la_ipc::transport::Endpoint {
-    #[cfg(unix)]
-    {
-        la_ipc::transport::Endpoint::uds(socket)
-    }
-    #[cfg(not(unix))]
-    {
-        let name = format!(
-            r"\\.\pipe\lazyagents-{}",
-            socket.file_stem().and_then(|s| s.to_str()).unwrap_or("lad")
-        );
-        la_ipc::transport::Endpoint::named_pipe(name)
-    }
 }
 
 /// Synchronous probe of every adapter. Used by the doctor binary path

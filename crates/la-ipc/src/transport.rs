@@ -44,6 +44,35 @@ impl Endpoint {
     }
 }
 
+/// Map a "socket path"-shaped identifier to the right [`Endpoint`] for this
+/// platform. On Unix the path becomes a UDS endpoint verbatim; on Windows it
+/// is mapped to the Named Pipe `\\.\pipe\lazyagents-<file_stem>` that the
+/// daemon binds (`lad-1.sock` → `\\.\pipe\lazyagents-lad-1`).
+///
+/// This is the single source of truth for that mapping — daemon, doctor,
+/// la-tui bootstrap, and the m2-smoke / WEK-84 integration harnesses all
+/// route through here so the naming convention cannot drift between
+/// listener and connector.
+pub fn endpoint_for(path: &Path) -> Endpoint {
+    #[cfg(unix)]
+    {
+        Endpoint::uds(path)
+    }
+    #[cfg(not(unix))]
+    {
+        Endpoint::named_pipe(pipe_name_for(path))
+    }
+}
+
+/// Translate a socket-shaped path into the Win32 Named Pipe name the daemon
+/// binds. Cross-platform so non-Windows code (tests, doc-tests, daemonize
+/// helpers built on every target) can reason about the convention without a
+/// `cfg` cascade; the actual string only matters on Windows.
+pub fn pipe_name_for(path: &Path) -> String {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("lad");
+    format!(r"\\.\pipe\lazyagents-{stem}")
+}
+
 // ---------------- Unix implementation ----------------
 
 #[cfg(unix)]
@@ -647,3 +676,41 @@ mod imp {
 }
 
 pub use imp::*;
+
+#[cfg(test)]
+mod endpoint_for_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn pipe_name_for_uses_file_stem() {
+        let p = PathBuf::from("anywhere/lad-1.sock");
+        assert_eq!(pipe_name_for(&p), r"\\.\pipe\lazyagents-lad-1");
+    }
+
+    #[test]
+    fn pipe_name_for_falls_back_to_lad_when_stem_missing() {
+        let p = PathBuf::from("");
+        assert_eq!(pipe_name_for(&p), r"\\.\pipe\lazyagents-lad");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_for_unix_is_uds() {
+        let p = PathBuf::from("/tmp/lad-1.sock");
+        match endpoint_for(&p) {
+            Endpoint::Uds(pb) => assert_eq!(pb, p),
+            Endpoint::NamedPipe(n) => panic!("expected UDS, got NamedPipe({n})"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endpoint_for_windows_derives_pipe_from_stem() {
+        let p = PathBuf::from(r"C:\tmp\lad-1.sock");
+        match endpoint_for(&p) {
+            Endpoint::NamedPipe(n) => assert_eq!(n, r"\\.\pipe\lazyagents-lad-1"),
+            Endpoint::Uds(pb) => panic!("expected NamedPipe, got Uds({})", pb.display()),
+        }
+    }
+}

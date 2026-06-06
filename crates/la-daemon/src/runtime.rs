@@ -19,7 +19,7 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
 use la_adapter::AgentAdapter;
 use la_core::{ManagerConfig, SessionManager, WorktreeManager};
-use la_ipc::transport::{Endpoint, Listener};
+use la_ipc::transport::{endpoint_for, Listener};
 use la_storage::{Storage, StorageConfig};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -543,21 +543,6 @@ impl DaemonHandle {
     /// `JoinHandle` reports completion.
     pub fn shutdown(&self) {
         self.shutdown.notify_waiters();
-    }
-}
-
-fn endpoint_for(path: &Path) -> Endpoint {
-    #[cfg(unix)]
-    {
-        Endpoint::uds(path)
-    }
-    #[cfg(not(unix))]
-    {
-        let pipe_name = format!(
-            r"\\.\pipe\lazyagents-{}",
-            path.file_stem().and_then(|s| s.to_str()).unwrap_or("lad")
-        );
-        Endpoint::named_pipe(pipe_name)
     }
 }
 

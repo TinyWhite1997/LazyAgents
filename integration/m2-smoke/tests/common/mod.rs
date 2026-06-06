@@ -1,10 +1,11 @@
-#![cfg(unix)]
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -12,7 +13,7 @@ use la_adapter::{
     AdapterDescriptor, AdapterError, AgentAdapter, ProbeResult, SpawnRequest, SpawnSpec,
 };
 use la_daemon::{Daemon, DaemonConfig, DaemonHandle, SocketDiscovery};
-use la_ipc::transport::{connect, Endpoint};
+use la_ipc::transport::{connect, endpoint_for, StreamPair};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId, ResponseOutcome, RpcError};
 use tempfile::TempDir;
@@ -78,30 +79,51 @@ impl AgentAdapter for FakeBackend {
     }
 
     fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, AdapterError> {
-        let script_dir = std::env::temp_dir().join("lazyagents-m2-smoke-scripts");
-        std::fs::create_dir_all(&script_dir).map_err(AdapterError::SpawnFailed)?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let script_path = script_dir.join(format!("{}-{nonce}.sh", std::process::id()));
-        std::fs::write(&script_path, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 60\n")
-            .map_err(AdapterError::SpawnFailed)?;
+        // Windows: exec `ping.exe` directly. `ping -n 61 127.0.0.1` blocks
+        // ~60s without needing a shell wrapper. Going straight to ping
+        // avoids the daemon's `cmd /c <command-string>` shell-wrap reject
+        // (la-pty::reject_shell_wrapper, PtyError::ShellWrapping) — that
+        // gate trips on the m0-smoke `cmd /K echo` form too in spirit, but
+        // m0-smoke uses `/K` which the rule allow-lists; here we'd need
+        // `/C` to actually exit, so we sidestep cmd.exe entirely. ping.exe
+        // is in `C:\Windows\System32\` and always in PATH on supported
+        // Windows hosts.
+        #[cfg(windows)]
+        {
+            return Ok(SpawnSpec {
+                program: PathBuf::from("ping.exe"),
+                args: vec!["-n".into(), "61".into(), "127.0.0.1".into()],
+                env: req.env.clone(),
+                cwd: req.cwd.clone(),
+                pty: req.pty,
+                stdin_mode: req.stdin_mode,
+            });
+        }
+
         #[cfg(unix)]
         {
+            let script_dir = std::env::temp_dir().join("lazyagents-m2-smoke-scripts");
+            std::fs::create_dir_all(&script_dir).map_err(AdapterError::SpawnFailed)?;
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let script_path = script_dir.join(format!("{}-{nonce}.sh", std::process::id()));
+            std::fs::write(&script_path, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 60\n")
+                .map_err(AdapterError::SpawnFailed)?;
             use std::os::unix::fs::PermissionsExt;
 
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
                 .map_err(AdapterError::SpawnFailed)?;
+            Ok(SpawnSpec {
+                program: script_path,
+                args: Vec::new(),
+                env: req.env.clone(),
+                cwd: req.cwd.clone(),
+                pty: req.pty,
+                stdin_mode: req.stdin_mode,
+            })
         }
-        Ok(SpawnSpec {
-            program: script_path,
-            args: Vec::new(),
-            env: req.env.clone(),
-            cwd: req.cwd.clone(),
-            pty: req.pty,
-            stdin_mode: req.stdin_mode,
-        })
     }
 
     fn encode_user_input(&self, text: &str) -> Bytes {
@@ -115,7 +137,26 @@ pub async fn bootstrap_daemon(backends: Vec<FakeBackend>) -> TestDaemon {
     let state_dir = tempdir.path().join("state");
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
-    let socket = runtime_dir.join("lad-1.sock");
+    // On Windows `endpoint_for` derives the Named Pipe name from the
+    // socket path's file stem, so two concurrent test daemons that both
+    // pick `lad-1.sock` would race for the same `\\.\pipe\lazyagents-lad-1`.
+    // Use a short, unique stem there. On Unix the tempdir is already
+    // unique per call AND the full path goes through `bind(2)`, which
+    // enforces `SUN_LEN` (104 bytes on macOS) — keep the canonical
+    // `lad-1.sock` name so the path stays well under the limit.
+    #[cfg(windows)]
+    let stem = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "lad-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    };
+    #[cfg(not(windows))]
+    let stem = "lad-1";
+    let socket = runtime_dir.join(format!("{stem}.sock"));
 
     let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
     for backend in backends {
@@ -143,7 +184,7 @@ pub async fn bootstrap_daemon(backends: Vec<FakeBackend>) -> TestDaemon {
 async fn wait_for_socket(socket: &Path) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if connect(&Endpoint::uds(socket)).await.is_ok() {
+        if connect(&endpoint_for(socket)).await.is_ok() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -151,8 +192,8 @@ async fn wait_for_socket(socket: &Path) {
     panic!("daemon socket did not become ready at {}", socket.display());
 }
 
-pub async fn client(socket: &Path) -> Connection<tokio::net::UnixStream> {
-    let stream = connect(&Endpoint::uds(socket)).await.expect("connect");
+pub async fn client(socket: &Path) -> Connection<StreamPair> {
+    let stream = connect(&endpoint_for(socket)).await.expect("connect");
     let mut conn = Connection::new(stream);
     let info = client_handshake(
         &mut conn,
@@ -168,12 +209,7 @@ pub async fn client(socket: &Path) -> Connection<tokio::net::UnixStream> {
     conn
 }
 
-pub async fn call<T, R>(
-    conn: &mut Connection<tokio::net::UnixStream>,
-    id: i64,
-    method: &str,
-    params: T,
-) -> R
+pub async fn call<T, R>(conn: &mut Connection<StreamPair>, id: i64, method: &str, params: T) -> R
 where
     T: serde::Serialize,
     R: serde::de::DeserializeOwned,
@@ -199,7 +235,7 @@ where
 }
 
 pub async fn call_expect_err(
-    conn: &mut Connection<tokio::net::UnixStream>,
+    conn: &mut Connection<StreamPair>,
     id: i64,
     method: &str,
     params: impl serde::Serialize,
