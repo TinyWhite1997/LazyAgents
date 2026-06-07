@@ -2,7 +2,7 @@
 
 **Goal:** zero to your first running session in under 5 minutes.
 
-> **v1 status.** The daemon (`lad`) is fully functional in v1 — sessions, crons, worktrees, and adapter integrations all work. The TUI defaults to a live daemon-backed `RpcSessionSource` (with `la --demo` left in for the in-process fixture used in screenshots and design iteration), and the New-session form is wired end-to-end — pressing `n` opens a real backend / prompt / worktree picker that calls `sessions.create` on Confirm. The JSON-RPC path documented below stays valid for scripted spawns and CI.
+> **v1 status.** The daemon (`lad`) is fully functional in v1 — sessions, crons, worktrees, and adapter integrations all work. The TUI defaults to a live daemon-backed `RpcSessionSource` (with `la --demo` left in for the in-process fixture used in screenshots and design iteration), and the New-session form is wired end-to-end — pressing `n` opens a real backend / worktree picker that calls `sessions.create` on Confirm. The JSON-RPC path documented below stays valid for scripted spawns and CI.
 
 ## Before you start
 
@@ -45,7 +45,7 @@ That's it. `la` checks whether `lad` is already running and runs `lad daemonize`
 
 LazyAgents v1 ships the full daemon — sessions, crons, worktrees, adapters all work. **The TUI is wired end-to-end against the live daemon**:
 
-- Pressing `n` on a project opens the New-session form: pick a backend, type a prompt, toggle the worktree flag, and `Ctrl+Enter` to create. The new session appears on the sidebar within the next ~2 s refresh tick.
+- Pressing `n` on a project opens the New-session form: pick a backend, toggle the worktree flag, and `Enter` to create. The session starts with no initial prompt — attach and type your first instruction into the live agent. The new session appears on the sidebar within the next ~2 s refresh tick.
 - Pressing `Enter` on a session row streams the PTY into the pane and routes your keystrokes back to the daemon via `sessions.write`. Use `Ctrl+B d` (or `Ctrl+B Esc` / `Ctrl+B .`) to detach — the session keeps running on the daemon. `Ctrl+B Ctrl+B` sends a literal `Ctrl+B` (0x02) for agents that need it.
 
 If you want to drive `la` without a daemon (regression screenshots, design iteration), pass **`la --demo`** — that reverts the sidebar to the in-process demo fixture. The default `la` invocation always talks to `lad` and refuses to inject demo data into a real workspace.

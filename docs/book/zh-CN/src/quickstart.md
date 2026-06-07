@@ -2,7 +2,7 @@
 
 **目标：** 从零到跑起第一个会话，5 分钟以内完成。
 
-> **v1 状态。** v1 中 daemon（`lad`）完整可用 —— sessions、crons、worktree、adapter 集成都工作。TUI 默认走 daemon 后的 `RpcSessionSource`（保留 `la --demo` 用于截图与设计回归走进程内 fixture），New-session 表单也端到端接入 —— 按 `n` 打开真表单，挑 backend / 敲提示词 / 勾 worktree，Confirm 即调 `sessions.create`。下面的 JSON-RPC 路径继续对脚本化与 CI 有效。
+> **v1 状态。** v1 中 daemon（`lad`）完整可用 —— sessions、crons、worktree、adapter 集成都工作。TUI 默认走 daemon 后的 `RpcSessionSource`（保留 `la --demo` 用于截图与设计回归走进程内 fixture），New-session 表单也端到端接入 —— 按 `n` 打开真表单，挑 backend / 勾 worktree，Confirm 即调 `sessions.create`。下面的 JSON-RPC 路径继续对脚本化与 CI 有效。
 
 ## 开始之前
 
@@ -45,7 +45,7 @@ la
 
 LazyAgents v1 提供完整的 daemon —— sessions、crons、worktree、adapter 全部可用。**TUI 已端到端接入 daemon**：
 
-- 在项目上按 `n` 打开 New-session 表单：挑 backend、敲提示词、勾 worktree，`Ctrl+Enter` 创建。新会话会在下一次 ~2 s 刷新里出现在侧栏。
+- 在项目上按 `n` 打开 New-session 表单：挑 backend、勾 worktree，`Enter` 创建。会话创建时不带初始提示词 —— attach 进去后再向实时 agent 输入第一条指令。新会话会在下一次 ~2 s 刷新里出现在侧栏。
 - 在会话行按 `Enter` 把 PTY 流入面板，并把你的键入通过 `sessions.write` 回送到 daemon。用 `Ctrl+B d`（或 `Ctrl+B Esc` / `Ctrl+B .`）退出 attach —— 会话仍在 daemon 上跑。`Ctrl+B Ctrl+B` 发字面量 `Ctrl+B`（0x02），供需要该键的 agent 使用。
 
 如果你想在没有 daemon 的情况下驱动 `la`（截图、设计回归），传 **`la --demo`** —— 会切回进程内 demo fixture。默认的 `la` 始终连 daemon，不会把假数据塞进真工作区。

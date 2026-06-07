@@ -443,7 +443,6 @@ async fn create_session_times_out_when_daemon_never_replies() {
             project_dir: "/tmp/proj-a".into(),
             backend: "claude".into(),
             args: Vec::new(),
-            prompt: "hello".into(),
             worktree: false,
         });
         (res, started.elapsed())
@@ -562,7 +561,6 @@ async fn create_session_pulls_fresh_snapshot_before_acking_caller() {
                 project_dir: "/tmp/proj-a".into(),
                 backend: "claude".into(),
                 args: Vec::new(),
-                prompt: "hi".into(),
                 worktree: false,
             })
             .expect("create ok");

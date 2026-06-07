@@ -63,11 +63,6 @@ pub struct NewSessionRequest {
     /// Extra args appended to the adapter's base command. Empty until a
     /// later milestone surfaces an args buffer in the modal.
     pub args: Vec<String>,
-    /// Initial prompt to push to stdin once the first prompt loop is
-    /// ready. Empty string is rejected by [`SourceError::Validation`] —
-    /// the daemon also rejects it but failing in the TUI keeps the round
-    /// trip out of the hot path.
-    pub prompt: String,
     /// If true, create a fresh git worktree for this session.
     pub worktree: bool,
 }
@@ -108,8 +103,8 @@ impl fmt::Display for ProjectId {
 /// daemon failure the user cannot fix from the modal).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceError {
-    /// Caller-side validation failed — empty prompt, missing backend
-    /// list, etc. Modal stays open so the user can correct the input.
+    /// Caller-side validation failed — missing backend, empty project
+    /// directory, etc. Modal stays open so the user can correct the input.
     Validation(String),
     /// Daemon / IPC layer refused or the round-trip failed. Modal
     /// closes; the message is surfaced via the status toast.
@@ -511,9 +506,6 @@ impl SessionSource for MockSessionSource {
         if req.backend.trim().is_empty() {
             return Err(SourceError::Validation("backend is required".into()));
         }
-        if req.prompt.trim().is_empty() {
-            return Err(SourceError::Validation("prompt cannot be empty".into()));
-        }
         // Resolve the project by either its registered id OR its root
         // path (the modal passes `project_dir` from the sidebar's
         // `root_path`). Falling back to the id keeps `MockSessionSource`
@@ -533,11 +525,7 @@ impl SessionSource for MockSessionSource {
             session_id: session_id.clone(),
             project_id,
             backend: Backend::new(&req.backend),
-            title: if req.prompt.trim().is_empty() {
-                None
-            } else {
-                Some(req.prompt.lines().next().unwrap_or_default().to_string())
-            },
+            title: None,
             run_state: RunState::Running,
             archived: false,
             discovered: false,
@@ -637,7 +625,6 @@ mod tests {
                 project_dir: "/home/me/code/proj-a".into(),
                 backend: "claude".into(),
                 args: Vec::new(),
-                prompt: "hello".into(),
                 worktree: false,
             })
             .expect("create ok");
@@ -650,7 +637,7 @@ mod tests {
         assert_eq!(proj.sessions.len(), 1);
         assert_eq!(proj.sessions[0].session_id, id.as_str());
         assert_eq!(proj.sessions[0].backend.id(), "claude");
-        assert_eq!(proj.sessions[0].title.as_deref(), Some("hello"));
+        assert_eq!(proj.sessions[0].title, None);
         // create() also resolves a project by its registered id, so a
         // caller threading the project_id (as the App does when the
         // sidebar root_path is empty) still works.
@@ -659,7 +646,6 @@ mod tests {
                 project_dir: "proj-a".into(),
                 backend: "codex".into(),
                 args: Vec::new(),
-                prompt: "second".into(),
                 worktree: true,
             })
             .expect("create ok via project id");
@@ -669,22 +655,13 @@ mod tests {
     }
 
     #[test]
-    fn create_session_rejects_empty_prompt_and_unknown_project() {
+    fn create_session_rejects_unknown_project() {
         let mut src = MockSessionSource::new();
         src.add_project("proj-a", "proj-a", "/p/a");
-        let empty_prompt = src.create_session(NewSessionRequest {
-            project_dir: "/p/a".into(),
-            backend: "claude".into(),
-            args: Vec::new(),
-            prompt: "   ".into(),
-            worktree: false,
-        });
-        assert!(matches!(empty_prompt, Err(SourceError::Validation(_))));
         let unknown = src.create_session(NewSessionRequest {
             project_dir: "/nope".into(),
             backend: "claude".into(),
             args: Vec::new(),
-            prompt: "hi".into(),
             worktree: false,
         });
         assert!(matches!(unknown, Err(SourceError::Validation(_))));

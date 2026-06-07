@@ -283,9 +283,6 @@ impl SessionSource for RpcSessionSource {
         if req.backend.trim().is_empty() {
             return Err(SourceError::Validation("backend is required".into()));
         }
-        if req.prompt.trim().is_empty() {
-            return Err(SourceError::Validation("prompt cannot be empty".into()));
-        }
         if req.project_dir.trim().is_empty() {
             return Err(SourceError::Validation(
                 "project directory is missing — try a different project row".into(),
@@ -544,16 +541,14 @@ async fn run_once(
                     // bubbling a transport failure up to the reconnect
                     // loop so a wedged bg thread can't wedge the modal.
                     //
-                    // `prompt` is always Some(...) here because
-                    // [`SessionSource::create_session`] already rejected
-                    // an empty buffer as `Validation`; the daemon also
-                    // requires a non-empty prompt so we don't bother
-                    // sending `None`.
+                    // No initial prompt is sent — the session is created
+                    // waiting for human input, which the user supplies by
+                    // attaching and typing into the live agent.
                     let params = SessionsCreateParams {
                         project_dir: new_req.project_dir.clone(),
                         backend: new_req.backend.clone(),
                         args: new_req.args.clone(),
-                        prompt: Some(new_req.prompt.clone()),
+                        prompt: None,
                         worktree: new_req.worktree,
                     };
                     let req = match Request::new(next_id, SessionsCreate::NAME, params) {
