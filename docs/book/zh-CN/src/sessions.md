@@ -52,7 +52,7 @@ modal 内的快捷键：
 
 ### 在 TUI 里（v1 状态）
 
-v1 的 Sessions tab 完成了导航、侧栏与所有 modal，**New-session 表单已端到端接入**：在项目上按 **`n`** 会打开一个真表单，可以挑 backend、敲提示词、勾选 worktree，按 **`Ctrl+Enter`** 即调 daemon 的 `sessions.create`。新会话会在下一次 ~2 s 刷新里出现在侧栏。
+v1 的 Sessions tab 完成了导航、侧栏与所有 modal，**New-session 表单已端到端接入**：在项目上按 **`n`** 会打开一个真表单，可以挑 backend、勾选 worktree，按 **`Enter`** 即调 daemon 的 `sessions.create`。会话创建时不带初始提示词 —— 等 attach 进去后再向实时 agent 输入第一条指令。新会话会在下一次 ~2 s 刷新里出现在侧栏。
 
 **Live attach 已接入：** 选中会话行按 **`Enter`** 会打开一个实时 PTY 面板，底层走 `sessions.attach { acquire_input: true }`，daemon 把 `session.output` 直接送进 transcript，你键入的每一个字符通过 `sessions.write` 回送到 session。
 
@@ -62,7 +62,6 @@ New-session 表单的字段：
 |---|---|---|
 | Project | 是 | 取自侧栏当前选中的项目行 —— 打开 modal 前先把光标移到目标项目。 |
 | Backend | 是 | 来自 daemon 健康探测中状态为 `Available` 的 backend；`←`/`→` 切换。 |
-| Prompt | 是 | 启动时喂给 agent 的初始文本。多行可写：`Enter` 插入换行，`Ctrl+Enter` 创建。 |
 | Worktree | 否（默认关） | `Space` 切换。开启则在 spawn 之前运行 `git worktree add -b la/session-<short-sid> <base>`。 |
 | Args | 预留 | trait 已留位以便未来扩展，目前 modal 不暴露。 |
 
@@ -70,14 +69,13 @@ modal 内的快捷键：
 
 | 键 | 行为 |
 |---|---|
-| `Tab` / `Shift+Tab` | 在 Backend → Prompt → Worktree 之间循环焦点。 |
+| `Tab` / `Shift+Tab` | 在 Backend → Worktree 之间循环焦点。 |
 | `←` / `→` | 在 Backend 字段移动 backend 光标。 |
 | `Space` | 在 Worktree 字段切换 worktree 标志。 |
-| `Ctrl+Enter` | 触发 `sessions.create`。 |
-| `Enter` | 在 Prompt 字段插入换行；在其它字段等同 Confirm。 |
+| `Enter` | 触发 `sessions.create`。 |
 | `Esc` | 取消 —— 关闭 modal 并丢弃草稿。 |
 
-校验失败（提示词为空、无可用 backend）会保留 modal 并在内部贴上错误提示，方便就地修复；daemon 拒绝则关闭 modal，并通过底部状态栏 toast 显示原因。
+校验失败（无可用 backend）会保留 modal 并在内部贴上错误提示，方便就地修复；daemon 拒绝则关闭 modal，并通过底部状态栏 toast 显示原因。
 
 ### 程式化（通过 daemon socket 的 JSON-RPC）
 

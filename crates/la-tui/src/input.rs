@@ -288,54 +288,29 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
 fn translate_new_session_key(
     code: KeyCode,
     mods: KeyModifiers,
-    draft: &crate::app::NewSessionDraft,
+    _draft: &crate::app::NewSessionDraft,
 ) -> Option<AppMsg> {
-    use crate::app::NewSessionField;
-    // Ctrl+Enter unconditionally confirms — gives the user one
-    // unambiguous "create" gesture even when the prompt field is
-    // focused (where plain Enter inserts a newline).
+    // Enter confirms from any field. Ctrl+Enter is accepted too so the
+    // advertised "Ctrl+⏎ create" hint stays translatable.
     if let KeyCode::Enter = code {
-        if mods.contains(KeyModifiers::CONTROL) {
-            return Some(AppMsg::Confirm);
-        }
-        if draft.field == NewSessionField::Prompt {
-            return Some(AppMsg::NewSessionPromptNewline);
-        }
         return Some(AppMsg::Confirm);
     }
     match code {
         KeyCode::Esc => Some(AppMsg::Cancel),
         KeyCode::Tab => Some(AppMsg::NewSessionFocusNext),
         KeyCode::BackTab => Some(AppMsg::NewSessionFocusPrev),
-        // ←/→ + Space + Backspace are translated unconditionally so
-        // the `?` overlay's hint list survives the cross-check in
+        // ←/→ + Space are translated unconditionally so the `?` overlay's
+        // hint list survives the cross-check in
         // `every_advertised_modal_key_is_translatable`. The App's
-        // `try_apply_new_session_field` is the authority on which
-        // field actually reacts.
+        // `try_apply_new_session_field` is the authority on which field
+        // actually reacts.
         KeyCode::Left => Some(AppMsg::NewSessionBackendPrev),
         KeyCode::Right => Some(AppMsg::NewSessionBackendNext),
-        KeyCode::Char(' ') if draft.field != NewSessionField::Prompt => {
-            // Space cycles the worktree flag from the Worktree row; on
-            // the Backend row it's a no-op at the App level (so the
-            // hint can advertise "Space" unconditionally and the
-            // `every_advertised_modal_key_is_translatable` cross-check
-            // keeps passing). On the Prompt row Space is a literal
-            // character — fall through to the printable-char arm.
-            Some(AppMsg::NewSessionToggleWorktree)
+        KeyCode::Char(' ') => Some(AppMsg::NewSessionToggleWorktree),
+        _ => {
+            let _ = mods;
+            None
         }
-        KeyCode::Backspace if draft.field == NewSessionField::Prompt => {
-            Some(AppMsg::NewSessionPromptBackspace)
-        }
-        KeyCode::Char(c) if draft.field == NewSessionField::Prompt => {
-            // Filter control-modified printable chars so chords like
-            // Ctrl+S don't sneak into the buffer. Ctrl+C was already
-            // intercepted at the top of `translate_modal_key`.
-            if mods.contains(KeyModifiers::CONTROL) {
-                return None;
-            }
-            Some(AppMsg::NewSessionPromptChar(c))
-        }
-        _ => None,
     }
 }
 

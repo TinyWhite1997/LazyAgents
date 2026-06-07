@@ -172,7 +172,7 @@ impl HintRegistry {
                 // keys are exactly the ones the input layer translates
                 // for the modal — PRD §5.6 第 3 条 (hint == 真实绑定)
                 // is checked by `every_advertised_modal_key_is_translatable`.
-                Hint::new("Ctrl+⏎", "create", Importance::Primary),
+                Hint::new("⏎", "create", Importance::Primary),
                 Hint::new("Tab", "next field", Importance::High),
                 Hint::new("Esc", "cancel", Importance::High),
                 Hint::new("←/→", "backend", Importance::Medium),

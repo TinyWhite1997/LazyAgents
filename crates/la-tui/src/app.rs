@@ -70,15 +70,13 @@ pub enum Focus {
 }
 
 /// State carried inside [`Modal::NewSession`]. Holds the user's draft
-/// across redraws so the input keys (Tab cycle, backend ←/→, prompt
-/// typing, worktree toggle) can mutate it in place.
+/// across redraws so the input keys (Tab cycle, backend ←/→, worktree
+/// toggle) can mutate it in place.
 ///
 /// Kept as a plain struct of POD-ish fields so the parent [`Modal`] can
 /// still derive `Clone` + `PartialEq` + `Eq` (the rest of the modal
-/// machinery relies on that). The composer-style prompt buffer is a
-/// `String` here rather than a full [`crate::composer::Composer`] —
-/// A2's scope only needs append + backspace + Enter-for-newline; pulling
-/// in the multi-line caret machinery is overkill and would break Eq.
+/// machinery relies on that). The session is created without an initial
+/// prompt — the user types into the live agent after attaching.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSessionDraft {
     /// Project id the new session belongs to. Matches the sidebar
@@ -98,9 +96,6 @@ pub struct NewSessionDraft {
     /// Cursor into [`backends`]. May be 0 even when `backends` is
     /// empty; Confirm guards against that.
     pub backend_idx: usize,
-    /// Prompt buffer. UTF-8 char-boundary safe via the App's input
-    /// handlers.
-    pub prompt: String,
     /// Whether the daemon should mint a fresh git worktree on Confirm.
     pub worktree: bool,
     /// Which field has focus.
@@ -120,7 +115,6 @@ impl NewSessionDraft {
             project_dir,
             backends,
             backend_idx: 0,
-            prompt: String::new(),
             worktree: false,
             field: NewSessionField::Backend,
             error: None,
@@ -135,8 +129,7 @@ impl NewSessionDraft {
     /// Cycle to the next focusable field (Tab).
     pub fn focus_next(&mut self) {
         self.field = match self.field {
-            NewSessionField::Backend => NewSessionField::Prompt,
-            NewSessionField::Prompt => NewSessionField::Worktree,
+            NewSessionField::Backend => NewSessionField::Worktree,
             NewSessionField::Worktree => NewSessionField::Backend,
         };
     }
@@ -145,8 +138,7 @@ impl NewSessionDraft {
     pub fn focus_prev(&mut self) {
         self.field = match self.field {
             NewSessionField::Backend => NewSessionField::Worktree,
-            NewSessionField::Prompt => NewSessionField::Backend,
-            NewSessionField::Worktree => NewSessionField::Prompt,
+            NewSessionField::Worktree => NewSessionField::Backend,
         };
     }
 
@@ -176,7 +168,6 @@ impl NewSessionDraft {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewSessionField {
     Backend,
-    Prompt,
     Worktree,
 }
 
@@ -453,11 +444,6 @@ pub enum AppMsg {
     NewSessionBackendPrev,
     NewSessionBackendNext,
     NewSessionToggleWorktree,
-    /// One printable char from the user — appended to the prompt
-    /// buffer when the prompt field has focus, otherwise dropped.
-    NewSessionPromptChar(char),
-    NewSessionPromptNewline,
-    NewSessionPromptBackspace,
     /// `i` promote a Discovered session into a native row via
     /// `sessions.import` (WEK-26 / M2.3). No-op outside the
     /// Discovered bucket.
@@ -993,10 +979,7 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             | AppMsg::NewSessionFocusPrev
             | AppMsg::NewSessionBackendPrev
             | AppMsg::NewSessionBackendNext
-            | AppMsg::NewSessionToggleWorktree
-            | AppMsg::NewSessionPromptChar(_)
-            | AppMsg::NewSessionPromptNewline
-            | AppMsg::NewSessionPromptBackspace => {}
+            | AppMsg::NewSessionToggleWorktree => {}
 
             // --- NewProject modal field edits (WEK-101) -------------
             //
@@ -1116,28 +1099,6 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                     clear_err_on(draft);
                 } else {
                     return Some(msg);
-                }
-            }
-            AppMsg::NewSessionPromptChar(c) => {
-                if draft.field == NewSessionField::Prompt {
-                    draft.prompt.push(c);
-                    clear_err_on(draft);
-                } else {
-                    // Char hit but prompt isn't focused — swallow so
-                    // it doesn't drop through to the modal's
-                    // confirm/cancel matrix.
-                }
-            }
-            AppMsg::NewSessionPromptNewline => {
-                if draft.field == NewSessionField::Prompt {
-                    draft.prompt.push('\n');
-                    clear_err_on(draft);
-                }
-            }
-            AppMsg::NewSessionPromptBackspace => {
-                if draft.field == NewSessionField::Prompt {
-                    draft.prompt.pop();
-                    clear_err_on(draft);
                 }
             }
             other => return Some(other),
@@ -1273,9 +1234,8 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             (Modal::NewSession(draft), AppMsg::Confirm) => {
                 // Validate first so the user sees a precise reason and
                 // the modal can stay open for them to fix it (per
-                // architect review: no backends / empty prompt should
-                // surface a toast, not silently no-op).
-                let trimmed_prompt = draft.prompt.trim().to_string();
+                // architect review: no backends should surface a toast,
+                // not silently no-op).
                 let backend = match draft.selected_backend() {
                     Some(b) => b.to_string(),
                     None => {
@@ -1285,12 +1245,6 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                         return AppOutcome::Continue;
                     }
                 };
-                if trimmed_prompt.is_empty() {
-                    let msg = "prompt cannot be empty".to_string();
-                    self.update_new_session_error(msg.clone());
-                    self.last_toast = Some(format!("new session: {msg}"));
-                    return AppOutcome::Continue;
-                }
                 if draft.project_dir.trim().is_empty() {
                     let msg = "project directory missing for this row".to_string();
                     self.update_new_session_error(msg.clone());
@@ -1301,7 +1255,6 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                     project_dir: draft.project_dir.clone(),
                     backend,
                     args: Vec::new(),
-                    prompt: trimmed_prompt,
                     worktree: draft.worktree,
                 };
                 match self.source.create_session(req) {
@@ -1836,25 +1789,19 @@ mod tests {
         assert_eq!(draft.project_dir, "~/code/proj-a");
         assert_eq!(draft.backends, vec!["claude".to_string()]);
         assert_eq!(draft.backend_idx, 0);
-        assert!(draft.prompt.is_empty());
         assert!(!draft.worktree);
         assert_eq!(draft.field, NewSessionField::Backend);
         assert!(draft.error.is_none());
     }
 
     #[test]
-    fn confirm_with_backend_and_prompt_calls_source_with_correct_request() {
+    fn confirm_with_backend_calls_source_with_correct_request() {
         // WEK-94 / A2: UI ↔ trait edge — the modal hands the source
-        // the exact (project_dir, backend, prompt, worktree) it
-        // collected, and a successful return closes the modal and
-        // refreshes the sidebar.
+        // the exact (project_dir, backend, worktree) it collected, and a
+        // successful return closes the modal and refreshes the sidebar.
         let mut a = app();
         open_new_session_modal(&mut a);
-        a.handle(AppMsg::NewSessionFocusNext); // Backend -> Prompt
-        for c in "fix the login bug".chars() {
-            a.handle(AppMsg::NewSessionPromptChar(c));
-        }
-        a.handle(AppMsg::NewSessionFocusNext); // Prompt -> Worktree
+        a.handle(AppMsg::NewSessionFocusNext); // Backend -> Worktree
         a.handle(AppMsg::NewSessionToggleWorktree);
         a.handle(AppMsg::Confirm);
         assert!(a.modal.is_none(), "modal closed on successful create");
@@ -1862,7 +1809,6 @@ mod tests {
         assert_eq!(created.len(), 1, "exactly one create call");
         assert_eq!(created[0].project_dir, "~/code/proj-a");
         assert_eq!(created[0].backend, "claude");
-        assert_eq!(created[0].prompt, "fix the login bug");
         assert!(created[0].worktree);
         assert_eq!(created[0].args, Vec::<String>::new());
         // The mock inserted a `Running` row under proj-a — refresh
@@ -1897,10 +1843,6 @@ mod tests {
         // hop and gets painted on the next frame.
         let mut a = app();
         open_new_session_modal(&mut a);
-        a.handle(AppMsg::NewSessionFocusNext); // Backend -> Prompt
-        for c in "ship it".chars() {
-            a.handle(AppMsg::NewSessionPromptChar(c));
-        }
         a.handle(AppMsg::Confirm);
         let toast_after_create = a
             .last_toast
@@ -1939,28 +1881,6 @@ mod tests {
             a.last_toast.is_none(),
             "user-input dispatch must clear stale toast, got {:?}",
             a.last_toast
-        );
-    }
-
-    #[test]
-    fn empty_prompt_blocks_confirm_with_toast_and_keeps_modal_open() {
-        let mut a = app();
-        open_new_session_modal(&mut a);
-        // Backend focused, prompt empty.
-        a.handle(AppMsg::Confirm);
-        // Modal still open with an error stamped on the draft.
-        let Some(Modal::NewSession(ref draft)) = a.modal else {
-            panic!("expected NewSession modal still open, got {:?}", a.modal);
-        };
-        assert_eq!(draft.error.as_deref(), Some("prompt cannot be empty"));
-        assert!(a
-            .last_toast
-            .as_deref()
-            .map(|t| t.contains("prompt cannot be empty"))
-            .unwrap_or(false));
-        assert!(
-            a.source().created().is_empty(),
-            "source.create_session was not called"
         );
     }
 
@@ -2035,11 +1955,7 @@ mod tests {
             draft.project_dir, "",
             "empty root_path must NOT fall back to project_id — that would smuggle a UUID into `sessions.create.project_dir`"
         );
-        // Type a real prompt so the only blocker left is project_dir.
-        a.handle(AppMsg::NewSessionFocusNext);
-        for c in "go".chars() {
-            a.handle(AppMsg::NewSessionPromptChar(c));
-        }
+        // The only blocker left is the empty project_dir.
         a.handle(AppMsg::Confirm);
         let Some(Modal::NewSession(ref draft)) = a.modal else {
             panic!("modal must stay open on Validation refusal");
@@ -2061,12 +1977,11 @@ mod tests {
 
     #[test]
     fn modal_field_keys_route_to_their_target_field() {
-        // WEK-94 / A2: Tab cycles Backend → Prompt → Worktree → Backend;
-        // ←/→ only move the backend cursor while Backend is focused;
-        // Space only toggles worktree while Worktree is focused; printable
-        // chars only land in the prompt buffer while Prompt is focused.
-        // This pins the cross-field invariants in one place so a future
-        // refactor of the routing helpers can't silently break them.
+        // WEK-94 / A2: Tab cycles Backend → Worktree → Backend; ←/→ only
+        // move the backend cursor while Backend is focused; Space only
+        // toggles worktree while Worktree is focused. This pins the
+        // cross-field invariants in one place so a future refactor of the
+        // routing helpers can't silently break them.
         let mut a = app();
         open_new_session_modal(&mut a);
         // Stage two backends so backend cursor movement is observable.
@@ -2079,27 +1994,8 @@ mod tests {
         if let Some(Modal::NewSession(ref d)) = a.modal {
             assert_eq!(d.backend_idx, 0, "cycle wraps");
         }
-        // Char on Backend → swallowed (does not land in prompt).
-        a.handle(AppMsg::NewSessionPromptChar('z'));
-        if let Some(Modal::NewSession(ref d)) = a.modal {
-            assert!(
-                d.prompt.is_empty(),
-                "prompt char dropped while Backend focused"
-            );
-        }
-        // Focus → Prompt; chars now land.
-        a.handle(AppMsg::NewSessionFocusNext);
-        a.handle(AppMsg::NewSessionPromptChar('h'));
-        a.handle(AppMsg::NewSessionPromptChar('i'));
-        a.handle(AppMsg::NewSessionPromptNewline);
-        a.handle(AppMsg::NewSessionPromptChar('!'));
-        a.handle(AppMsg::NewSessionPromptBackspace);
-        if let Some(Modal::NewSession(ref d)) = a.modal {
-            assert_eq!(d.prompt, "hi\n");
-        }
-        // Space on Prompt → printable char (handled by input layer); the
-        // App's `NewSessionToggleWorktree` arm refuses to toggle while
-        // Prompt is focused.
+        // Space on Backend → the App's `NewSessionToggleWorktree` arm
+        // refuses to toggle while Backend is focused.
         a.handle(AppMsg::NewSessionToggleWorktree);
         if let Some(Modal::NewSession(ref d)) = a.modal {
             assert!(!d.worktree, "worktree untoggled outside its field");
