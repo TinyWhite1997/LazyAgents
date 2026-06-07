@@ -59,18 +59,27 @@ impl Completion {
     pub const CAP: usize = 200;
 }
 
-/// Expand a leading `~` in `input` to the user's home directory. Falls
-/// back to leaving the string untouched when:
-/// - input does not start with `~`,
-/// - the OS does not expose `HOME` / `USERPROFILE`,
-/// - input starts with `~user` (other users' homes are not supported —
-///   this matches `bash` behaviour when `getpwnam` is unavailable, and
-///   keeps the implementation `std`-only).
-pub fn expand_tilde(input: &str) -> String {
+/// Expand a leading `~` in `input` against the supplied home directory.
+///
+/// Pure helper — does NOT read the process environment. Use
+/// [`expand_tilde`] for the convenience wrapper that resolves the home
+/// from `$HOME` / `%USERPROFILE%`. Splitting the function this way is
+/// what lets the tests exercise tilde expansion deterministically
+/// without mutating the process-wide `HOME` env var (which was the
+/// source of a flake under default-parallel `cargo test` — the
+/// reviewer's blocker on PR #92).
+///
+/// Returns `input` unchanged when:
+/// - the input does not start with `~`,
+/// - `home` is `None` (no home directory available),
+/// - the input starts with `~user` (other users' homes are not
+///   supported — matches `bash` behaviour when `getpwnam` is
+///   unavailable, and keeps the implementation `std`-only).
+pub fn expand_tilde_with(input: &str, home: Option<&Path>) -> String {
     if !input.starts_with('~') {
         return input.to_string();
     }
-    let Some(home) = home_dir() else {
+    let Some(home) = home else {
         return input.to_string();
     };
     if input == "~" {
@@ -86,6 +95,16 @@ pub fn expand_tilde(input: &str) -> String {
     }
     // `~something` (no `/`) — unsupported, leave verbatim.
     input.to_string()
+}
+
+/// Expand a leading `~` in `input` against the process's home dir.
+///
+/// Thin wrapper over [`expand_tilde_with`] for production callers that
+/// just want the env-driven behaviour. Tests should prefer
+/// `expand_tilde_with(input, Some(td.path()))` so they don't fight each
+/// other over the `HOME` env var under parallel execution.
+pub fn expand_tilde(input: &str) -> String {
+    expand_tilde_with(input, home_dir().as_deref())
 }
 
 /// Cross-platform home directory lookup. Linux/macOS read `$HOME`;
@@ -132,13 +151,23 @@ pub fn default_starting_path() -> String {
         .unwrap_or_else(|_| "/".to_string())
 }
 
-/// Build a [`Completion`] for the given raw input string.
+/// Build a [`Completion`] for the given raw input string, using the
+/// process's `$HOME` for tilde expansion.
+///
+/// Thin wrapper over [`complete_with`]; tests should prefer the explicit
+/// form so they don't depend on the ambient environment.
+pub fn complete(input: &str) -> Completion {
+    complete_with(input, home_dir().as_deref())
+}
+
+/// Build a [`Completion`] for the given raw input string against an
+/// explicit home directory.
 ///
 /// Reads the parent directory on every call — cheap enough for the
 /// modal's keystroke cadence (one `read_dir` per character; the result
 /// fits in the page cache after the first hit).
-pub fn complete(input: &str) -> Completion {
-    let expanded = expand_tilde(input);
+pub fn complete_with(input: &str, home: Option<&Path>) -> Completion {
+    let expanded = expand_tilde_with(input, home);
     if expanded.is_empty() {
         return Completion::default();
     }
@@ -272,28 +301,26 @@ mod tests {
 
     #[test]
     fn expand_tilde_passes_through_when_no_tilde() {
-        assert_eq!(expand_tilde("/etc/foo"), "/etc/foo");
-        assert_eq!(expand_tilde("foo"), "foo");
-        assert_eq!(expand_tilde(""), "");
+        assert_eq!(expand_tilde_with("/etc/foo", None), "/etc/foo");
+        assert_eq!(expand_tilde_with("foo", None), "foo");
+        assert_eq!(expand_tilde_with("", None), "");
     }
 
     #[test]
     fn expand_tilde_replaces_leading_tilde_only() {
-        // Override HOME so the test is deterministic regardless of the
-        // user running it.
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", "/home/tester");
-        assert_eq!(expand_tilde("~"), "/home/tester");
-        assert_eq!(expand_tilde("~/code"), "/home/tester/code");
+        // Inject the home dir explicitly — never touch `$HOME`. Mutating
+        // the process env races with `complete_resolves_tilde` (and any
+        // other future test) under default-parallel `cargo test`, which
+        // was the reviewer's blocker on PR #92.
+        let home = std::path::Path::new("/home/tester");
+        assert_eq!(expand_tilde_with("~", Some(home)), "/home/tester");
+        assert_eq!(expand_tilde_with("~/code", Some(home)), "/home/tester/code");
         // Other-user homes (`~someone`) are not expanded.
-        assert_eq!(expand_tilde("~someone/x"), "~someone/x");
+        assert_eq!(expand_tilde_with("~someone/x", Some(home)), "~someone/x");
         // Tilde mid-string is literal, not expanded.
-        assert_eq!(expand_tilde("/foo/~/bar"), "/foo/~/bar");
-        if let Some(v) = prev {
-            std::env::set_var("HOME", v);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        assert_eq!(expand_tilde_with("/foo/~/bar", Some(home)), "/foo/~/bar");
+        // No home available → input passes through verbatim.
+        assert_eq!(expand_tilde_with("~/code", None), "~/code");
     }
 
     #[test]
@@ -304,7 +331,7 @@ mod tests {
         fs::write(td.path().join("plain.txt"), "x").unwrap();
 
         let base = format!("{}/", td.path().display());
-        let comp = complete(&base);
+        let comp = complete_with(&base, None);
         assert_eq!(comp.prefix, "");
         assert!(comp.resolved_exists_as_dir);
         assert_eq!(
@@ -314,7 +341,7 @@ mod tests {
         );
 
         // Prefix narrows the list.
-        let narrowed = complete(&format!("{}al", base));
+        let narrowed = complete_with(&format!("{}al", base), None);
         assert_eq!(narrowed.prefix, "al");
         assert_eq!(
             narrowed.candidates,
@@ -330,7 +357,7 @@ mod tests {
     fn complete_shows_hidden_when_user_explicitly_types_dot() {
         let td = TempDir::new().unwrap();
         make_tree(&td, &[".hidden", ".other", "visible"]);
-        let comp = complete(&format!("{}/.", td.path().display()));
+        let comp = complete_with(&format!("{}/.", td.path().display()), None);
         assert_eq!(comp.prefix, ".");
         assert_eq!(
             comp.candidates,
@@ -340,29 +367,27 @@ mod tests {
 
     #[test]
     fn complete_resolves_tilde() {
+        // Inject the home dir directly into `complete_with` — do NOT
+        // mutate `$HOME`. Tests in this module run in parallel by
+        // default, and the earlier env-mutation version raced with
+        // `expand_tilde_replaces_leading_tilde_only` (Code Reviewer's
+        // blocker on PR #92: `expected ["work"], got ["workspace"]`).
         let td = TempDir::new().unwrap();
         make_tree(&td, &["work"]);
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", td.path());
+        let home = td.path();
 
-        let comp = complete("~/");
+        let comp = complete_with("~/", Some(home));
         assert!(comp.resolved_exists_as_dir, "~/ resolves to HOME");
         assert!(comp.candidates.contains(&"work".to_string()));
 
-        let narrowed = complete("~/wo");
+        let narrowed = complete_with("~/wo", Some(home));
         assert_eq!(narrowed.prefix, "wo");
         assert_eq!(narrowed.candidates, vec!["work".to_string()]);
-
-        if let Some(v) = prev {
-            std::env::set_var("HOME", v);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[test]
     fn complete_empty_input_returns_empty_completion() {
-        let comp = complete("");
+        let comp = complete_with("", None);
         assert!(!comp.resolved_exists_as_dir);
         assert!(comp.candidates.is_empty());
         assert_eq!(comp.parent, PathBuf::new());
@@ -370,7 +395,7 @@ mod tests {
 
     #[test]
     fn complete_unreadable_parent_returns_empty_candidates_without_panic() {
-        let comp = complete("/this/path/definitely/does/not/exist/abc");
+        let comp = complete_with("/this/path/definitely/does/not/exist/abc", None);
         assert!(!comp.resolved_exists_as_dir);
         assert!(comp.candidates.is_empty(), "read_dir failure → no panic");
         assert_eq!(comp.prefix, "abc");
@@ -380,7 +405,7 @@ mod tests {
     fn apply_candidate_joins_under_parent() {
         let td = TempDir::new().unwrap();
         make_tree(&td, &["proj-a"]);
-        let comp = complete(&format!("{}/", td.path().display()));
+        let comp = complete_with(&format!("{}/", td.path().display()), None);
         let chosen = apply_candidate(&comp, "proj-a");
         assert_eq!(chosen, td.path().join("proj-a"));
     }

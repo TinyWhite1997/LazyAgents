@@ -240,15 +240,23 @@ impl SessionSource for RpcSessionSource {
         // `create_project` but not yet surfaced by the daemon's
         // `sessions.list` — the daemon only inserts a `projects` row on
         // first `sessions.create`). Drop pending entries whose
-        // `root_path` (or display_name, which equals the basename used
-        // by the daemon's `ensure_project`) now matches a daemon-side
-        // group; that means the next session under the same path
-        // promoted the local stub into a real row.
+        // normalized `root_path` now matches a daemon-side group; that
+        // means the next session under the same path promoted the local
+        // stub into a real row.
+        //
+        // Match on `root_path` ONLY — never on `display_name`. The
+        // `projects` table's uniqueness constraint is on `root_path`
+        // alone (see la-storage/migrations/0001_initial.sql), and the
+        // daemon's `ensure_project` also looks up by `root_path`. Two
+        // distinct projects can legitimately share a basename
+        // (`/repo/app` and `/tmp/app`) and the merge MUST keep both —
+        // collapsing on display_name was the Code Reviewer's blocker
+        // on PR #92.
         if let Ok(mut pending) = self.pending_projects.lock() {
             pending.retain(|p| {
                 !groups
                     .iter()
-                    .any(|g| g.root_path == p.root_path || g.display_name == p.display_name)
+                    .any(|g| normalize_root(&g.root_path) == normalize_root(&p.root_path))
             });
             for p in pending.iter() {
                 // Insert before the synthetic Discovered / Archived
@@ -362,21 +370,19 @@ impl SessionSource for RpcSessionSource {
             .map(|s| s.to_string_lossy().into_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| trimmed.to_string());
-        // Duplicate guard: a path already in the live cache OR in the
-        // pending list means the project is "already known" and we
-        // refuse with a precise Validation error instead of stacking a
-        // second stub. Matching on either `root_path` or `display_name`
-        // mirrors the merge rule in `snapshot` — once the daemon adopts
-        // this path it'll surface under the same display name (the
-        // basename), and a stale stub would otherwise live forever
-        // alongside the real entry.
+        // Duplicate guard: refuse only when the SAME root path is
+        // already known (live cache OR pending list). Compare by
+        // normalized `root_path` — never by `display_name`, since the
+        // `projects` table only enforces uniqueness on `root_path`
+        // (la-storage/migrations/0001_initial.sql) and two different
+        // checkouts can legitimately share a basename
+        // (`/repo/app` vs `/tmp/app`). The Code Reviewer's blocker on
+        // PR #92 was the basename collision rejecting that second case.
+        let norm = normalize_root(trimmed);
         let live_has = self
             .cache
             .lock()
-            .map(|c| {
-                c.iter()
-                    .any(|g| g.root_path == trimmed || g.display_name == display)
-            })
+            .map(|c| c.iter().any(|g| normalize_root(&g.root_path) == norm))
             .unwrap_or(false);
         if live_has {
             return Err(SourceError::Validation(format!(
@@ -388,10 +394,7 @@ impl SessionSource for RpcSessionSource {
                 .pending_projects
                 .lock()
                 .map_err(|_| SourceError::Backend("pending_projects lock poisoned".into()))?;
-            if pending
-                .iter()
-                .any(|p| p.root_path == trimmed || p.display_name == display)
-            {
+            if pending.iter().any(|p| normalize_root(&p.root_path) == norm) {
                 return Err(SourceError::Validation(format!(
                     "project already exists for {trimmed}"
                 )));
@@ -806,6 +809,18 @@ fn derive_root_path(worktree_path: Option<&str>) -> String {
     worktree_path.unwrap_or("").to_string()
 }
 
+/// Normalize a project root path for `pending_projects` dedup. Strips
+/// trailing separators so `"/repo/app"` and `"/repo/app/"` compare
+/// equal — the rest of the byte sequence is taken verbatim because the
+/// TUI does not own the on-disk authority (the daemon's
+/// `ensure_project` is the canonical normalizer, and it just stores
+/// whatever string `sessions.create.project_dir` arrived with). Case is
+/// preserved on every platform; case-folding `/Users/Alice` vs
+/// `/users/alice` is the daemon's call, not ours.
+fn normalize_root(p: &str) -> String {
+    p.trim_end_matches(['/', '\\']).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,6 +896,29 @@ mod tests {
         let groups = build_groups(&sessions);
         assert_eq!(groups.len(), 1);
         assert!(!groups[0].is_archived);
+    }
+
+    #[test]
+    fn normalize_root_strips_trailing_separators_only() {
+        // Code Reviewer's blocker on PR #92: dedup must match the
+        // daemon's own uniqueness rule, which is "the literal
+        // `root_path` string". Trailing-slash variants are the only
+        // normalization the daemon's `ensure_project` is robust to
+        // (PathBuf comparisons are identity), so we mirror that.
+        assert_eq!(normalize_root("/repo/app"), "/repo/app");
+        assert_eq!(normalize_root("/repo/app/"), "/repo/app");
+        assert_eq!(normalize_root("/repo/app///"), "/repo/app");
+        // Case is preserved on every platform — daemon decides if it
+        // wants to case-fold, not the TUI.
+        assert_eq!(normalize_root("/Users/Alice"), "/Users/Alice");
+        assert_ne!(
+            normalize_root("/Users/Alice"),
+            normalize_root("/users/alice")
+        );
+        // Two distinct paths with the same basename must NOT compare
+        // equal — that was the regression: `/repo/app` was collapsing
+        // with `/tmp/app` because the old guard looked at display_name.
+        assert_ne!(normalize_root("/repo/app"), normalize_root("/tmp/app"));
     }
 }
 

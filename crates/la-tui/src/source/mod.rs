@@ -470,10 +470,17 @@ impl SessionSource for MockSessionSource {
         // dir + mkdir. Existence enforcement lives on the modal side
         // for the live source; the mock's job is to exercise the
         // dedup + select-after-create paths.
+        //
+        // Dedup is by `root_path` ONLY — never by `display_name`. The
+        // daemon's `projects` table only enforces uniqueness on
+        // `root_path`, and two distinct checkouts can share a basename
+        // (`/repo/app` and `/tmp/app`); collapsing on display_name was
+        // the Code Reviewer's blocker on PR #92.
+        let norm = trimmed.trim_end_matches(['/', '\\']);
         if self
             .projects
             .iter()
-            .any(|p| p.root_path == trimmed || p.display_name == trimmed)
+            .any(|p| p.root_path.trim_end_matches(['/', '\\']) == norm)
         {
             return Err(SourceError::Validation(format!(
                 "project already exists for {trimmed}"
@@ -685,5 +692,46 @@ mod tests {
         // Nothing was inserted.
         assert!(src.created().is_empty());
         assert_eq!(src.snapshot()[0].sessions.len(), 0);
+    }
+
+    #[test]
+    fn create_project_accepts_two_distinct_paths_with_same_basename() {
+        // Code Reviewer's blocker on PR #92: dedup must be by
+        // `root_path` only — never by basename — so a user with
+        // `/repo/app` can still register `/tmp/app`. The daemon's
+        // `projects` table itself only enforces uniqueness on
+        // `root_path` (la-storage migration 0001).
+        let mut src = MockSessionSource::new();
+        let first = src
+            .create_project("/repo/app")
+            .expect("first /repo/app succeeds");
+        let second = src
+            .create_project("/tmp/app")
+            .expect("same basename, different path also succeeds");
+        assert_ne!(first.as_str(), second.as_str(), "distinct project ids");
+        let snap = src.snapshot();
+        let roots: Vec<&str> = snap.iter().map(|g| g.root_path.as_str()).collect();
+        assert!(
+            roots.contains(&"/repo/app") && roots.contains(&"/tmp/app"),
+            "both projects must be present in the snapshot; got {roots:?}"
+        );
+        // ... but a literal repeat of the same path is still rejected.
+        let dup = src.create_project("/repo/app");
+        assert!(matches!(dup, Err(SourceError::Validation(_))));
+    }
+
+    #[test]
+    fn create_project_trailing_slash_normalizes_against_existing() {
+        // Trailing-slash variants are the only path normalization the
+        // dedup performs (matching the daemon's `ensure_project`, which
+        // compares literal strings). `/p/a/` and `/p/a` should collide
+        // so we don't accidentally seed two stubs for the same dir.
+        let mut src = MockSessionSource::new();
+        src.create_project("/p/a").expect("first succeeds");
+        let dup = src.create_project("/p/a/");
+        assert!(
+            matches!(dup, Err(SourceError::Validation(_))),
+            "trailing slash variant must dedupe, got {dup:?}"
+        );
     }
 }
