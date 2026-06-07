@@ -72,6 +72,34 @@ pub struct NewSessionRequest {
     pub worktree: bool,
 }
 
+/// Newly-registered project identifier returned by
+/// [`SessionSource::create_project`].
+///
+/// In M1 the daemon has no `projects.create` RPC — [`ensure_project`] on
+/// the daemon side lazily creates the SQLite row when the first
+/// `sessions.create` lands. The TUI therefore manages "the user
+/// announced this directory as a project" entirely in-process: the
+/// source registers it locally, the sidebar surfaces it as an empty
+/// group, and the daemon picks the same `root_path` up the moment the
+/// user spawns their first session inside it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProjectId(pub String);
+
+impl ProjectId {
+    pub fn into_string(self) -> String {
+        self.0
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Reason [`SessionSource::create_session`] refused.
 ///
 /// Split into two arms so the calling [`crate::app::App`] can decide
@@ -149,6 +177,34 @@ pub trait SessionSource {
     /// RPC + a follow-up `sessions.list` refresh.
     fn create_session(&mut self, req: NewSessionRequest) -> Result<SessionId, SourceError>;
 
+    /// Register an existing on-disk directory as a project.
+    ///
+    /// Returns the project id the sidebar should focus after the
+    /// refresh. M1's daemon has no `projects.create` RPC — the storage
+    /// row is created lazily on the first `sessions.create` against
+    /// this directory — so the source MUST keep a local record of the
+    /// directory so the sidebar can show the (empty) project group
+    /// immediately. The next `create_session` against the same path
+    /// will reuse the daemon's `ensure_project` path and the local
+    /// record naturally folds into the daemon-side snapshot.
+    ///
+    /// Implementations MUST:
+    /// - reject empty / non-absolute paths and paths that don't exist
+    ///   on disk with [`SourceError::Validation`] (the issue brief
+    ///   forbids creating directories from the modal),
+    /// - reject a path that's already registered with a Validation
+    ///   error so the App can surface a "project already exists" toast,
+    /// - mint a stable id so the App can pre-position the sidebar cursor
+    ///   onto the new group before the next snapshot lands.
+    ///
+    /// Default implementation refuses with a Backend error so future
+    /// sources don't silently no-op — every real source must opt in.
+    fn create_project(&mut self, _path: &str) -> Result<ProjectId, SourceError> {
+        Err(SourceError::Backend(
+            "this session source does not support creating projects".into(),
+        ))
+    }
+
     /// Monotonic counter the source bumps after every internal cache
     /// rebuild. The runner reads this once per frame and dispatches
     /// [`crate::app::AppMsg::RefreshSessions`] whenever the value
@@ -179,6 +235,10 @@ pub struct MockSessionSource {
     /// `mock-<n>` so tests can assert deterministic shapes without
     /// dragging in a uuid dependency on the mock.
     next_create_id: u64,
+    /// Monotonic id source for `create_project` — mints `mock-proj-<n>`
+    /// so the App's "register a new project" path stays testable
+    /// without a uuid dep on the mock.
+    next_project_id: u64,
     /// Tape of every `create_session` call, captured for unit tests
     /// that pin the UI ↔ trait wire-up.
     created: Vec<NewSessionRequest>,
@@ -196,6 +256,7 @@ impl MockSessionSource {
             rows: BTreeMap::new(),
             projects: Vec::new(),
             next_create_id: 0,
+            next_project_id: 0,
             created: Vec::new(),
         }
     }
@@ -396,6 +457,45 @@ impl SessionSource for MockSessionSource {
         if let Some(row) = self.rows.get_mut(session_id) {
             row.discovered = false;
         }
+    }
+
+    fn create_project(&mut self, path: &str) -> Result<ProjectId, SourceError> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(SourceError::Validation("path is required".into()));
+        }
+        // The Mock does NOT touch the real filesystem (tests run in
+        // tmpfs-less environments / CI sandboxes) — checking existence
+        // here would make every test that drives the modal pay a tmp
+        // dir + mkdir. Existence enforcement lives on the modal side
+        // for the live source; the mock's job is to exercise the
+        // dedup + select-after-create paths.
+        if self
+            .projects
+            .iter()
+            .any(|p| p.root_path == trimmed || p.display_name == trimmed)
+        {
+            return Err(SourceError::Validation(format!(
+                "project already exists for {trimmed}"
+            )));
+        }
+        let display = std::path::Path::new(trimmed)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| trimmed.to_string());
+        // Synthesise a stable id so the App can pre-position the
+        // sidebar cursor immediately. `mock-proj-N` keeps the shape
+        // distinct from session ids (`mock-N`) so test assertions can
+        // tell which call minted which id at a glance.
+        self.next_project_id += 1;
+        let id = format!("mock-proj-{}", self.next_project_id);
+        self.projects.push(ProjectMeta {
+            project_id: id.clone(),
+            display_name: display,
+            root_path: trimmed.to_string(),
+        });
+        Ok(ProjectId(id))
     }
 
     fn create_session(&mut self, req: NewSessionRequest) -> Result<SessionId, SourceError> {

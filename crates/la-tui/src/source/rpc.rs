@@ -43,7 +43,7 @@ use la_proto::methods::{
 use tokio::sync::mpsc;
 
 use crate::model::{ProjectGroup, SessionRow};
-use crate::source::{NewSessionRequest, SessionId, SessionSource, SourceError};
+use crate::source::{NewSessionRequest, ProjectId, SessionId, SessionSource, SourceError};
 
 /// Background-loop tick. A1 contract: polling. A5 (WEK-95) replaces
 /// this with `sessions.changed` push notifications.
@@ -69,6 +69,16 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 /// thread has completed its initial `sessions.list` round-trip.
 pub struct RpcSessionSource {
     cache: Arc<Mutex<Vec<ProjectGroup>>>,
+    /// Locally-registered projects that the daemon's `sessions.list`
+    /// snapshot has not yet surfaced (because the user has not spawned
+    /// a session under them yet — M1's daemon only inserts a `projects`
+    /// row lazily on the first `sessions.create`). Merged into the
+    /// snapshot returned by [`SessionSource::snapshot`] so the sidebar
+    /// shows the empty group immediately after a `create_project`
+    /// call. Each entry is `(synthetic_id, root_path, display_name)`.
+    /// Indexed by `root_path` so we can drop the local entry once the
+    /// daemon-side row for the same path lands.
+    pending_projects: Arc<Mutex<Vec<PendingProject>>>,
     /// Monotonic counter bumped by [`refresh_cache`] after every
     /// successful `sessions.list` round-trip. The runner snapshots this
     /// once per frame and dispatches [`crate::app::AppMsg::RefreshSessions`]
@@ -89,6 +99,17 @@ pub struct RpcSessionSource {
     /// exercised in < 1 s; production uses [`CREATE_TIMEOUT`].
     create_timeout: Duration,
     _thread: ThreadGuard,
+}
+
+/// Locally-pinned project that the daemon hasn't returned in
+/// `sessions.list` yet (no sessions under it). Merged into snapshots so
+/// the sidebar shows the empty group immediately after the user
+/// registers the directory via [`SessionSource::create_project`].
+#[derive(Debug, Clone)]
+struct PendingProject {
+    id: String,
+    root_path: String,
+    display_name: String,
 }
 
 /// Bg-thread command channel payload.
@@ -135,6 +156,7 @@ impl RpcSessionSource {
     pub fn connect(socket: &Path) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
         let cache = Arc::new(Mutex::new(Vec::<ProjectGroup>::new()));
+        let pending_projects = Arc::new(Mutex::new(Vec::<PendingProject>::new()));
         let refresh_gen = Arc::new(AtomicU64::new(0));
         let socket = socket.to_path_buf();
         let cache_bg = cache.clone();
@@ -162,6 +184,7 @@ impl RpcSessionSource {
 
         Self {
             cache,
+            pending_projects,
             refresh_gen,
             cmd_tx,
             create_timeout: CREATE_TIMEOUT,
@@ -212,7 +235,34 @@ impl RpcSessionSource {
 
 impl SessionSource for RpcSessionSource {
     fn snapshot(&self) -> Vec<ProjectGroup> {
-        self.cache.lock().map(|c| c.clone()).unwrap_or_default()
+        let mut groups = self.cache.lock().map(|c| c.clone()).unwrap_or_default();
+        // Merge locally-registered "pending" projects (created via
+        // `create_project` but not yet surfaced by the daemon's
+        // `sessions.list` — the daemon only inserts a `projects` row on
+        // first `sessions.create`). Drop pending entries whose
+        // `root_path` (or display_name, which equals the basename used
+        // by the daemon's `ensure_project`) now matches a daemon-side
+        // group; that means the next session under the same path
+        // promoted the local stub into a real row.
+        if let Ok(mut pending) = self.pending_projects.lock() {
+            pending.retain(|p| {
+                !groups
+                    .iter()
+                    .any(|g| g.root_path == p.root_path || g.display_name == p.display_name)
+            });
+            for p in pending.iter() {
+                // Insert before the synthetic Discovered / Archived
+                // buckets so the regular project ordering is preserved.
+                let insert_at = groups
+                    .iter()
+                    .position(|g| g.is_archived || g.is_discovered())
+                    .unwrap_or(groups.len());
+                let mut g = ProjectGroup::new(p.id.clone(), p.display_name.clone());
+                g.root_path = p.root_path.clone();
+                groups.insert(insert_at, g);
+            }
+        }
+        groups
     }
 
     fn refresh_generation(&self) -> u64 {
@@ -289,6 +339,80 @@ impl SessionSource for RpcSessionSource {
                 "rpc session source bg thread dropped the create reply".into(),
             )),
         }
+    }
+
+    fn create_project(&mut self, path: &str) -> Result<ProjectId, SourceError> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(SourceError::Validation("path is required".into()));
+        }
+        let path_buf = std::path::Path::new(trimmed);
+        if !path_buf.is_absolute() {
+            return Err(SourceError::Validation(format!(
+                "path must be absolute (was {trimmed:?})"
+            )));
+        }
+        if !path_buf.is_dir() {
+            return Err(SourceError::Validation(format!(
+                "{trimmed} does not exist or is not a directory"
+            )));
+        }
+        let display = path_buf
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| trimmed.to_string());
+        // Duplicate guard: a path already in the live cache OR in the
+        // pending list means the project is "already known" and we
+        // refuse with a precise Validation error instead of stacking a
+        // second stub. Matching on either `root_path` or `display_name`
+        // mirrors the merge rule in `snapshot` — once the daemon adopts
+        // this path it'll surface under the same display name (the
+        // basename), and a stale stub would otherwise live forever
+        // alongside the real entry.
+        let live_has = self
+            .cache
+            .lock()
+            .map(|c| {
+                c.iter()
+                    .any(|g| g.root_path == trimmed || g.display_name == display)
+            })
+            .unwrap_or(false);
+        if live_has {
+            return Err(SourceError::Validation(format!(
+                "project already exists for {trimmed}"
+            )));
+        }
+        let id = {
+            let mut pending = self
+                .pending_projects
+                .lock()
+                .map_err(|_| SourceError::Backend("pending_projects lock poisoned".into()))?;
+            if pending
+                .iter()
+                .any(|p| p.root_path == trimmed || p.display_name == display)
+            {
+                return Err(SourceError::Validation(format!(
+                    "project already exists for {trimmed}"
+                )));
+            }
+            // Synthesise a UUID-looking id prefixed so it's distinguishable
+            // from daemon-assigned ones in logs but interoperates with
+            // the sidebar's plain-string id matching.
+            let id = format!("pending-{}", pending.len() + 1);
+            pending.push(PendingProject {
+                id: id.clone(),
+                root_path: trimmed.to_string(),
+                display_name: display,
+            });
+            id
+        };
+        // Bump refresh_gen so the runner's per-frame
+        // `refresh_generation()` check dispatches a RefreshSessions on
+        // the very next loop, pulling the new stub into the sidebar
+        // without waiting for the user to press a key.
+        self.refresh_gen.fetch_add(1, Ordering::Relaxed);
+        Ok(ProjectId(id))
     }
 }
 

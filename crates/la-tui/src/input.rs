@@ -101,6 +101,12 @@ fn translate_key(
         KeyCode::Enter => AppMsg::Enter,
         KeyCode::Char('d') => AppMsg::Delete,
         KeyCode::Char('a') => AppMsg::ArchiveOrRestore,
+        // WEK-101: uppercase `N` (Shift+N) opens the New-project
+        // modal. Lowercase `n` MUST stay bound to NewSession — the
+        // issue brief is explicit: 触发键为大写 `N`,小写 `n` 不应触发.
+        // crossterm reports Shift+N as `Char('N')`; some terminals
+        // also include the SHIFT modifier, so accept either form.
+        KeyCode::Char('N') => AppMsg::NewProject,
         KeyCode::Char('n') => AppMsg::NewSession,
         KeyCode::Char('i') => AppMsg::ImportDiscovered,
         KeyCode::Char('f') => AppMsg::OpenErrors,
@@ -238,6 +244,12 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
     if let Modal::NewSession(draft) = modal {
         return translate_new_session_key(code, mods, draft);
     }
+    // WEK-101: NewProject is a free-typing modal too — paths can
+    // legitimately contain digits, dashes, dots, and slashes that
+    // would otherwise hit the "quit / tab / cancel" matrix.
+    if let Modal::NewProject(_) = modal {
+        return translate_new_project_key(code, mods);
+    }
     Some(match modal {
         Modal::ConfirmDelete { .. } => match code {
             KeyCode::Char('y') | KeyCode::Enter => AppMsg::Confirm,
@@ -250,6 +262,7 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
             _ => return None,
         },
         Modal::NewSession(_) => unreachable!("handled above"),
+        Modal::NewProject(_) => unreachable!("handled above"),
         Modal::ConfirmEnableCron { .. } | Modal::ConfirmDeleteCron { .. } => match code {
             KeyCode::Char('y') | KeyCode::Enter => AppMsg::Confirm,
             KeyCode::Char('n') | KeyCode::Esc => AppMsg::Cancel,
@@ -321,6 +334,50 @@ fn translate_new_session_key(
                 return None;
             }
             Some(AppMsg::NewSessionPromptChar(c))
+        }
+        _ => None,
+    }
+}
+
+/// Modal-key translator for [`Modal::NewProject`] (WEK-101).
+///
+/// The buffer is a free-typing path field, so we must NOT route plain
+/// `q` / `?` / digits / letters back through the normal "quit / help"
+/// matrix — they're literal path characters. Only structural keys
+/// (Enter / Esc / Tab / Up / Down / Backspace) carry control semantics.
+///
+/// Key map (hint == real binding — pinned by the modal hint test in
+/// `crate::key_hints::tests`):
+///   * Enter — Confirm. The App's Confirm arm "applies-then-confirms"
+///     when a candidate is highlighted, so Enter on a fresh dropdown
+///     selection descends one level first.
+///   * Esc — Cancel (close modal).
+///   * Tab / ↓ — cycle to the next candidate.
+///   * Shift-Tab / ↑ — cycle to the previous candidate.
+///   * → — apply highlighted candidate (descend without confirming).
+///   * Backspace — pop last char from buffer.
+///   * Ctrl+C — Quit (already intercepted at the top of
+///     `translate_modal_key`; no special handling here).
+///   * Any printable char — append to buffer (including digits and
+///     letters that would otherwise be globals).
+fn translate_new_project_key(code: KeyCode, mods: KeyModifiers) -> Option<AppMsg> {
+    match code {
+        KeyCode::Enter => Some(AppMsg::Confirm),
+        KeyCode::Esc => Some(AppMsg::Cancel),
+        KeyCode::Tab => Some(AppMsg::NewProjectCandidateNext),
+        KeyCode::BackTab => Some(AppMsg::NewProjectCandidatePrev),
+        KeyCode::Down => Some(AppMsg::NewProjectCandidateNext),
+        KeyCode::Up => Some(AppMsg::NewProjectCandidatePrev),
+        KeyCode::Right => Some(AppMsg::NewProjectApplyCandidate),
+        KeyCode::Backspace => Some(AppMsg::NewProjectPathBackspace),
+        KeyCode::Char(c) => {
+            // Control-modified chords (Ctrl+S, Ctrl+R, …) MUST NOT
+            // leak into the path buffer — they're terminal chrome.
+            // Ctrl+C is already intercepted above by translate_modal_key.
+            if mods.contains(KeyModifiers::CONTROL) {
+                return None;
+            }
+            Some(AppMsg::NewProjectPathChar(c))
         }
         _ => None,
     }
@@ -497,5 +554,99 @@ mod tests {
         let mut k = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         k.kind = KeyEventKind::Release;
         assert_eq!(translate(Event::Key(k), None, &hit()), None);
+    }
+
+    // ---- WEK-101: Shift+N opens NewProject, lowercase n stays NewSession ----
+
+    #[test]
+    fn lowercase_n_still_creates_session_not_project() {
+        // Issue brief: 触发键为大写 `N`,小写 `n` 不应触发.
+        // Pin both halves so a future remap can't silently regress.
+        let msg = translate(key(KeyCode::Char('n')), None, &hit());
+        assert_eq!(msg, Some(AppMsg::NewSession));
+    }
+
+    #[test]
+    fn uppercase_n_opens_new_project_modal() {
+        // crossterm reports Shift+N as `Char('N')` even when the SHIFT
+        // modifier is also set — accept either form so the binding is
+        // robust across terminals.
+        let plain_n = translate(key(KeyCode::Char('N')), None, &hit());
+        assert_eq!(plain_n, Some(AppMsg::NewProject));
+        let with_shift = translate(
+            Event::Key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            None,
+            &hit(),
+        );
+        assert_eq!(with_shift, Some(AppMsg::NewProject));
+    }
+
+    #[test]
+    fn new_project_modal_routes_printable_chars_into_buffer_not_quit() {
+        // The path buffer must accept `q`, `?`, digits, `n` literally —
+        // they would otherwise fire global Quit / Help / NewSession.
+        let modal = Modal::NewProject(crate::app::NewProjectDraft::new());
+        assert_eq!(
+            translate(key(KeyCode::Char('q')), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectPathChar('q'))
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('?')), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectPathChar('?'))
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('5')), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectPathChar('5'))
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('n')), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectPathChar('n'))
+        );
+    }
+
+    #[test]
+    fn new_project_modal_structural_keys() {
+        let modal = Modal::NewProject(crate::app::NewProjectDraft::new());
+        assert_eq!(
+            translate(key(KeyCode::Tab), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectCandidateNext)
+        );
+        assert_eq!(
+            translate(key(KeyCode::BackTab), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectCandidatePrev)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Down), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectCandidateNext)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Up), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectCandidatePrev)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Right), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectApplyCandidate)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Enter), Some(&modal), &hit()),
+            Some(AppMsg::Confirm)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Esc), Some(&modal), &hit()),
+            Some(AppMsg::Cancel)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Backspace), Some(&modal), &hit()),
+            Some(AppMsg::NewProjectPathBackspace)
+        );
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_inside_new_project_modal() {
+        // Modal-level safety: Ctrl+C must always escape, even when every
+        // printable char goes into the path buffer.
+        let modal = Modal::NewProject(crate::app::NewProjectDraft::new());
+        let ev = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(translate(ev, Some(&modal), &hit()), Some(AppMsg::Quit));
     }
 }

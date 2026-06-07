@@ -1165,6 +1165,9 @@ fn render_modal(
         Modal::NewSession(draft) => {
             render_new_session_modal(frame, full, draft, body, muted, primary, warn, err);
         }
+        Modal::NewProject(draft) => {
+            render_new_project_modal(frame, full, draft, body, muted, primary, warn, err);
+        }
         Modal::ConfirmEnableCron {
             cron_name,
             budget_label,
@@ -1434,6 +1437,155 @@ fn render_new_session_modal(
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         "[Tab] next field  [⇧Tab] prev  [Ctrl+⏎] create  [Esc] cancel",
+        Style::default().fg(warn).add_modifier(Modifier::DIM),
+    )]));
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// Render the WEK-101 New-project modal: single path field on top, a
+/// scrollable directory dropdown below, sticky error and hint footer.
+#[allow(clippy::too_many_arguments)]
+fn render_new_project_modal(
+    frame: &mut Frame,
+    full: Rect,
+    draft: &crate::app::NewProjectDraft,
+    body: ratatui::style::Color,
+    muted: ratatui::style::Color,
+    primary: ratatui::style::Color,
+    warn: ratatui::style::Color,
+    err: ratatui::style::Color,
+) {
+    // Bigger than NewSession because the dropdown wants vertical room.
+    let area = centered(full, 80, 22);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("New project — path")
+        .border_style(Style::default().fg(primary));
+    frame.render_widget(block, area);
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // --- Path row -------------------------------------------------------
+    lines.push(Line::from(vec![Span::styled(
+        "Path  ",
+        Style::default().fg(primary).add_modifier(Modifier::BOLD),
+    )]));
+    let path_display = if draft.path.is_empty() {
+        "(type a directory path — supports ~, Tab/↓ to complete)".to_string()
+    } else {
+        draft.path.clone()
+    };
+    let path_style = if draft.path.is_empty() {
+        Style::default().fg(muted).add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(body)
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(path_display, path_style),
+        Span::styled(
+            "▌",
+            Style::default().fg(primary).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // --- Resolved hint --------------------------------------------------
+    if !draft.path.is_empty() {
+        let resolved = draft.completion.resolved.display().to_string();
+        if resolved != draft.path {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("→ {resolved}"),
+                    Style::default().fg(muted).add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+    if !draft.path.is_empty() {
+        let status = if draft.completion.resolved_exists_as_dir {
+            ("✓ existing directory", Style::default().fg(primary))
+        } else if draft.completion.resolved.as_os_str().is_empty() {
+            ("", Style::default().fg(muted))
+        } else {
+            (
+                "✗ no such directory (Enter requires an existing dir)",
+                Style::default().fg(warn),
+            )
+        };
+        if !status.0.is_empty() {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(status.0, status.1),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // --- Candidates dropdown -------------------------------------------
+    lines.push(Line::from(vec![Span::styled(
+        "Matches",
+        Style::default().fg(primary).add_modifier(Modifier::BOLD),
+    )]));
+    if draft.completion.candidates.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "(no matching subdirectories)",
+                Style::default().fg(muted).add_modifier(Modifier::DIM),
+            ),
+        ]));
+    } else {
+        // Show up to ~10 rows; if more, indicate truncation.
+        let visible: usize = 10;
+        let total = draft.completion.candidates.len();
+        // Center the highlighted row in the visible window so a long
+        // candidate list stays explorable.
+        let cursor = draft.selected.unwrap_or(0);
+        let start = cursor.saturating_sub(visible.saturating_sub(1));
+        let end = (start + visible).min(total);
+        for i in start..end {
+            let name = &draft.completion.candidates[i];
+            let style = if Some(i) == draft.selected {
+                Style::default().fg(body).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(body)
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{name}/"), style),
+            ]));
+        }
+        if end < total {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("… {} more", total - end),
+                    Style::default().fg(muted).add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+
+    // --- Error row (sticky) --------------------------------------------
+    if let Some(e) = draft.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("⚠ {e}"),
+            Style::default().fg(err).add_modifier(Modifier::BOLD),
+        )]));
+    }
+
+    // --- Hint row -------------------------------------------------------
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "[Tab/↓] next match  [⇧Tab/↑] prev  [→] descend  [⏎] create  [Esc] cancel",
         Style::default().fg(warn).add_modifier(Modifier::DIM),
     )]));
 
