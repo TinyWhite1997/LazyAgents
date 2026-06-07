@@ -48,7 +48,7 @@ Key map inside the modal:
 | `Enter` | Two-stage: when a candidate is highlighted, descend into it; otherwise create the project. |
 | `Esc` | Cancel — no project is created. |
 
-On success the new (empty) project group lands at the top of the sidebar, the cursor is pre-positioned on its header, and the toast shows `project added: <path>`. The daemon's `projects` row is created lazily on your very first `sessions.create` against the same directory — the TUI keeps a local stub in the meantime so the sidebar reflects the new project immediately.
+On success the new (empty) project group lands at the top of the sidebar, the cursor is pre-positioned on its header, and the toast shows `project added: <path>`. The project is persisted immediately: the TUI calls the daemon's `projects.create` RPC, which inserts the `projects` row up front, so the empty project survives a daemon or `la` restart even before you spawn a session under it.
 
 ### From the TUI (v1 status)
 
@@ -206,6 +206,7 @@ For tools and scripts, the daemon speaks JSON-RPC 2.0 over a length-prefixed UDS
 - `sessions.write`, `sessions.resize`, `sessions.signal`
 - `sessions.archive`, `sessions.delete`
 - `sessions.import`, `sessions.replay`
+- `projects.list`, `projects.create` — enumerate projects (including empty ones) and register a directory as a project without spawning a session
 - `adapters.discover`
 - `events.subscribe` with topics: `session.output`, `session.state`, `session.gap`
 

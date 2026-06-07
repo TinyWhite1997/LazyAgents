@@ -23,14 +23,15 @@ use la_proto::methods::{
     AdaptersDiscover, AdaptersDiscoverParams, AdaptersDiscoverResult, DiscoveredSession,
     EventTopic, EventsSubscribe, EventsSubscribeParams, EventsSubscribeResult, ImportedSession,
     Initialize, InitializeParams, InitializeResult, Method, MetricsScrape, MetricsScrapeParams,
-    MetricsScrapeResult, PtySize, ServerCapabilities, SessionSignal, SessionState, SessionSummary,
-    SessionsArchive, SessionsArchiveParams, SessionsAttach, SessionsAttachParams,
-    SessionsAttachResult, SessionsCreate, SessionsCreateParams, SessionsCreateResult,
-    SessionsDelete, SessionsDeleteParams, SessionsDetach, SessionsDetachParams, SessionsImport,
-    SessionsImportParams, SessionsImportResult, SessionsList, SessionsListParams,
-    SessionsListResult, SessionsReplay, SessionsReplayParams, SessionsReplayResult, SessionsResize,
-    SessionsResizeParams, SessionsSignal, SessionsSignalParams, SessionsWrite, SessionsWriteParams,
-    SessionsWriteResult, Shutdown, ShutdownParams, ShutdownResult,
+    MetricsScrapeResult, ProjectsCreate, ProjectsList, PtySize, ServerCapabilities, SessionSignal,
+    SessionState, SessionSummary, SessionsArchive, SessionsArchiveParams, SessionsAttach,
+    SessionsAttachParams, SessionsAttachResult, SessionsCreate, SessionsCreateParams,
+    SessionsCreateResult, SessionsDelete, SessionsDeleteParams, SessionsDetach,
+    SessionsDetachParams, SessionsImport, SessionsImportParams, SessionsImportResult, SessionsList,
+    SessionsListParams, SessionsListResult, SessionsReplay, SessionsReplayParams,
+    SessionsReplayResult, SessionsResize, SessionsResizeParams, SessionsSignal,
+    SessionsSignalParams, SessionsWrite, SessionsWriteParams, SessionsWriteResult, Shutdown,
+    ShutdownParams, ShutdownResult,
 };
 use la_proto::notifications::{
     CronFired, CronFiredParams, DaemonHealth, DaemonHealthParams, NotificationMethod,
@@ -1203,6 +1204,8 @@ fn schema_files_match_generated_output() {
     add_method!(SessionsSignal);
     add_method!(SessionsArchive);
     add_method!(SessionsDelete);
+    add_method!(ProjectsList);
+    add_method!(ProjectsCreate);
     add_method!(AdaptersDiscover);
     add_method!(SessionsImport);
     add_method!(SessionsReplay);

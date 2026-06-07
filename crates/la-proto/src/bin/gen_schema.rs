@@ -16,11 +16,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use la_proto::methods::{
-    AdaptersDiscover, EventsSubscribe, Initialize, Method, MetricsScrape, SessionsArchive,
-    SessionsAttach, SessionsCreate, SessionsDelete, SessionsDetach, SessionsImport, SessionsList,
-    SessionsReplay, SessionsResize, SessionsSignal, SessionsWrite, Shutdown, WorktreeCommit,
-    WorktreeDiff, WorktreeDiscard, WorktreeOpenInEditor, WorktreeStage, WorktreeStatus,
-    WorktreeUnstage,
+    AdaptersDiscover, EventsSubscribe, Initialize, Method, MetricsScrape, ProjectsCreate,
+    ProjectsList, SessionsArchive, SessionsAttach, SessionsCreate, SessionsDelete, SessionsDetach,
+    SessionsImport, SessionsList, SessionsReplay, SessionsResize, SessionsSignal, SessionsWrite,
+    Shutdown, WorktreeCommit, WorktreeDiff, WorktreeDiscard, WorktreeOpenInEditor, WorktreeStage,
+    WorktreeStatus, WorktreeUnstage,
 };
 use la_proto::notifications::{
     CronFired, DaemonHealth, NotificationMethod, SchedulerHealth, SessionGap, SessionOutput,
@@ -48,6 +48,8 @@ fn main() {
     write_method::<SessionsSignal>(&out_dir);
     write_method::<SessionsArchive>(&out_dir);
     write_method::<SessionsDelete>(&out_dir);
+    write_method::<ProjectsList>(&out_dir);
+    write_method::<ProjectsCreate>(&out_dir);
     write_method::<AdaptersDiscover>(&out_dir);
     write_method::<SessionsImport>(&out_dir);
     write_method::<SessionsReplay>(&out_dir);

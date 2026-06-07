@@ -180,22 +180,21 @@ pub trait SessionSource {
     /// Register an existing on-disk directory as a project.
     ///
     /// Returns the project id the sidebar should focus after the
-    /// refresh. M1's daemon has no `projects.create` RPC — the storage
-    /// row is created lazily on the first `sessions.create` against
-    /// this directory — so the source MUST keep a local record of the
-    /// directory so the sidebar can show the (empty) project group
-    /// immediately. The next `create_session` against the same path
-    /// will reuse the daemon's `ensure_project` path and the local
-    /// record naturally folds into the daemon-side snapshot.
+    /// refresh. The daemon-backed source issues a `projects.create`
+    /// RPC, so the project is persisted immediately (it survives a
+    /// daemon restart even with no sessions under it) and the next
+    /// snapshot surfaces the empty group via `projects.list`.
     ///
     /// Implementations MUST:
     /// - reject empty / non-absolute paths and paths that don't exist
     ///   on disk with [`SourceError::Validation`] (the issue brief
     ///   forbids creating directories from the modal),
-    /// - reject a path that's already registered with a Validation
-    ///   error so the App can surface a "project already exists" toast,
     /// - mint a stable id so the App can pre-position the sidebar cursor
     ///   onto the new group before the next snapshot lands.
+    ///
+    /// Duplicate paths are the daemon's call — `projects.create` is
+    /// get-or-create by root path, so re-registering an existing
+    /// directory returns the same project rather than erroring.
     ///
     /// Default implementation refuses with a Backend error so future
     /// sources don't silently no-op — every real source must opt in.

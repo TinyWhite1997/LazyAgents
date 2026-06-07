@@ -8,18 +8,22 @@
 //!
 //! 1. Open one [`la_ipc::Connection`] to the daemon socket and run the
 //!    standard [`la_ipc::client_handshake`].
-//! 2. Issue `sessions.list` (with `include_archived = true` so the
-//!    archived bucket is populated) on startup and then every
-//!    [`POLL_INTERVAL`] (~2 s — A1's interim contract; A5 (WEK-95)
-//!    will replace this with `sessions.changed` push notifications).
+//! 2. Issue `projects.list` + `sessions.list` (the latter with
+//!    `include_archived = true` so the archived bucket is populated) on
+//!    startup and then every [`POLL_INTERVAL`] (~2 s — A1's interim
+//!    contract; A5 (WEK-95) will replace this with `sessions.changed`
+//!    push notifications).
 //! 3. Translate each [`SessionSummary`] into a [`SessionRow`] via
 //!    [`SessionRow::from_summary`] and group them by `project_id` into
-//!    [`ProjectGroup`]s. Project display metadata is derived from the
-//!    session's `worktree_path` (basename + parent) because the daemon
-//!    does not yet expose a `projects.list` RPC.
+//!    [`ProjectGroup`]s. Project display metadata (name + root path)
+//!    comes from the daemon's `projects.list` RPC — the authoritative
+//!    source of project identity — so a project with no sessions still
+//!    renders, and a session's group always shows the real folder name
+//!    instead of a UUID prefix.
 //! 4. Apply mutations posted from the main thread (`archive`, `delete`,
-//!    `import_discovered`) by sending the matching RPC and then doing a
-//!    fast re-poll so the next `snapshot()` reflects the change.
+//!    `import_discovered`, `create_project`) by sending the matching RPC
+//!    and then doing a fast re-poll so the next `snapshot()` reflects the
+//!    change.
 //!
 //! A disconnected daemon never panics — `snapshot()` simply returns the
 //! last good cache (possibly empty), and the bg loop reconnects with
@@ -35,10 +39,11 @@ use la_ipc::transport::{connect, endpoint_for};
 use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, ResponseOutcome};
 use la_proto::methods::{
-    AdaptersDiscover, AdaptersDiscoverParams, Method, SessionSummary, SessionsArchive,
-    SessionsArchiveParams, SessionsCreate, SessionsCreateParams, SessionsCreateResult,
-    SessionsDelete, SessionsDeleteParams, SessionsImport, SessionsImportParams, SessionsList,
-    SessionsListParams,
+    AdaptersDiscover, AdaptersDiscoverParams, Method, ProjectSummary, ProjectsCreate,
+    ProjectsCreateParams, ProjectsCreateResult, ProjectsList, ProjectsListParams, SessionSummary,
+    SessionsArchive, SessionsArchiveParams, SessionsCreate, SessionsCreateParams,
+    SessionsCreateResult, SessionsDelete, SessionsDeleteParams, SessionsImport,
+    SessionsImportParams, SessionsList, SessionsListParams,
 };
 use tokio::sync::mpsc;
 
@@ -69,16 +74,6 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 /// thread has completed its initial `sessions.list` round-trip.
 pub struct RpcSessionSource {
     cache: Arc<Mutex<Vec<ProjectGroup>>>,
-    /// Locally-registered projects that the daemon's `sessions.list`
-    /// snapshot has not yet surfaced (because the user has not spawned
-    /// a session under them yet — M1's daemon only inserts a `projects`
-    /// row lazily on the first `sessions.create`). Merged into the
-    /// snapshot returned by [`SessionSource::snapshot`] so the sidebar
-    /// shows the empty group immediately after a `create_project`
-    /// call. Each entry is `(synthetic_id, root_path, display_name)`.
-    /// Indexed by `root_path` so we can drop the local entry once the
-    /// daemon-side row for the same path lands.
-    pending_projects: Arc<Mutex<Vec<PendingProject>>>,
     /// Monotonic counter bumped by [`refresh_cache`] after every
     /// successful `sessions.list` round-trip. The runner snapshots this
     /// once per frame and dispatches [`crate::app::AppMsg::RefreshSessions`]
@@ -101,44 +96,19 @@ pub struct RpcSessionSource {
     _thread: ThreadGuard,
 }
 
-/// Locally-pinned project that the daemon hasn't returned in
-/// `sessions.list` yet (no sessions under it). Merged into snapshots so
-/// the sidebar shows the empty group immediately after the user
-/// registers the directory via [`SessionSource::create_project`].
-///
-/// Two eviction keys, applied in [`SessionSource::snapshot`] (both must
-/// match the same daemon group to drop the stub):
-///
-/// - `root_path` — works when the daemon-side group carries a non-empty
-///   `root_path` (i.e. the project's first session was a worktree
-///   session and `SessionSummary.worktree_path` was populated).
-/// - `daemon_project_id` — populated after the bg loop sees a
-///   `sessions.create` reply for this stub's directory and looks up the
-///   newly-spawned session's `project_id` in the refreshed cache. This
-///   is what evicts the stub for the **non-worktree** first-session
-///   case, where `sessions.list` returns `worktree_path: None` and
-///   `build_groups` derives `root_path = ""` (Code Reviewer's blocker
-///   on PR #92 round 2: only root_path checking left the stub stranded
-///   beside the real daemon group, and the empty root then broke the
-///   next `n` keystroke against the real group).
-#[derive(Debug, Clone)]
-struct PendingProject {
-    id: String,
-    root_path: String,
-    display_name: String,
-    /// Daemon-assigned `projects.id` we observed for this `root_path`
-    /// (set lazily after the first `sessions.create` succeeds). Used
-    /// as a fallback eviction key when the daemon-side group's
-    /// `root_path` is empty.
-    daemon_project_id: Option<String>,
-}
-
 /// Bg-thread command channel payload.
 #[derive(Debug)]
 enum Command {
     Archive(String),
     Delete(String),
     ImportDiscovered(String),
+    /// Register an existing directory as a project via `projects.create`.
+    /// The reply carries the daemon-assigned [`ProjectId`] (success) or
+    /// the wire-level failure so the synchronous trait method can block.
+    CreateProject {
+        path: String,
+        reply: std::sync::mpsc::SyncSender<Result<ProjectId, SourceError>>,
+    },
     /// Spawn a new session via `sessions.create`. The reply channel
     /// carries the daemon-assigned id (success) or the wire-level
     /// failure (mapped to [`SourceError::Backend`]) so the calling
@@ -177,11 +147,9 @@ impl RpcSessionSource {
     pub fn connect(socket: &Path) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
         let cache = Arc::new(Mutex::new(Vec::<ProjectGroup>::new()));
-        let pending_projects = Arc::new(Mutex::new(Vec::<PendingProject>::new()));
         let refresh_gen = Arc::new(AtomicU64::new(0));
         let socket = socket.to_path_buf();
         let cache_bg = cache.clone();
-        let pending_bg = pending_projects.clone();
         let refresh_gen_bg = refresh_gen.clone();
 
         let handle = std::thread::Builder::new()
@@ -199,14 +167,13 @@ impl RpcSessionSource {
                     }
                 };
                 rt.block_on(async move {
-                    reconnect_loop(socket, cache_bg, pending_bg, refresh_gen_bg, cmd_rx).await;
+                    reconnect_loop(socket, cache_bg, refresh_gen_bg, cmd_rx).await;
                 });
             })
             .expect("spawn la-rpc-session-source thread");
 
         Self {
             cache,
-            pending_projects,
             refresh_gen,
             cmd_tx,
             create_timeout: CREATE_TIMEOUT,
@@ -265,99 +232,15 @@ impl RpcSessionSource {
             *c = groups;
         }
     }
-
-    /// Test-only: stamp a daemon-assigned project id onto the pending
-    /// stub whose `root_path` matches `project_dir`. Mirrors what the
-    /// bg loop does after a successful `sessions.create`; unit tests
-    /// drive it directly because we don't spin a real daemon.
-    #[doc(hidden)]
-    pub fn __test_stamp_daemon_project_id(&self, project_dir: &str, daemon_project_id: &str) {
-        if let Ok(mut pending) = self.pending_projects.lock() {
-            let norm = normalize_root(project_dir);
-            if let Some(stub) = pending
-                .iter_mut()
-                .find(|p| normalize_root(&p.root_path) == norm)
-            {
-                stub.daemon_project_id = Some(daemon_project_id.to_string());
-            }
-        }
-    }
 }
 
 impl SessionSource for RpcSessionSource {
     fn snapshot(&self) -> Vec<ProjectGroup> {
-        let mut groups = self.cache.lock().map(|c| c.clone()).unwrap_or_default();
-        // Merge locally-registered "pending" projects (created via
-        // `create_project` but not yet surfaced by the daemon's
-        // `sessions.list`). Two evictions cooperate so the stub disappears
-        // the moment the daemon-side group lands, even when the daemon
-        // group's `root_path` is empty:
-        //
-        // 1. `root_path` match — works for worktree-first sessions, where
-        //    `SessionSummary.worktree_path` populated the cache's
-        //    `root_path`.
-        // 2. `daemon_project_id` match — populated by the bg loop's
-        //    create-handler when the freshly-spawned session's
-        //    `project_id` surfaces in the refreshed cache. This covers
-        //    the non-worktree-first case where `sessions.list` returns
-        //    `worktree_path: None` and `build_groups` derives an empty
-        //    `root_path` — the Code Reviewer's blocker on PR #92 round 2.
-        //
-        // We also OVERLAY the stub's `root_path` / `display_name` onto
-        // the daemon group when the daemon side has an empty root. That
-        // way the next `n` keystroke against the real group (whose
-        // `project_id` is the daemon id, not the stub's id) still hits
-        // a populated `root_path` and Confirm doesn't fall through to
-        // the "project directory is missing" Validation arm.
-        if let Ok(mut pending) = self.pending_projects.lock() {
-            let mut overlays: Vec<(String, String, String)> = Vec::new();
-            pending.retain(|p| {
-                let matched = groups.iter().find(|g| {
-                    let by_root = normalize_root(&g.root_path) == normalize_root(&p.root_path)
-                        && !p.root_path.is_empty();
-                    let by_pid = p
-                        .daemon_project_id
-                        .as_deref()
-                        .map(|pid| g.project_id == pid)
-                        .unwrap_or(false);
-                    by_root || by_pid
-                });
-                if let Some(g) = matched {
-                    if g.root_path.is_empty() && !p.root_path.is_empty() {
-                        overlays.push((
-                            g.project_id.clone(),
-                            p.root_path.clone(),
-                            p.display_name.clone(),
-                        ));
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            for (pid, root, display) in overlays {
-                if let Some(g) = groups.iter_mut().find(|g| g.project_id == pid) {
-                    if g.root_path.is_empty() {
-                        g.root_path = root;
-                    }
-                    if g.display_name.is_empty() {
-                        g.display_name = display;
-                    }
-                }
-            }
-            for p in pending.iter() {
-                // Insert before the synthetic Discovered / Archived
-                // buckets so the regular project ordering is preserved.
-                let insert_at = groups
-                    .iter()
-                    .position(|g| g.is_archived || g.is_discovered())
-                    .unwrap_or(groups.len());
-                let mut g = ProjectGroup::new(p.id.clone(), p.display_name.clone());
-                g.root_path = p.root_path.clone();
-                groups.insert(insert_at, g);
-            }
-        }
-        groups
+        // The cache is authoritative: [`refresh_cache`] builds it from
+        // `projects.list` (project identity + empty groups) merged with
+        // `sessions.list` (the session rows), so there is nothing left
+        // for the TUI to reconstruct here.
+        self.cache.lock().map(|c| c.clone()).unwrap_or_default()
     }
 
     fn refresh_generation(&self) -> u64 {
@@ -437,6 +320,12 @@ impl SessionSource for RpcSessionSource {
     }
 
     fn create_project(&mut self, path: &str) -> Result<ProjectId, SourceError> {
+        // Validate locally first so the modal can stay open with the
+        // user's input intact (Validation arm); the daemon also rejects
+        // these, but failing here keeps the round-trip out of the hot
+        // path. The daemon's `projects.create` is get-or-create by root
+        // path, so it is the authority on duplicates — we don't second-
+        // guess it from a possibly-stale cache.
         let trimmed = path.trim();
         if trimmed.is_empty() {
             return Err(SourceError::Validation("path is required".into()));
@@ -452,58 +341,25 @@ impl SessionSource for RpcSessionSource {
                 "{trimmed} does not exist or is not a directory"
             )));
         }
-        let display = path_buf
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| trimmed.to_string());
-        // Duplicate guard: refuse only when the SAME root path is
-        // already known (live cache OR pending list). Compare by
-        // normalized `root_path` — never by `display_name`, since the
-        // `projects` table only enforces uniqueness on `root_path`
-        // (la-storage/migrations/0001_initial.sql) and two different
-        // checkouts can legitimately share a basename
-        // (`/repo/app` vs `/tmp/app`). The Code Reviewer's blocker on
-        // PR #92 was the basename collision rejecting that second case.
-        let norm = normalize_root(trimmed);
-        let live_has = self
-            .cache
-            .lock()
-            .map(|c| c.iter().any(|g| normalize_root(&g.root_path) == norm))
-            .unwrap_or(false);
-        if live_has {
-            return Err(SourceError::Validation(format!(
-                "project already exists for {trimmed}"
-            )));
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        self.cmd_tx
+            .send(Command::CreateProject {
+                path: trimmed.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                SourceError::Backend("rpc session source bg thread is no longer running".into())
+            })?;
+        match reply_rx.recv_timeout(self.create_timeout) {
+            Ok(res) => res,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(SourceError::Backend(format!(
+                "create project timed out — daemon did not reply within {}s",
+                self.create_timeout.as_secs()
+            ))),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(SourceError::Backend(
+                "rpc session source bg thread dropped the create-project reply".into(),
+            )),
         }
-        let id = {
-            let mut pending = self
-                .pending_projects
-                .lock()
-                .map_err(|_| SourceError::Backend("pending_projects lock poisoned".into()))?;
-            if pending.iter().any(|p| normalize_root(&p.root_path) == norm) {
-                return Err(SourceError::Validation(format!(
-                    "project already exists for {trimmed}"
-                )));
-            }
-            // Synthesise a UUID-looking id prefixed so it's distinguishable
-            // from daemon-assigned ones in logs but interoperates with
-            // the sidebar's plain-string id matching.
-            let id = format!("pending-{}", pending.len() + 1);
-            pending.push(PendingProject {
-                id: id.clone(),
-                root_path: trimmed.to_string(),
-                display_name: display,
-                daemon_project_id: None,
-            });
-            id
-        };
-        // Bump refresh_gen so the runner's per-frame
-        // `refresh_generation()` check dispatches a RefreshSessions on
-        // the very next loop, pulling the new stub into the sidebar
-        // without waiting for the user to press a key.
-        self.refresh_gen.fetch_add(1, Ordering::Relaxed);
-        Ok(ProjectId(id))
     }
 }
 
@@ -514,23 +370,13 @@ impl SessionSource for RpcSessionSource {
 async fn reconnect_loop(
     socket: PathBuf,
     cache: Arc<Mutex<Vec<ProjectGroup>>>,
-    pending: Arc<Mutex<Vec<PendingProject>>>,
     refresh_gen: Arc<AtomicU64>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let mut connected = false;
-        match run_once(
-            &socket,
-            &cache,
-            &pending,
-            &refresh_gen,
-            &mut cmd_rx,
-            &mut connected,
-        )
-        .await
-        {
+        match run_once(&socket, &cache, &refresh_gen, &mut cmd_rx, &mut connected).await {
             Ok(()) => {
                 // Sender side dropped — clean shutdown.
                 return;
@@ -550,7 +396,6 @@ async fn reconnect_loop(
 async fn run_once(
     socket: &Path,
     cache: &Arc<Mutex<Vec<ProjectGroup>>>,
-    pending: &Arc<Mutex<Vec<PendingProject>>>,
     refresh_gen: &Arc<AtomicU64>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
     connected: &mut bool,
@@ -650,6 +495,45 @@ async fn run_once(
                         );
                     }
                 }
+                Command::CreateProject { path, reply } => {
+                    let params = ProjectsCreateParams { path: path.clone() };
+                    let req = match Request::new(next_id, ProjectsCreate::NAME, params) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = reply.send(Err(SourceError::Backend(format!(
+                                "encode create project: {e}"
+                            ))));
+                            continue;
+                        }
+                    };
+                    next_id += 1;
+                    match send_and_await_ack(&mut conn, req).await {
+                        Ok(value) => match serde_json::from_value::<ProjectsCreateResult>(value) {
+                            Ok(r) => {
+                                // Read-your-write: refresh the cache so the
+                                // new (empty) project group is visible the
+                                // moment the TUI thread unblocks and calls
+                                // `snapshot()`.
+                                if let Err(e) = refresh_cache(&mut conn, cache, refresh_gen).await {
+                                    let _ = reply.send(Err(SourceError::Backend(format!(
+                                        "create project succeeded but follow-up refresh failed: {e}"
+                                    ))));
+                                    return Err(e);
+                                }
+                                let _ = reply.send(Ok(ProjectId(r.project.project_id)));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(SourceError::Backend(format!(
+                                    "decode create project result: {e}"
+                                ))));
+                            }
+                        },
+                        Err(e) => {
+                            let _ = reply.send(Err(SourceError::Backend(e.clone())));
+                            return Err(e);
+                        }
+                    }
+                }
                 Command::Create {
                     req: new_req,
                     reply,
@@ -665,7 +549,6 @@ async fn run_once(
                     // an empty buffer as `Validation`; the daemon also
                     // requires a non-empty prompt so we don't bother
                     // sending `None`.
-                    let project_dir_for_pending = new_req.project_dir.clone();
                     let params = SessionsCreateParams {
                         project_dir: new_req.project_dir.clone(),
                         backend: new_req.backend.clone(),
@@ -706,25 +589,6 @@ async fn run_once(
                                     ))));
                                     return Err(e);
                                 }
-                                // Link the daemon-assigned project_id
-                                // back to whichever pending stub owns
-                                // this directory. This is the eviction
-                                // signal for the non-worktree-first
-                                // case, where the daemon group's
-                                // `root_path` would otherwise be empty
-                                // (`sessions.list` only carries
-                                // `worktree_path`, see
-                                // `crates/la-daemon/src/dispatcher.rs`
-                                // `handle_sessions_list`). Without this
-                                // the stub would live forever next to
-                                // the real group — Code Reviewer's
-                                // blocker on PR #92 round 2.
-                                stamp_pending_project_id(
-                                    cache,
-                                    pending,
-                                    &project_dir_for_pending,
-                                    &r.session_id,
-                                );
                                 let _ = reply.send(Ok(SessionId(r.session_id)));
                                 // The cache is already current; skip the
                                 // tail-of-loop refresh.
@@ -788,15 +652,48 @@ async fn send_and_await_ack(
     }
 }
 
-/// Single `sessions.list` round-trip; overwrite the cache on success.
-/// Bumps `refresh_gen` after a successful overwrite so the runner can
-/// observe that a fresh snapshot is available and dispatch
-/// [`crate::app::AppMsg::RefreshSessions`] on the next frame.
+/// Refresh the cache from the daemon: pull `projects.list` (project
+/// identity + empty groups) and `sessions.list` (the session rows),
+/// then build the grouped snapshot. Bumps `refresh_gen` after a
+/// successful overwrite so the runner can observe that a fresh snapshot
+/// is available and dispatch [`crate::app::AppMsg::RefreshSessions`] on
+/// the next frame.
 async fn refresh_cache(
     conn: &mut Connection<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>,
     cache: &Arc<Mutex<Vec<ProjectGroup>>>,
     refresh_gen: &Arc<AtomicU64>,
 ) -> Result<(), String> {
+    // Projects first: this is the authoritative source of project
+    // identity (display name + root path) and surfaces projects that
+    // have no sessions yet. Best-effort: an older daemon that predates
+    // the `projects.list` RPC answers with a method-not-found *error
+    // response* (the connection stays open), so we must NOT let that
+    // brick the whole refresh. Fall back to an empty project list —
+    // `build_groups` then derives names from session worktree paths
+    // exactly as it did before this RPC existed, and `sessions.list`
+    // below still populates the sidebar.
+    let projects = match Request::new(0i64, ProjectsList::NAME, ProjectsListParams {}) {
+        Ok(projects_req) => match send_and_await_ack(conn, projects_req).await {
+            Ok(value) => serde_json::from_value::<la_proto::methods::ProjectsListResult>(value)
+                .map(|r| r.projects)
+                .unwrap_or_else(|e| {
+                    tracing::debug!(%e, "projects.list decode failed; falling back to empty");
+                    Vec::new()
+                }),
+            Err(e) => {
+                tracing::debug!(
+                    %e,
+                    "projects.list not answered (older daemon?); deriving project names from sessions"
+                );
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            tracing::debug!(%e, "projects.list encode failed; falling back to empty");
+            Vec::new()
+        }
+    };
+
     let req = Request::new(
         // The id collides across refreshes but the daemon doesn't care
         // (no in-flight request multiplexing on this connection) and
@@ -813,7 +710,7 @@ async fn refresh_cache(
     let value = send_and_await_ack(conn, req).await?;
     let result: la_proto::methods::SessionsListResult =
         serde_json::from_value(value).map_err(|e| format!("decode list result: {e}"))?;
-    let groups = build_groups(&result.sessions);
+    let groups = build_groups(&projects, &result.sessions);
     if let Ok(mut guard) = cache.lock() {
         *guard = groups;
     }
@@ -851,10 +748,13 @@ async fn find_discovered_backend(
     Ok(None)
 }
 
-/// Convert a flat `sessions.list` payload into the grouped, ordered
-/// shape the sidebar expects. The Archived bucket goes last; the
-/// project ordering is by display name (stable across snapshots).
-fn build_groups(sessions: &[SessionSummary]) -> Vec<ProjectGroup> {
+/// Build the grouped, ordered sidebar shape from the daemon's
+/// `projects.list` (authoritative project identity) and `sessions.list`
+/// (the session rows). Every project gets a group — even one with no
+/// sessions — so empty projects render and survive restarts. The
+/// Archived bucket goes last; project ordering is by display name
+/// (stable across snapshots).
+fn build_groups(projects: &[ProjectSummary], sessions: &[SessionSummary]) -> Vec<ProjectGroup> {
     use la_proto::methods::SessionState;
 
     struct PendingGroup {
@@ -863,7 +763,21 @@ fn build_groups(sessions: &[SessionSummary]) -> Vec<ProjectGroup> {
         sessions: Vec<SessionRow>,
     }
 
+    // Seed every known project so empty groups appear. Keyed by
+    // project_id; the daemon's display_name + root_path win over any
+    // worktree-path derivation below.
     let mut by_project: BTreeMap<String, PendingGroup> = BTreeMap::new();
+    for p in projects {
+        by_project.insert(
+            p.project_id.clone(),
+            PendingGroup {
+                display_name: p.display_name.clone(),
+                root_path: p.root_path.clone(),
+                sessions: Vec::new(),
+            },
+        );
+    }
+
     let mut archived = ProjectGroup::archived();
 
     for s in sessions {
@@ -875,11 +789,14 @@ fn build_groups(sessions: &[SessionSummary]) -> Vec<ProjectGroup> {
         let entry = by_project
             .entry(s.project_id.clone())
             .or_insert_with(|| PendingGroup {
+                // Fallback for a session whose project somehow isn't in
+                // `projects.list` (shouldn't happen — the daemon creates
+                // the project row before the session): derive from the
+                // worktree path so the row still groups sensibly.
                 display_name: derive_display_name(&s.project_id, s.worktree_path.as_deref()),
                 root_path: derive_root_path(s.worktree_path.as_deref()),
                 sessions: Vec::new(),
             });
-        // Fill blanks the first session lacked.
         if entry.display_name.is_empty() {
             entry.display_name = derive_display_name(&s.project_id, s.worktree_path.as_deref());
         }
@@ -906,7 +823,8 @@ fn build_groups(sessions: &[SessionSummary]) -> Vec<ProjectGroup> {
 
 /// Best-effort project display name derived from the worktree path.
 /// Falls back to a short project-id prefix when there is no worktree
-/// path (sessions sharing the project root).
+/// path. Only reached when a session references a project that wasn't
+/// in `projects.list`; normal projects carry their name from the daemon.
 fn derive_display_name(project_id: &str, worktree_path: Option<&str>) -> String {
     if let Some(p) = worktree_path {
         if let Some(name) = Path::new(p).file_name().and_then(|n| n.to_str()) {
@@ -926,63 +844,6 @@ fn derive_display_name(project_id: &str, worktree_path: Option<&str>) -> String 
 /// Best-effort root path: the worktree path itself, or empty.
 fn derive_root_path(worktree_path: Option<&str>) -> String {
     worktree_path.unwrap_or("").to_string()
-}
-
-/// Normalize a project root path for `pending_projects` dedup. Strips
-/// trailing separators so `"/repo/app"` and `"/repo/app/"` compare
-/// equal — the rest of the byte sequence is taken verbatim because the
-/// TUI does not own the on-disk authority (the daemon's
-/// `ensure_project` is the canonical normalizer, and it just stores
-/// whatever string `sessions.create.project_dir` arrived with). Case is
-/// preserved on every platform; case-folding `/Users/Alice` vs
-/// `/users/alice` is the daemon's call, not ours.
-fn normalize_root(p: &str) -> String {
-    p.trim_end_matches(['/', '\\']).to_string()
-}
-
-/// After a successful `sessions.create`, look up the freshly-spawned
-/// session's `project_id` in the just-refreshed cache and pin it onto
-/// whichever pending stub owns the same `root_path`. This is what
-/// evicts the stub in [`SessionSource::snapshot`] for the
-/// non-worktree-first case (where the daemon group's `root_path` is
-/// empty because `sessions.list` only ferries `worktree_path` and
-/// `build_groups` derives an empty root from `None`).
-///
-/// Best-effort: if we can't find the session in the cache, or no
-/// pending stub matches, we silently no-op — the snapshot's root_path
-/// path still works for the worktree-first case, and the basic safety
-/// net (`projects` table dedup at daemon level) means we never lose
-/// data, just see two visible groups for one project until the user
-/// restarts `la`. The Code Reviewer's blocker on PR #92 round 2 was
-/// about that visible duplication, which this stamp prevents.
-fn stamp_pending_project_id(
-    cache: &Arc<Mutex<Vec<ProjectGroup>>>,
-    pending: &Arc<Mutex<Vec<PendingProject>>>,
-    project_dir: &str,
-    session_id: &str,
-) {
-    let Ok(cache_guard) = cache.lock() else {
-        return;
-    };
-    let Some(daemon_project_id) = cache_guard.iter().find_map(|g| {
-        g.sessions
-            .iter()
-            .find(|s| s.session_id == session_id)
-            .map(|_| g.project_id.clone())
-    }) else {
-        return;
-    };
-    drop(cache_guard);
-    let Ok(mut pending_guard) = pending.lock() else {
-        return;
-    };
-    let norm = normalize_root(project_dir);
-    if let Some(stub) = pending_guard
-        .iter_mut()
-        .find(|p| normalize_root(&p.root_path) == norm)
-    {
-        stub.daemon_project_id = Some(daemon_project_id);
-    }
 }
 
 #[cfg(test)]
@@ -1010,16 +871,25 @@ mod tests {
         }
     }
 
+    fn project(id: &str, display_name: &str, root_path: &str) -> ProjectSummary {
+        ProjectSummary {
+            project_id: id.into(),
+            display_name: display_name.into(),
+            root_path: root_path.into(),
+        }
+    }
+
     #[test]
-    fn build_groups_pins_archived_last_and_derives_display_name() {
+    fn build_groups_uses_project_metadata_and_pins_archived_last() {
+        // The fix: a session's group must show the daemon's project
+        // display_name (folder basename), NOT a UUID prefix — even when
+        // the session has no worktree_path.
+        let projects = vec![
+            project("proj-a", "proj-a", "/home/me/code/proj-a"),
+            project("proj-b", "proj-b", "/tmp/proj-b"),
+        ];
         let sessions = vec![
-            summary(
-                "s1",
-                "proj-a",
-                "claude",
-                SessionState::Running,
-                Some("/home/me/code/proj-a"),
-            ),
+            summary("s1", "proj-a", "claude", SessionState::Running, None),
             summary("s2", "proj-a", "codex", SessionState::Exited, None),
             summary(
                 "s3",
@@ -1029,11 +899,12 @@ mod tests {
                 Some("/tmp/proj-b"),
             ),
         ];
-        let groups = build_groups(&sessions);
-        assert_eq!(groups.len(), 2);
-        assert!(!groups[0].is_archived);
-        assert_eq!(groups[0].display_name, "proj-a");
-        assert_eq!(groups[0].sessions.len(), 2);
+        let groups = build_groups(&projects, &sessions);
+        // proj-a + proj-b(empty after its only session archived) + archived bucket
+        let proj_a = groups.iter().find(|g| g.project_id == "proj-a").unwrap();
+        assert_eq!(proj_a.display_name, "proj-a");
+        assert_eq!(proj_a.root_path, "/home/me/code/proj-a");
+        assert_eq!(proj_a.sessions.len(), 2);
         let archived = groups.last().unwrap();
         assert!(archived.is_archived);
         assert_eq!(archived.sessions.len(), 1);
@@ -1041,7 +912,25 @@ mod tests {
     }
 
     #[test]
-    fn build_groups_falls_back_to_project_id_when_no_worktree() {
+    fn build_groups_seeds_empty_projects() {
+        // A project with no sessions must still render — that's the
+        // whole point of `projects.list` (empty projects survive).
+        let projects = vec![project(
+            "01934fff-feed-7000-a000-aaaaaaaaa001",
+            "my-empty-proj",
+            "/home/me/code/empty",
+        )];
+        let groups = build_groups(&projects, &[]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].display_name, "my-empty-proj");
+        assert_eq!(groups[0].root_path, "/home/me/code/empty");
+        assert!(groups[0].sessions.is_empty());
+    }
+
+    #[test]
+    fn build_groups_falls_back_when_session_project_absent_from_list() {
+        // Defensive: a session whose project isn't in `projects.list`
+        // still groups under a derived name rather than panicking.
         let sessions = vec![summary(
             "s1",
             "01934fff-feed-7000-a000-aaaaaaaaa001",
@@ -1049,142 +938,57 @@ mod tests {
             SessionState::Exited,
             None,
         )];
-        let groups = build_groups(&sessions);
+        let groups = build_groups(&[], &sessions);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].display_name, "01934fff");
     }
 
     #[test]
     fn build_groups_omits_archived_bucket_when_empty() {
+        let projects = vec![project("p1", "p1", "/p1")];
         let sessions = vec![summary("s1", "p1", "claude", SessionState::Exited, None)];
-        let groups = build_groups(&sessions);
+        let groups = build_groups(&projects, &sessions);
         assert_eq!(groups.len(), 1);
         assert!(!groups[0].is_archived);
-    }
-
-    #[test]
-    fn normalize_root_strips_trailing_separators_only() {
-        // Code Reviewer's blocker on PR #92: dedup must match the
-        // daemon's own uniqueness rule, which is "the literal
-        // `root_path` string". Trailing-slash variants are the only
-        // normalization the daemon's `ensure_project` is robust to
-        // (PathBuf comparisons are identity), so we mirror that.
-        assert_eq!(normalize_root("/repo/app"), "/repo/app");
-        assert_eq!(normalize_root("/repo/app/"), "/repo/app");
-        assert_eq!(normalize_root("/repo/app///"), "/repo/app");
-        // Case is preserved on every platform — daemon decides if it
-        // wants to case-fold, not the TUI.
-        assert_eq!(normalize_root("/Users/Alice"), "/Users/Alice");
-        assert_ne!(
-            normalize_root("/Users/Alice"),
-            normalize_root("/users/alice")
-        );
-        // Two distinct paths with the same basename must NOT compare
-        // equal — that was the regression: `/repo/app` was collapsing
-        // with `/tmp/app` because the old guard looked at display_name.
-        assert_ne!(normalize_root("/repo/app"), normalize_root("/tmp/app"));
     }
 
     /// Construct an `RpcSessionSource` whose bg thread points at a
     /// path we never bind. The thread loops forever trying to connect;
     /// the test only exercises the synchronous trait surface (which
-    /// does NOT need a live daemon for `snapshot`, `create_project`,
-    /// or the `__test_set_cache` / `__test_stamp_daemon_project_id`
-    /// helpers).
+    /// does NOT need a live daemon for `snapshot` or `__test_set_cache`).
     fn fake_rpc_source() -> RpcSessionSource {
         let nowhere = std::path::Path::new("/tmp/lazyagents-no-such-socket-for-tests.sock");
         RpcSessionSource::connect(nowhere)
     }
 
     #[test]
-    fn pending_stub_evicts_when_daemon_group_lands_with_matching_root_path() {
-        // Worktree-first case: the daemon-side group carries a real
-        // `root_path` (derived from `SessionSummary.worktree_path`).
-        // Pure root-path match must evict the stub.
-        let td = tempfile::TempDir::new().unwrap();
-        let path = td.path().display().to_string();
-        let mut src = fake_rpc_source();
-        src.create_project(&path).expect("stub registered");
+    fn snapshot_returns_cache_verbatim() {
+        // The cache is now authoritative (built from projects.list +
+        // sessions.list in the bg loop), so snapshot is a plain clone.
         let mut g = ProjectGroup::new("daemon-proj-id".to_string(), "proj-a".to_string());
-        g.root_path = path.clone();
+        g.root_path = "/home/me/code/proj-a".to_string();
+        let src = fake_rpc_source();
         src.__test_set_cache(vec![g]);
-        let snap = src.snapshot();
-        let roots: Vec<&str> = snap.iter().map(|g| g.root_path.as_str()).collect();
-        let ids: Vec<&str> = snap.iter().map(|g| g.project_id.as_str()).collect();
-        assert_eq!(
-            roots.iter().filter(|r| **r == path.as_str()).count(),
-            1,
-            "expected exactly one group for {path} after merge; got roots={roots:?} ids={ids:?}",
-        );
-        assert!(
-            ids.iter().any(|i| *i == "daemon-proj-id"),
-            "real daemon group must survive; ids={ids:?}",
-        );
-        assert!(
-            !ids.iter().any(|i| i.starts_with("pending-")),
-            "pending stub must be evicted when root_path matches; ids={ids:?}",
-        );
-    }
-
-    #[test]
-    fn pending_stub_evicts_when_daemon_group_has_empty_root_path() {
-        // Non-worktree-first case (Code Reviewer's blocker on PR #92
-        // round 2): the daemon-side group's `root_path` is empty
-        // because `sessions.list` returned `worktree_path: None`. The
-        // stub MUST still evict via the daemon_project_id stamp the
-        // bg loop applies after `sessions.create` succeeds.
-        let td = tempfile::TempDir::new().unwrap();
-        let path = td.path().display().to_string();
-        let expected_display = td
-            .path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let mut src = fake_rpc_source();
-        src.create_project(&path).expect("stub registered");
-        // Stamp comes from the bg loop's create-handler in production.
-        src.__test_stamp_daemon_project_id(&path, "daemon-proj-b-id");
-        let mut g = ProjectGroup::new("daemon-proj-b-id".to_string(), String::new());
-        // root_path stays empty — exactly what `build_groups` produces
-        // for a SessionSummary { worktree_path: None }.
-        g.root_path = String::new();
-        src.__test_set_cache(vec![g]);
-        let snap = src.snapshot();
-        let ids: Vec<&str> = snap.iter().map(|g| g.project_id.as_str()).collect();
-        assert!(
-            !ids.iter().any(|i| i.starts_with("pending-")),
-            "pending stub must NOT linger next to the daemon group; ids={ids:?}",
-        );
-        assert_eq!(ids, vec!["daemon-proj-b-id"]);
-        // The merge also overlays the stub's root onto the empty
-        // daemon group so a follow-up `n` against the real group
-        // still has a usable `project_dir` (without this the App's
-        // `on_new_session` reads "" and Confirm fails Validation).
-        assert_eq!(
-            snap[0].root_path, path,
-            "empty daemon root should be overlaid with the stub's known path",
-        );
-        assert_eq!(
-            snap[0].display_name, expected_display,
-            "empty daemon display name should be overlaid with the stub's basename",
-        );
-    }
-
-    #[test]
-    fn snapshot_keeps_pending_when_no_daemon_match_yet() {
-        // Sanity guard so the eviction doesn't over-fire and erase
-        // stubs that haven't been registered with the daemon yet.
-        let td = tempfile::TempDir::new().unwrap();
-        let path = td.path().display().to_string();
-        let mut src = fake_rpc_source();
-        src.create_project(&path).expect("stub registered");
-        // No matching cache entry yet.
-        src.__test_set_cache(vec![]);
         let snap = src.snapshot();
         assert_eq!(snap.len(), 1);
-        assert!(snap[0].project_id.starts_with("pending-"));
-        assert_eq!(snap[0].root_path, path);
+        assert_eq!(snap[0].project_id, "daemon-proj-id");
+        assert_eq!(snap[0].display_name, "proj-a");
+        assert_eq!(snap[0].root_path, "/home/me/code/proj-a");
+    }
+
+    #[test]
+    fn create_project_rejects_relative_and_missing_paths_locally() {
+        // Local validation gate fires before any RPC round-trip, so it
+        // works even against the never-bound fake socket.
+        let mut src = fake_rpc_source();
+        assert!(matches!(
+            src.create_project("relative/path"),
+            Err(SourceError::Validation(_))
+        ));
+        assert!(matches!(
+            src.create_project("/no/such/dir/lazyagents-test-xyz"),
+            Err(SourceError::Validation(_))
+        ));
     }
 }
 

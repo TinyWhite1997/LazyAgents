@@ -42,6 +42,8 @@ pub const METHOD_NAMES: &[&str] = &[
     SessionsSignal::NAME,
     SessionsArchive::NAME,
     SessionsDelete::NAME,
+    ProjectsList::NAME,
+    ProjectsCreate::NAME,
     AdaptersDiscover::NAME,
     SessionsImport::NAME,
     SessionsReplay::NAME,
@@ -567,6 +569,69 @@ impl Method for SessionsDelete {
     const NAME: &'static str = "sessions.delete";
     type Params = SessionsDeleteParams;
     type Result = SessionsDeleteResult;
+}
+
+// ---------- projects.list ----------
+
+/// Enumerate every known project (the top level of the sidebar's
+/// two-level tree). Unlike `sessions.list`, this surfaces projects that
+/// have **no** sessions yet, so the client can render an empty project
+/// group and persist it across restarts.
+pub enum ProjectsList {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "ProjectsListParams")]
+pub struct ProjectsListParams {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "ProjectsListResult")]
+pub struct ProjectsListResult {
+    pub projects: Vec<ProjectSummary>,
+}
+
+/// Compact project row. Carries the project's identity so the client
+/// never has to reverse-engineer a display name from a session's
+/// worktree path.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProjectSummary {
+    /// Project id (UUID v7).
+    pub project_id: String,
+    /// Human label shown in the sidebar header — the directory basename.
+    pub display_name: String,
+    /// Absolute on-disk root path the daemon stored for this project.
+    pub root_path: String,
+}
+
+impl Method for ProjectsList {
+    const NAME: &'static str = "projects.list";
+    type Params = ProjectsListParams;
+    type Result = ProjectsListResult;
+}
+
+// ---------- projects.create ----------
+
+/// Register an on-disk directory as a project without spawning a
+/// session. Idempotent: if a project already exists for `path` the
+/// daemon returns the existing row (get-or-create by root path).
+pub enum ProjectsCreate {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "ProjectsCreateParams")]
+pub struct ProjectsCreateParams {
+    /// Absolute path of an existing directory to register.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(rename = "ProjectsCreateResult")]
+pub struct ProjectsCreateResult {
+    pub project: ProjectSummary,
+}
+
+impl Method for ProjectsCreate {
+    const NAME: &'static str = "projects.create";
+    type Params = ProjectsCreateParams;
+    type Result = ProjectsCreateResult;
 }
 
 // ---------- adapters.discover ----------

@@ -698,6 +698,91 @@ async fn end_to_end_create_and_attach() {
     let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
 
+// WEK-101 follow-up: the Sessions tab is a two-level tree — project
+// (folder) over sessions. The bug this guards against: after creating
+// the first session under a freshly-registered project, the project's
+// display name collapsed to a UUID prefix because `sessions.list`
+// carried no project identity and the client derived the name from a
+// (missing) worktree path. With `projects.create` / `projects.list`
+// the daemon is authoritative, so the folder name must survive a
+// `sessions.create`.
+#[cfg(unix)]
+#[tokio::test]
+async fn project_name_survives_session_create() {
+    use la_proto::methods::{ProjectsCreateResult, ProjectsListResult};
+
+    let project = tempfile::tempdir().expect("project tmp");
+    let project_dir = project.path().to_string_lossy().to_string();
+    let folder_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let daemon = bootstrap_daemon("printf 'hi\\n'; sleep 0.2").await;
+    let mut conn = client(&daemon.socket).await;
+
+    // projects.create — register the directory with no session yet.
+    let created: ProjectsCreateResult = call(
+        &mut conn,
+        1,
+        "projects.create",
+        serde_json::json!({ "path": project_dir }),
+    )
+    .await;
+    assert_eq!(created.project.display_name, folder_name);
+    assert_eq!(created.project.root_path, project_dir);
+    let project_id = created.project.project_id.clone();
+
+    // projects.list — the empty project is present with its folder name.
+    let listed: ProjectsListResult =
+        call(&mut conn, 2, "projects.list", serde_json::json!({})).await;
+    let row = listed
+        .projects
+        .iter()
+        .find(|p| p.project_id == project_id)
+        .expect("registered project must appear in projects.list");
+    assert_eq!(
+        row.display_name, folder_name,
+        "empty project must show its folder name, not a UUID"
+    );
+
+    // sessions.create under that project, then re-list.
+    let create_params = SessionsCreateParams {
+        project_dir: project_dir.clone(),
+        backend: "shtest".to_string(),
+        args: vec![],
+        prompt: None,
+        worktree: false,
+    };
+    let _: SessionsCreateResult = call(&mut conn, 3, "sessions.create", &create_params).await;
+
+    // The bug repro: after the first session, the project must STILL
+    // resolve to the same id + folder name (the session reused the
+    // existing project rather than minting a fresh UUID-named one).
+    let after: ProjectsListResult =
+        call(&mut conn, 4, "projects.list", serde_json::json!({})).await;
+    let same = after
+        .projects
+        .iter()
+        .filter(|p| p.root_path == project_dir)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        same.len(),
+        1,
+        "exactly one project for the directory after sessions.create; got {same:?}"
+    );
+    assert_eq!(same[0].project_id, project_id, "project id must be stable");
+    assert_eq!(
+        same[0].display_name, folder_name,
+        "project display name must stay the folder name after a session is added"
+    );
+
+    daemon.handle.shutdown();
+    let _ = timeout(Duration::from_secs(15), daemon.join).await;
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
