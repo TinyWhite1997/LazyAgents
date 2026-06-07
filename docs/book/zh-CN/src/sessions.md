@@ -48,7 +48,7 @@ modal 内的快捷键：
 | `Enter` | 两段式：已有候选高亮时下钻一级；否则创建项目。 |
 | `Esc` | 取消——不创建任何东西。 |
 
-创建成功后，新的（空）项目分组会出现在侧栏，光标自动落在它的 header 上，toast 显示 `project added: <path>`。daemon 端的 `projects` 行在你首次对该目录调 `sessions.create` 时才会真正写入 SQLite——在那之前，TUI 在本地维护一个 stub，所以侧栏会立刻反映新项目。
+创建成功后，新的（空）项目分组会出现在侧栏，光标自动落在它的 header 上，toast 显示 `project added: <path>`。项目会立即持久化：TUI 调用 daemon 的 `projects.create` RPC，直接写入 `projects` 行，所以即使还没在其下新建会话，这个空项目也能在 daemon 或 `la` 重启后保留。
 
 ### 在 TUI 里（v1 状态）
 
@@ -204,6 +204,7 @@ lad backup --output ./lad-snapshot.sqlite
 - `sessions.write`、`sessions.resize`、`sessions.signal`
 - `sessions.archive`、`sessions.delete`
 - `sessions.import`、`sessions.replay`
+- `projects.list`、`projects.create` —— 枚举项目（含空项目）、把目录注册为项目而无需新建会话
 - `adapters.discover`
 - `events.subscribe` 主题：`session.output`、`session.state`、`session.gap`
 

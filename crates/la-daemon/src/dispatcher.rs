@@ -466,9 +466,9 @@ async fn dispatch(
     ctx: &ConnectionContext,
 ) -> Result<serde_json::Value, RpcError> {
     use la_proto::methods::{
-        AdaptersDiscover, Initialize, SessionsArchive, SessionsAttach, SessionsCreate,
-        SessionsDelete, SessionsDetach, SessionsImport, SessionsList, SessionsSignal,
-        SessionsWrite,
+        AdaptersDiscover, Initialize, ProjectsCreate, ProjectsList, SessionsArchive,
+        SessionsAttach, SessionsCreate, SessionsDelete, SessionsDetach, SessionsImport,
+        SessionsList, SessionsSignal, SessionsWrite,
     };
 
     match req.method.as_str() {
@@ -514,6 +514,14 @@ async fn dispatch(
             let id = SessionId(params.session_id);
             state.manager.delete(&id).await.map_err(core_to_rpc)?;
             ok(la_proto::methods::SessionsDeleteResult {})
+        }
+        ProjectsList::NAME => {
+            let _params = decode_params::<la_proto::methods::ProjectsListParams>(req)?;
+            handle_projects_list(state).await
+        }
+        ProjectsCreate::NAME => {
+            let params = decode_params::<la_proto::methods::ProjectsCreateParams>(req)?;
+            handle_projects_create(state, params).await
         }
         AdaptersDiscover::NAME => {
             let params: AdaptersDiscoverParams = decode_params(req)?;
@@ -856,6 +864,68 @@ async fn ensure_project(state: &ConnState, dir: &str) -> Result<String, RpcError
         .await
         .map_err(storage_to_rpc)?;
     Ok(id)
+}
+
+async fn handle_projects_list(state: &ConnState) -> Result<serde_json::Value, RpcError> {
+    let storage = state.manager.storage();
+    let projects = storage.projects().list().await.map_err(storage_to_rpc)?;
+    let projects = projects
+        .into_iter()
+        .map(|p| la_proto::methods::ProjectSummary {
+            project_id: p.id,
+            display_name: p.display_name,
+            root_path: p.root_path,
+        })
+        .collect();
+    ok(la_proto::methods::ProjectsListResult { projects })
+}
+
+async fn handle_projects_create(
+    state: &ConnState,
+    params: la_proto::methods::ProjectsCreateParams,
+) -> Result<serde_json::Value, RpcError> {
+    let path = params.path.trim();
+    if path.is_empty() {
+        return Err(RpcError::new(
+            error_codes::INVALID_PARAMS,
+            "project path is required",
+        ));
+    }
+    let path_buf = std::path::Path::new(path);
+    if !path_buf.is_absolute() {
+        return Err(RpcError::new(
+            error_codes::INVALID_PARAMS,
+            format!("project path must be absolute (was {path:?})"),
+        ));
+    }
+    if !path_buf.is_dir() {
+        return Err(RpcError::new(
+            error_codes::INVALID_PARAMS,
+            format!("{path} does not exist or is not a directory"),
+        ));
+    }
+    // Get-or-create by root path — `ensure_project` already does exactly
+    // this, so an existing project for `path` is returned idempotently.
+    let project_id = ensure_project(state, path).await?;
+    let storage = state.manager.storage();
+    let project = storage
+        .projects()
+        .get(&project_id)
+        .await
+        .map_err(storage_to_rpc)?
+        .ok_or_else(|| {
+            RpcError::new(
+                error_codes::INTERNAL_ERROR,
+                "project vanished immediately after create",
+            )
+        })?;
+    ok(la_proto::methods::ProjectsCreateResult {
+        project: la_proto::methods::ProjectSummary {
+            project_id: project.id,
+            display_name: project.display_name,
+            root_path: project.root_path,
+        },
+    })
 }
 
 async fn handle_sessions_attach(

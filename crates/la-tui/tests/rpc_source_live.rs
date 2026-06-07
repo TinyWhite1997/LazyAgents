@@ -25,9 +25,9 @@ use la_ipc::transport::{Endpoint, Listener};
 use la_ipc::{server_handshake, Connection};
 use la_proto::jsonrpc::{Message, Response};
 use la_proto::methods::{
-    Method, PtySize, ServerCapabilities, SessionState, SessionSummary, SessionsArchive,
-    SessionsArchiveResult, SessionsCreate, SessionsCreateParams, SessionsCreateResult,
-    SessionsList, SessionsListResult,
+    Method, ProjectSummary, ProjectsList, ProjectsListResult, PtySize, ServerCapabilities,
+    SessionState, SessionSummary, SessionsArchive, SessionsArchiveResult, SessionsCreate,
+    SessionsCreateParams, SessionsCreateResult, SessionsList, SessionsListResult,
 };
 use la_tui::source::{NewSessionRequest, RpcSessionSource, SourceError};
 use la_tui::SessionSource;
@@ -44,6 +44,24 @@ fn make_summary(id: &str, project: &str, state: SessionState) -> SessionSummary 
         created_at: "2026-06-06T00:00:00Z".into(),
         updated_at: "2026-06-06T00:00:00Z".into(),
         worktree_path: Some(format!("/tmp/{project}")),
+    }
+}
+
+/// A `projects.list` result mirroring the projects the stub's
+/// `sessions.list` references (id == basename, root == `/tmp/<id>`).
+/// `refresh_cache` now pulls `projects.list` before `sessions.list`,
+/// so every stub must answer it. Helper keeps the per-stub arm a
+/// one-liner.
+fn make_projects(ids: &[&str]) -> ProjectsListResult {
+    ProjectsListResult {
+        projects: ids
+            .iter()
+            .map(|id| ProjectSummary {
+                project_id: (*id).into(),
+                display_name: (*id).into(),
+                root_path: format!("/tmp/{id}"),
+            })
+            .collect(),
     }
 }
 
@@ -79,26 +97,37 @@ async fn snapshot_reflects_sessions_list_after_handshake() {
         let mut conn = Connection::new(stream);
         handshake_stub(&mut conn).await;
 
-        // Reply to one sessions.list, then park until the test thread
-        // drops its sender (causing the source's bg loop to exit and
-        // close this connection).
-        let msg = conn.recv().await.expect("recv").expect("eof");
-        if let Message::Request(req) = msg {
-            assert_eq!(req.method, SessionsList::NAME);
-            let result = SessionsListResult {
-                sessions: vec![
-                    make_summary("s1", "proj-a", SessionState::Running),
-                    make_summary("s2", "proj-a", SessionState::Exited),
-                    make_summary("s3", "proj-b", SessionState::Archived),
-                ],
+        // Answer one projects.list + one sessions.list, then park until
+        // the test thread drops its sender (causing the source's bg loop
+        // to exit and close this connection).
+        loop {
+            let msg = match conn.recv().await {
+                Ok(Some(m)) => m,
+                _ => return,
             };
-            let resp = Response::success(req.id, &result).expect("encode list result");
-            conn.send(&Message::Response(resp)).await.expect("send ack");
-        } else {
-            panic!("expected sessions.list request");
+            let Message::Request(req) = msg else { continue };
+            match req.method.as_str() {
+                m if m == ProjectsList::NAME => {
+                    let resp = Response::success(req.id, make_projects(&["proj-a", "proj-b"]))
+                        .expect("encode projects list");
+                    conn.send(&Message::Response(resp))
+                        .await
+                        .expect("send projects ack");
+                }
+                m if m == SessionsList::NAME => {
+                    let result = SessionsListResult {
+                        sessions: vec![
+                            make_summary("s1", "proj-a", SessionState::Running),
+                            make_summary("s2", "proj-a", SessionState::Exited),
+                            make_summary("s3", "proj-b", SessionState::Archived),
+                        ],
+                    };
+                    let resp = Response::success(req.id, &result).expect("encode list result");
+                    conn.send(&Message::Response(resp)).await.expect("send ack");
+                }
+                other => panic!("unexpected method on stub: {other}"),
+            }
         }
-        // Idle until disconnect.
-        let _ = conn.recv().await;
     });
 
     let source = RpcSessionSource::connect(&socket);
@@ -124,6 +153,75 @@ async fn snapshot_reflects_sessions_list_after_handshake() {
     assert!(archived.is_archived, "archived bucket pinned last");
     assert_eq!(archived.sessions.len(), 1);
     assert_eq!(archived.sessions[0].session_id, "s3");
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    let _ = std::fs::remove_file(&socket);
+    drop(dir);
+}
+
+// Regression: an older `lad` that predates the `projects.list` RPC
+// answers it with a method-not-found *error response* (connection stays
+// open). The source must degrade gracefully — derive project names from
+// session worktree paths and still populate the sidebar — instead of
+// letting the failed refresh brick the cache and starve the command
+// loop (which froze the New-project modal for the full create timeout).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projects_list_rejection_falls_back_to_session_derived_groups() {
+    use la_proto::jsonrpc::RpcError;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("lad-rpc-src-old.sock");
+    let listener = Listener::bind(&Endpoint::uds(&socket))
+        .await
+        .expect("bind stub");
+
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.expect("accept");
+        let mut conn = Connection::new(stream);
+        handshake_stub(&mut conn).await;
+        loop {
+            let msg = match conn.recv().await {
+                Ok(Some(m)) => m,
+                _ => return,
+            };
+            let Message::Request(req) = msg else { continue };
+            match req.method.as_str() {
+                m if m == ProjectsList::NAME => {
+                    // Simulate the pre-projects.list daemon.
+                    let resp = Response::error(req.id, RpcError::method_not_found("projects.list"));
+                    conn.send(&Message::Response(resp)).await.expect("send err");
+                }
+                m if m == SessionsList::NAME => {
+                    let result = SessionsListResult {
+                        sessions: vec![make_summary("s1", "proj-a", SessionState::Running)],
+                    };
+                    let resp = Response::success(req.id, &result).expect("encode list");
+                    conn.send(&Message::Response(resp)).await.expect("send");
+                }
+                other => panic!("unexpected method on stub: {other}"),
+            }
+        }
+    });
+
+    let source = RpcSessionSource::connect(&socket);
+    let (ok, groups) = tokio::task::spawn_blocking(move || {
+        let ok = source.wait_for_first_snapshot(Duration::from_secs(5));
+        (ok, source.snapshot())
+    })
+    .await
+    .expect("blocking join");
+
+    assert!(
+        ok,
+        "sidebar must still populate from sessions.list even when projects.list errors"
+    );
+    let proj_a = groups
+        .iter()
+        .find(|g| g.project_id == "proj-a")
+        .expect("proj-a derived from session worktree path");
+    // Name derived from the session's worktree_path (`/tmp/proj-a`).
+    assert_eq!(proj_a.display_name, "proj-a");
+    assert_eq!(proj_a.sessions.len(), 1);
 
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
     let _ = std::fs::remove_file(&socket);
@@ -158,6 +256,11 @@ async fn archive_emits_rpc_and_triggers_immediate_refresh() {
                 _ => continue,
             };
             match req.method.as_str() {
+                m if m == ProjectsList::NAME => {
+                    let resp = Response::success(req.id, make_projects(&["proj-a"]))
+                        .expect("encode projects list");
+                    conn.send(&Message::Response(resp)).await.expect("send");
+                }
                 m if m == SessionsList::NAME => {
                     let archived = archive_seen_bg.lock().await.clone();
                     let mut sessions = vec![
@@ -294,6 +397,13 @@ async fn create_session_times_out_when_daemon_never_replies() {
                 _ => continue,
             };
             match req.method.as_str() {
+                m if m == ProjectsList::NAME => {
+                    let resp = Response::success(req.id, make_projects(&["proj-a"]))
+                        .expect("encode projects list");
+                    conn.send(&Message::Response(resp))
+                        .await
+                        .expect("send projects");
+                }
                 m if m == SessionsList::NAME => {
                     let resp = Response::success(
                         req.id,
@@ -395,6 +505,11 @@ async fn create_session_pulls_fresh_snapshot_before_acking_caller() {
                 _ => continue,
             };
             match req.method.as_str() {
+                m if m == ProjectsList::NAME => {
+                    let resp = Response::success(req.id, make_projects(&["proj-a"]))
+                        .expect("encode projects list");
+                    conn.send(&Message::Response(resp)).await.expect("send");
+                }
                 m if m == SessionsList::NAME => {
                     let mut sessions = vec![make_summary("s1", "proj-a", SessionState::Running)];
                     // Once a create has been ack'd, the list response
@@ -521,6 +636,11 @@ async fn refresh_generation_bumps_after_bg_poll_tick() {
                 _ => continue,
             };
             match req.method.as_str() {
+                m if m == ProjectsList::NAME => {
+                    let resp = Response::success(req.id, make_projects(&["proj-a"]))
+                        .expect("encode projects list");
+                    conn.send(&Message::Response(resp)).await.expect("send");
+                }
                 m if m == SessionsList::NAME => {
                     let mut n = list_count_bg.lock().await;
                     *n += 1;

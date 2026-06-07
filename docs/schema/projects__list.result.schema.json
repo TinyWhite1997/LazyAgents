@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ProjectsListResult",
+  "type": "object",
+  "required": [
+    "projects"
+  ],
+  "properties": {
+    "projects": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ProjectSummary"
+      }
+    }
+  },
+  "definitions": {
+    "ProjectSummary": {
+      "description": "Compact project row. Carries the project's identity so the client never has to reverse-engineer a display name from a session's worktree path.",
+      "type": "object",
+      "required": [
+        "display_name",
+        "project_id",
+        "root_path"
+      ],
+      "properties": {
+        "project_id": {
+          "description": "Project id (UUID v7).",
+          "type": "string"
+        },
+        "display_name": {
+          "description": "Human label shown in the sidebar header — the directory basename.",
+          "type": "string"
+        },
+        "root_path": {
+          "description": "Absolute on-disk root path the daemon stored for this project.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}
