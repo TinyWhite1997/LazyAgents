@@ -17,6 +17,7 @@
 use crate::crons::{CronSource, CronsState, FieldEdit};
 use crate::model::BackendBadge;
 use crate::notif_sub::HealthSnapshot;
+use crate::path_complete::{self, Completion};
 use crate::sidebar::{Selection, SidebarState};
 use crate::source::{NewSessionRequest, SessionSource, SourceError};
 use crate::status::{CronPulse, Status};
@@ -179,6 +180,138 @@ pub enum NewSessionField {
     Worktree,
 }
 
+/// State carried inside [`Modal::NewProject`] (WEK-101).
+///
+/// One field — the path buffer — plus a live dropdown of matching
+/// subdirectory candidates. The App recomputes the [`Completion`] on
+/// every keystroke; the modal renderer reads it to paint the dropdown.
+///
+/// Path semantics (issue brief):
+///   - `~` at the start expands to `$HOME`,
+///   - hidden directories filtered unless the prefix begins with `.`,
+///   - only directories are listed,
+///   - non-existent paths are rejected on Confirm with a clear toast
+///     (the modal does NOT create directories — that's the user's job),
+///   - `selected_candidate` (cycled with Up/Down/Tab) drives Enter's
+///     behaviour: applies the highlighted candidate first, only
+///     confirming when the buffer already names an existing dir AND no
+///     candidate is highlighted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewProjectDraft {
+    /// Raw path buffer — exactly what the user typed (pre-`~` expansion).
+    pub path: String,
+    /// Live completion view derived from [`path`] on every edit.
+    pub completion: Completion,
+    /// Highlighted candidate inside [`completion::candidates`]. `None`
+    /// means "no selection yet — Up/Down or Tab will pick the first".
+    pub selected: Option<usize>,
+    /// Last error to surface inside the modal (validation refusal,
+    /// duplicate, missing dir). Cleared on the next keystroke.
+    pub error: Option<String>,
+}
+
+impl NewProjectDraft {
+    /// Construct a fresh draft seeded with a sensible starting path.
+    pub fn new() -> Self {
+        let path = path_complete::default_starting_path();
+        let completion = path_complete::complete(&path);
+        Self {
+            path,
+            completion,
+            selected: None,
+            error: None,
+        }
+    }
+
+    /// Replace the path buffer and recompute completion. Resets the
+    /// dropdown selection because a new buffer means the previous
+    /// highlighted candidate may no longer exist.
+    pub fn set_path(&mut self, path: String) {
+        self.path = path;
+        self.completion = path_complete::complete(&self.path);
+        self.selected = None;
+        self.error = None;
+    }
+
+    /// Append a single char to the buffer.
+    pub fn push_char(&mut self, c: char) {
+        let mut path = std::mem::take(&mut self.path);
+        path.push(c);
+        self.set_path(path);
+    }
+
+    /// Pop the last char (Backspace). No-op on empty buffer.
+    pub fn pop_char(&mut self) {
+        let mut path = std::mem::take(&mut self.path);
+        path.pop();
+        self.set_path(path);
+    }
+
+    /// Move the candidate cursor down (Down / Tab). Wraps to the top.
+    pub fn select_next(&mut self) {
+        if self.completion.candidates.is_empty() {
+            self.selected = None;
+            return;
+        }
+        self.selected = Some(match self.selected {
+            None => 0,
+            Some(i) => (i + 1) % self.completion.candidates.len(),
+        });
+    }
+
+    /// Move the candidate cursor up (Up / Shift-Tab). Wraps to the bottom.
+    pub fn select_prev(&mut self) {
+        if self.completion.candidates.is_empty() {
+            self.selected = None;
+            return;
+        }
+        self.selected = Some(match self.selected {
+            None => self.completion.candidates.len() - 1,
+            Some(0) => self.completion.candidates.len() - 1,
+            Some(i) => i - 1,
+        });
+    }
+
+    /// Currently-highlighted candidate, if any.
+    pub fn selected_candidate(&self) -> Option<&str> {
+        self.selected
+            .and_then(|i| self.completion.candidates.get(i).map(String::as_str))
+    }
+
+    /// Apply the highlighted candidate to the path buffer. The buffer
+    /// becomes the joined absolute path with a trailing `/` so the user
+    /// can immediately descend further. Returns true when something was
+    /// applied; the App treats Enter as "first apply, then confirm" so
+    /// pressing Enter on a fresh dropdown selection descends one level
+    /// before sealing the choice.
+    pub fn apply_selected(&mut self) -> bool {
+        let Some(name) = self.selected_candidate().map(str::to_string) else {
+            return false;
+        };
+        let joined = path_complete::apply_candidate(&self.completion, &name);
+        let mut s = joined.to_string_lossy().into_owned();
+        // Trailing separator → the next keystroke completes children.
+        if !s.ends_with('/') {
+            s.push('/');
+        }
+        self.set_path(s);
+        true
+    }
+
+    /// Path the App should pass to [`SessionSource::create_project`] on
+    /// Confirm. Uses the resolved (tilde-expanded) form so the daemon
+    /// stores an absolute path it can stat later.
+    pub fn confirm_path(&self) -> String {
+        self.completion.resolved.to_string_lossy().into_owned()
+    }
+}
+
+impl Default for NewProjectDraft {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Modal overlays. At most one open at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
@@ -191,6 +324,11 @@ pub enum Modal {
     /// the worktree flag before Confirm calls
     /// [`crate::source::SessionSource::create_session`].
     NewSession(NewSessionDraft),
+    /// `Shift+N` on the sidebar → register a new project (WEK-101).
+    /// User types a directory path; the modal completes subdirectories
+    /// from the live filesystem. Confirm calls
+    /// [`SessionSource::create_project`] and selects the new group.
+    NewProject(NewProjectDraft),
     /// `space` on a disabled cron, first enable only (WEK-35 / M3.4):
     /// shows the cost budget plus next trigger time and forces an
     /// explicit confirmation before the daemon picks the cron up. The
@@ -292,6 +430,22 @@ pub enum AppMsg {
     ArchiveOrRestore,
     /// `n` new session (opens chooser modal).
     NewSession,
+    /// `Shift+N` new project (WEK-101). Opens the path-input modal
+    /// even on an empty workspace — that's the *only* way to seed the
+    /// sidebar before any sessions exist.
+    NewProject,
+    /// New-project modal field editing (WEK-101). Routed by the input
+    /// layer only while [`Modal::NewProject`] is open.
+    NewProjectPathChar(char),
+    NewProjectPathBackspace,
+    /// Navigate the completion dropdown (Up/Down or Shift-Tab/Tab).
+    NewProjectCandidatePrev,
+    NewProjectCandidateNext,
+    /// Apply the highlighted candidate to the path buffer without
+    /// confirming. Used by ←/Right or to make Enter feel two-staged
+    /// (Enter when a candidate is highlighted descends; Enter again
+    /// confirms).
+    NewProjectApplyCandidate,
     /// New-session modal field editing (WEK-94 / A2). Routed by the
     /// input layer only while [`Modal::NewSession`] is open.
     NewSessionFocusNext,
@@ -593,6 +747,13 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 None => return AppOutcome::Continue,
                 Some(other) => other,
             };
+            // WEK-101: NewProject modal field edits + dropdown
+            // navigation mutate the draft in place. Same routing
+            // rationale as `NewSession`.
+            let msg = match self.try_apply_new_project_field(msg) {
+                None => return AppOutcome::Continue,
+                Some(other) => other,
+            };
             // Modal short-circuits — while a modal is open, only its keys are
             // valid (PRD §5.6 上下文驱动).
             if let Some(modal) = self.modal.clone() {
@@ -646,6 +807,7 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             AppMsg::Delete => self.on_delete(),
             AppMsg::ArchiveOrRestore => self.on_archive_or_restore(),
             AppMsg::NewSession => self.on_new_session(),
+            AppMsg::NewProject => self.on_new_project(),
             AppMsg::ImportDiscovered => self.on_import_discovered(),
             AppMsg::Confirm | AppMsg::Cancel => {
                 // Outside a modal: `Esc` on the Crons editor pane drops
@@ -835,6 +997,18 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             | AppMsg::NewSessionPromptChar(_)
             | AppMsg::NewSessionPromptNewline
             | AppMsg::NewSessionPromptBackspace => {}
+
+            // --- NewProject modal field edits (WEK-101) -------------
+            //
+            // Consumed by `try_apply_new_project_field` BEFORE the
+            // modal short-circuit. Reaching here means no NewProject
+            // modal was open (the user mashed a path key while the
+            // sidebar had focus); silently drop so the key is a no-op.
+            AppMsg::NewProjectPathChar(_)
+            | AppMsg::NewProjectPathBackspace
+            | AppMsg::NewProjectCandidateNext
+            | AppMsg::NewProjectCandidatePrev
+            | AppMsg::NewProjectApplyCandidate => {}
         }
         AppOutcome::Continue
     }
@@ -971,6 +1145,58 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
         None
     }
 
+    /// Apply a [`Modal::NewProject`] field-edit message in place. Same
+    /// shape as [`Self::try_apply_new_session_field`] but for the
+    /// WEK-101 path-input modal: typing into the buffer, navigating the
+    /// candidate dropdown, applying a selection without confirming.
+    /// Returns `None` when the message was consumed; otherwise hands
+    /// the message back.
+    fn try_apply_new_project_field(&mut self, msg: AppMsg) -> Option<AppMsg> {
+        let draft = match &mut self.modal {
+            Some(Modal::NewProject(d)) => d,
+            _ => return Some(msg),
+        };
+        match msg {
+            AppMsg::NewProjectPathChar(c) => {
+                draft.push_char(c);
+            }
+            AppMsg::NewProjectPathBackspace => {
+                draft.pop_char();
+            }
+            AppMsg::NewProjectCandidateNext => {
+                draft.select_next();
+            }
+            AppMsg::NewProjectCandidatePrev => {
+                draft.select_prev();
+            }
+            AppMsg::NewProjectApplyCandidate => {
+                if !draft.apply_selected() {
+                    // Nothing highlighted — surface a subtle hint
+                    // instead of failing silently.
+                    draft.error = Some("no candidate highlighted".into());
+                }
+            }
+            other => return Some(other),
+        }
+        None
+    }
+
+    /// Stamp an error onto the open [`Modal::NewProject`] draft.
+    fn update_new_project_error(&mut self, why: String) {
+        if let Some(Modal::NewProject(ref mut d)) = self.modal {
+            d.error = Some(why);
+        }
+    }
+
+    fn on_new_project(&mut self) {
+        // Reachable from any sidebar context — including an empty
+        // workspace, which is precisely when the user needs this
+        // affordance most.
+        if matches!(self.tab, Tab::Sessions) {
+            self.modal = Some(Modal::NewProject(NewProjectDraft::new()));
+        }
+    }
+
     /// Stamp an error onto the open [`Modal::NewSession`] draft. Used
     /// by the Confirm path so a Validation refusal surfaces inside the
     /// modal AND (via the caller) on the status toast.
@@ -1100,6 +1326,57 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 }
             }
             (Modal::NewSession(_), AppMsg::Cancel) => {
+                self.modal = None;
+            }
+            (Modal::NewProject(draft), AppMsg::Confirm) => {
+                // Two-stage Enter: a highlighted candidate descends
+                // into it instead of confirming. Lets the user navigate
+                // the dropdown with Up/Down + Enter without an
+                // accidental Confirm sealing the choice halfway down a
+                // path.
+                if draft.selected_candidate().is_some() {
+                    if let Some(Modal::NewProject(ref mut d)) = self.modal {
+                        d.apply_selected();
+                    }
+                    return AppOutcome::Continue;
+                }
+                let path = draft.confirm_path();
+                if path.trim().is_empty() {
+                    let msg = "path is required".to_string();
+                    self.update_new_project_error(msg.clone());
+                    self.last_toast = Some(format!("new project: {msg}"));
+                    return AppOutcome::Continue;
+                }
+                if !draft.completion.resolved_exists_as_dir {
+                    let msg = format!(
+                        "{} does not exist (the modal does NOT create directories)",
+                        path
+                    );
+                    self.update_new_project_error(msg.clone());
+                    self.last_toast = Some(format!("new project: {msg}"));
+                    return AppOutcome::Continue;
+                }
+                match self.source.create_project(&path) {
+                    Ok(project_id) => {
+                        self.modal = None;
+                        self.refresh_sessions();
+                        // Pre-position the cursor onto the new group
+                        // so the next `n` (new session) keystroke
+                        // targets it without an extra navigation step.
+                        self.sidebar.select_project(project_id.as_str());
+                        self.last_toast = Some(format!("project added: {path}"));
+                    }
+                    Err(SourceError::Validation(why)) => {
+                        self.update_new_project_error(why.clone());
+                        self.last_toast = Some(format!("new project: {why}"));
+                    }
+                    Err(SourceError::Backend(why)) => {
+                        self.modal = None;
+                        self.last_toast = Some(format!("new project failed: {why}"));
+                    }
+                }
+            }
+            (Modal::NewProject(_), AppMsg::Cancel) => {
                 self.modal = None;
             }
             (Modal::ConfirmEnableCron { cron_id, .. }, AppMsg::Confirm) => {
@@ -2219,5 +2496,215 @@ mod tests {
             a.attached, before,
             "stray pump events must not mutate state"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // WEK-101: NewProject modal + Shift+N keybinding
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn shift_n_opens_new_project_modal_even_on_empty_workspace() {
+        // The acceptance is "the only path to seed the sidebar before
+        // any sessions exist" — verify the modal opens even when the
+        // mock has zero projects.
+        let mut a = App::new(MockSessionSource::new());
+        assert!(a.sidebar.groups().is_empty());
+        a.handle(AppMsg::NewProject);
+        assert!(matches!(a.modal, Some(Modal::NewProject(_))));
+    }
+
+    #[test]
+    fn new_project_draft_starts_with_a_starting_path_seed() {
+        // Default starting path is HOME (or cwd as fallback) followed
+        // by a separator so the dropdown immediately lists children.
+        let draft = NewProjectDraft::new();
+        assert!(
+            draft.path.ends_with('/') || draft.path.ends_with('\\'),
+            "starting path should end with a separator, got {:?}",
+            draft.path
+        );
+    }
+
+    #[test]
+    fn new_project_field_edits_route_through_helper_and_recompute_completion() {
+        // Setup: open the modal, then drive printable chars + Backspace
+        // through the field-edit dispatch and assert the path buffer
+        // matches.
+        let mut a = app();
+        a.handle(AppMsg::NewProject);
+        // Overwrite the seeded path with a deterministic value so the
+        // assertions don't depend on $HOME.
+        if let Some(Modal::NewProject(ref mut d)) = a.modal {
+            d.set_path(String::new());
+        }
+        a.handle(AppMsg::NewProjectPathChar('/'));
+        a.handle(AppMsg::NewProjectPathChar('t'));
+        a.handle(AppMsg::NewProjectPathChar('m'));
+        a.handle(AppMsg::NewProjectPathChar('p'));
+        if let Some(Modal::NewProject(ref d)) = a.modal {
+            assert_eq!(d.path, "/tmp");
+            // `/tmp` is conventionally a real dir on Unix CI runners; on
+            // the off-chance it isn't, just assert that the completion
+            // recomputed (resolved is set).
+            assert_eq!(d.completion.resolved, std::path::PathBuf::from("/tmp"));
+        } else {
+            panic!("modal was closed unexpectedly");
+        }
+        a.handle(AppMsg::NewProjectPathBackspace);
+        if let Some(Modal::NewProject(ref d)) = a.modal {
+            assert_eq!(d.path, "/tm");
+        } else {
+            panic!("modal was closed unexpectedly");
+        }
+    }
+
+    #[test]
+    fn new_project_confirm_rejects_nonexistent_path_and_keeps_modal_open() {
+        let mut a = app();
+        a.handle(AppMsg::NewProject);
+        if let Some(Modal::NewProject(ref mut d)) = a.modal {
+            d.set_path("/this/path/definitely/does/not/exist/abc".into());
+        }
+        a.handle(AppMsg::Confirm);
+        // Modal stays open so the user can fix the path.
+        let Some(Modal::NewProject(ref d)) = a.modal else {
+            panic!("modal closed; should still be open after invalid path");
+        };
+        assert!(
+            d.error
+                .as_deref()
+                .map(|e| e.contains("does not exist"))
+                .unwrap_or(false),
+            "expected does-not-exist error on draft, got {:?}",
+            d.error
+        );
+        assert!(a
+            .last_toast
+            .as_deref()
+            .map(|t| t.contains("does not exist"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn new_project_confirm_with_highlighted_candidate_descends_instead() {
+        // Two-stage Enter: when the dropdown has a highlighted match,
+        // Enter applies it to the path and stays open. Another Enter
+        // without a fresh highlight would actually create. This pins
+        // the muscle-memory expectation around Up/Down + Enter.
+        let td = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(td.path().join("alpha")).unwrap();
+        let base = format!("{}/", td.path().display());
+
+        let mut a = app();
+        a.handle(AppMsg::NewProject);
+        if let Some(Modal::NewProject(ref mut d)) = a.modal {
+            d.set_path(base.clone());
+        }
+        // Highlight the first candidate.
+        a.handle(AppMsg::NewProjectCandidateNext);
+        a.handle(AppMsg::Confirm);
+        let Some(Modal::NewProject(ref d)) = a.modal else {
+            panic!("modal closed; first Enter should have descended");
+        };
+        assert!(
+            d.path.ends_with("alpha/"),
+            "Enter on a highlighted match descends; path={:?}",
+            d.path
+        );
+    }
+
+    #[test]
+    fn new_project_confirm_creates_and_selects_the_new_group() {
+        // End-to-end: open modal, type a real path, Confirm. The source
+        // gets a create_project call, the sidebar refreshes, and the
+        // cursor lands on the new group so the next `n` targets it.
+        let td = tempfile::TempDir::new().unwrap();
+        let dir = td.path().to_path_buf();
+        let mut a = App::new(MockSessionSource::new());
+        a.handle(AppMsg::NewProject);
+        if let Some(Modal::NewProject(ref mut d)) = a.modal {
+            d.set_path(dir.display().to_string());
+        }
+        a.handle(AppMsg::Confirm);
+        assert!(a.modal.is_none(), "modal closes on successful create");
+        let snap = a.source().snapshot();
+        assert_eq!(snap.len(), 1, "new project surfaced in the snapshot");
+        assert_eq!(snap[0].root_path, dir.display().to_string());
+        // Sidebar cursor is on the new group's header so a follow-up
+        // `n` (new session) targets it without extra navigation.
+        match a.sidebar.selection() {
+            Selection::Group { project_id } => {
+                assert_eq!(project_id, snap[0].project_id);
+            }
+            other => panic!("expected sidebar cursor on new group header, got {other:?}"),
+        }
+        // The toast tells the user what happened.
+        assert!(a
+            .last_toast
+            .as_deref()
+            .map(|t| t.starts_with("project added:"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn new_project_confirm_rejects_duplicate_path() {
+        let td = tempfile::TempDir::new().unwrap();
+        let dir = td.path().display().to_string();
+        let mut a = App::new(MockSessionSource::new());
+        // First create: succeeds.
+        a.handle(AppMsg::NewProject);
+        if let Some(Modal::NewProject(ref mut d)) = a.modal {
+            d.set_path(dir.clone());
+        }
+        a.handle(AppMsg::Confirm);
+        assert!(a.modal.is_none());
+        // Second create on the same path: validation refusal, modal
+        // stays open with the error stamped on the draft.
+        a.handle(AppMsg::NewProject);
+        if let Some(Modal::NewProject(ref mut d)) = a.modal {
+            d.set_path(dir.clone());
+        }
+        a.handle(AppMsg::Confirm);
+        let Some(Modal::NewProject(ref d)) = a.modal else {
+            panic!("modal closed; duplicate must surface as Validation");
+        };
+        assert!(
+            d.error
+                .as_deref()
+                .map(|e| e.contains("already exists"))
+                .unwrap_or(false),
+            "expected duplicate error, got {:?}",
+            d.error
+        );
+    }
+
+    #[test]
+    fn new_project_escape_cancels_modal_without_calling_source() {
+        let mut a = App::new(MockSessionSource::new());
+        a.handle(AppMsg::NewProject);
+        a.handle(AppMsg::Cancel);
+        assert!(a.modal.is_none());
+        assert!(
+            a.sidebar.groups().is_empty(),
+            "Esc must NOT create anything"
+        );
+    }
+
+    #[test]
+    fn new_project_draft_candidate_cycle_wraps() {
+        let mut d = NewProjectDraft::new();
+        // Fabricate a candidate list — the modal would normally fill
+        // this via `complete()` after a keystroke; tests don't need a
+        // real filesystem to exercise the cursor logic.
+        d.completion.candidates = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(d.selected, None);
+        d.select_next();
+        assert_eq!(d.selected, Some(0));
+        d.select_next();
+        d.select_next();
+        d.select_next(); // wraps
+        assert_eq!(d.selected, Some(0));
+        d.select_prev(); // wraps back
+        assert_eq!(d.selected, Some(2));
     }
 }

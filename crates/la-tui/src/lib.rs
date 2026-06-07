@@ -63,6 +63,7 @@ pub mod input;
 pub mod key_hints;
 pub mod model;
 pub mod notif_sub;
+pub mod path_complete;
 pub mod runner;
 pub mod sidebar;
 pub mod source;
@@ -85,7 +86,9 @@ pub use diff_view::{
 };
 pub use model::{Backend, BackendBadge, ProjectGroup, RunState, SessionRow};
 pub use notif_sub::{HealthEvent, HealthSnapshot, NotifEvent};
-pub use source::{MockSessionSource, NewSessionRequest, SessionId, SessionSource, SourceError};
+pub use source::{
+    MockSessionSource, NewSessionRequest, ProjectId, SessionId, SessionSource, SourceError,
+};
 pub use status::{CronPulse, Status};
 pub use theme::{Accent, KeyHintsMode, Palette, Theme};
 pub use transcript::{ScrollAction, Transcript, TranscriptView};

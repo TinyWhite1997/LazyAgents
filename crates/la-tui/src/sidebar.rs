@@ -277,6 +277,25 @@ impl SidebarState {
         self.selection()
     }
 
+    /// Move the cursor onto the group header for the given project id.
+    /// Returns the new [`Selection`] (or `Selection::Empty` when no
+    /// such group exists in the current snapshot). Used by the
+    /// New-project modal (WEK-101) to pre-position the sidebar onto a
+    /// freshly registered project so the user's next `n` keystroke
+    /// targets it without an extra navigation step.
+    pub fn select_project(&mut self, project_id: &str) -> Selection {
+        if let Some(gi) = self.groups.iter().position(|g| g.project_id == project_id) {
+            if let Some(idx) = self
+                .items
+                .iter()
+                .position(|it| matches!(it, Item::GroupHeader { group_index: g } if *g == gi))
+            {
+                self.cursor = Some(idx);
+            }
+        }
+        self.selection()
+    }
+
     // ---- helpers ----------------------------------------------------
 
     /// Rebuild [`items`] from the current `groups` snapshot. Called whenever

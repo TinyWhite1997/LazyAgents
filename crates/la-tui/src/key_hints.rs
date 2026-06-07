@@ -147,6 +147,10 @@ impl HintRegistry {
             if matches!(selection, Selection::Session { .. }) {
                 out.push(Hint::new("n", "new", Importance::Medium));
             }
+            // WEK-101: `N` (Shift+N) opens the New-project modal. Always
+            // valid on the Sessions sidebar — including the empty
+            // workspace where it's the only way to seed a first project.
+            out.push(Hint::new("N", "new project", Importance::Medium));
         }
 
         // Globals visible in any focus on the Sessions tab.
@@ -173,6 +177,14 @@ impl HintRegistry {
                 Hint::new("Esc", "cancel", Importance::High),
                 Hint::new("←/→", "backend", Importance::Medium),
                 Hint::new("Space", "worktree", Importance::Medium),
+            ],
+            Modal::NewProject(_) => vec![
+                // WEK-101: hint == real binding, verified by
+                // `every_advertised_modal_key_is_translatable`.
+                Hint::new("⏎", "create / descend", Importance::Primary),
+                Hint::new("Tab", "next match", Importance::High),
+                Hint::new("Esc", "cancel", Importance::High),
+                Hint::new("→", "apply match", Importance::Medium),
             ],
             Modal::ConfirmEnableCron { .. } => vec![
                 Hint::new("y", "enable cron", Importance::Primary),
@@ -488,6 +500,7 @@ mod tests {
                 "/p1".into(),
                 vec!["claude".into()],
             )),
+            Modal::NewProject(crate::app::NewProjectDraft::new()),
             Modal::ConfirmEnableCron {
                 cron_id: "c1".into(),
                 cron_name: "n".into(),
@@ -595,6 +608,7 @@ mod tests {
             "d" => Some(KeyCode::Char('d')),
             "a" => Some(KeyCode::Char('a')),
             "n" => Some(KeyCode::Char('n')),
+            "N" => Some(KeyCode::Char('N')),
             "h" => Some(KeyCode::Char('h')),
             "l" => Some(KeyCode::Char('l')),
             "q" => Some(KeyCode::Char('q')),

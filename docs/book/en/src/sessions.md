@@ -24,6 +24,32 @@ Transitions you'll see day-to-day:
 
 ## Create a session
 
+### Register a project first (Shift+N)
+
+The Sessions sidebar groups runs by their on-disk **project directory**. To seed a brand-new project (so a subsequent `n` has something to attach a session to), press **`Shift+N`** anywhere on the Sessions sidebar — including an empty workspace, which is the only way to bootstrap the very first project.
+
+The New-project modal takes one field: a directory path.
+
+- Default starting path is your home directory; edit it from there.
+- `~` at the start expands to `$HOME` (`%USERPROFILE%` on Windows).
+- Hidden directories (`.git`, `.cache`, …) are filtered from completions unless you explicitly start the prefix with `.`.
+- Only **directories** are listed — never regular files.
+- The modal does **not** create directories. If the path does not exist, the modal stays open with a clear error so you can fix it.
+
+Key map inside the modal:
+
+| Key | Action |
+|---|---|
+| any printable char | Append to the path buffer. `q`/`?`/digits/letters are all literal here. |
+| `Backspace` | Pop the last char from the buffer. |
+| `Tab` / `↓` | Highlight the next completion candidate. |
+| `Shift+Tab` / `↑` | Highlight the previous candidate. |
+| `→` | Apply the highlighted candidate to the path and stay open (descend). |
+| `Enter` | Two-stage: when a candidate is highlighted, descend into it; otherwise create the project. |
+| `Esc` | Cancel — no project is created. |
+
+On success the new (empty) project group lands at the top of the sidebar, the cursor is pre-positioned on its header, and the toast shows `project added: <path>`. The daemon's `projects` row is created lazily on your very first `sessions.create` against the same directory — the TUI keeps a local stub in the meantime so the sidebar reflects the new project immediately.
+
 ### From the TUI (v1 status)
 
 The Sessions tab in v1 ships the live navigation, sidebar, and modals — and the **New-session form is wired end-to-end**: pressing **`n`** on a project opens a modal that lets you pick a backend, type the initial prompt, and toggle the worktree flag, then **`Ctrl+Enter`** calls `sessions.create` on the daemon. The freshly minted session appears on the sidebar within the next ~2 s refresh tick.
