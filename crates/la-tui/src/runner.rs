@@ -1296,8 +1296,8 @@ fn centered(parent: Rect, width: u16, height: u16) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-/// Render the WEK-94 / A2 New-session modal: backend picker + prompt
-/// buffer + worktree toggle, all driven from
+/// Render the WEK-94 / A2 New-session modal: backend picker + worktree
+/// toggle, all driven from
 /// [`crate::app::NewSessionDraft`].
 #[allow(clippy::too_many_arguments)]
 fn render_new_session_modal(
@@ -1363,42 +1363,6 @@ fn render_new_session_modal(
         }
     }
     lines.push(Line::from(backend_spans));
-    lines.push(Line::from(""));
-
-    // --- Prompt block ---------------------------------------------------
-    let prompt_focus = matches!(draft.field, NewSessionField::Prompt);
-    let prompt_label_style = if prompt_focus {
-        Style::default().fg(primary).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(muted)
-    };
-    lines.push(Line::from(vec![Span::styled(
-        "Prompt   ",
-        prompt_label_style,
-    )]));
-    if draft.prompt.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (type the prompt sent to the agent on start — Enter inserts a newline)",
-            Style::default().fg(muted).add_modifier(Modifier::DIM),
-        )));
-    } else {
-        for raw in draft.prompt.split('\n') {
-            lines.push(Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(raw.to_string(), Style::default().fg(body)),
-            ]));
-        }
-    }
-    if prompt_focus {
-        // Cursor caret so the user sees where their next char lands.
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "▌",
-                Style::default().fg(primary).add_modifier(Modifier::BOLD),
-            ),
-        ]));
-    }
     lines.push(Line::from(""));
 
     // --- Worktree toggle ------------------------------------------------
