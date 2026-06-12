@@ -129,11 +129,14 @@ impl BackendHealthEntry {
 
 /// Returns true when the cached probe state means `sessions.create` for
 /// this backend should be refused before we ever touch the adapter.
+///
+/// Only a missing executable is truly blocking. `Unauthenticated` is *not*
+/// — the agent CLIs (Codex, Claude, OpenCode) can run against an API key
+/// instead of an interactive login, so refusing the spawn would wrongly
+/// gate a usable backend. Let the spawn proceed and surface any real auth
+/// failure from the child itself.
 pub fn is_blocking(probe: &ProbeResult) -> bool {
-    matches!(
-        probe,
-        ProbeResult::NotInstalled { .. } | ProbeResult::Unauthenticated { .. }
-    )
+    matches!(probe, ProbeResult::NotInstalled { .. })
 }
 
 /// Returns true when a generic [`ProbeResult::Error`] detail self-
@@ -554,11 +557,12 @@ mod tests {
     }
 
     #[test]
-    fn is_blocking_only_for_install_and_auth_states() {
+    fn is_blocking_only_for_install_state() {
         assert!(is_blocking(&ProbeResult::NotInstalled {
             hint: "n/a".into()
         }));
-        assert!(is_blocking(&ProbeResult::Unauthenticated {
+        // Unauthenticated is NOT blocking — the CLI can run via API key.
+        assert!(!is_blocking(&ProbeResult::Unauthenticated {
             docs_url: "n/a".into()
         }));
         assert!(!is_blocking(&ProbeResult::Available {

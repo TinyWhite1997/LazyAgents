@@ -780,12 +780,12 @@ async fn handle_sessions_create(
     })?;
 
     // WEK-29 pre-flight: if the latest cached probe says the backend
-    // isn't installed or the user isn't authenticated, fail fast with
-    // the right business code instead of letting the spawn explode with
-    // a generic `AdapterSpawnFailed`. The TUI uses these codes to keep
-    // its sidebar entry grey-stated rather than offering a `create`
-    // entry point — so the dispatcher must not silently flip to "kind
-    // of okay" when health says otherwise.
+    // isn't installed, fail fast with the right business code instead of
+    // letting the spawn explode with a generic `AdapterSpawnFailed`. The
+    // TUI uses this code to hide the backend rather than offering a
+    // `create` entry point. Unauthenticated backends are intentionally
+    // *not* blocked here — they can run against an API key, so we let the
+    // spawn proceed and surface any real auth failure from the child.
     if let Some(probe) = ctx.health.probe_for(&params.backend).await {
         if crate::health::is_blocking(&probe) {
             return Err(probe_to_rpc(&params.backend, &probe));

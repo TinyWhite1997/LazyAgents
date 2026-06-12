@@ -55,13 +55,13 @@ sqlite3 "$XDG_DATA_HOME/lazyagents/lad.sqlite" 'SELECT * FROM _sqlx_migrations;'
 
 ### `unauthenticated; see <docs_url>`
 
-后端 CLI 没登录。直接跑 CLI 验证：
+后端 CLI 因为没有可用凭据拒绝了 spawn。要么登录，要么在 daemon 环境里提供 API key（例如 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`）。登录可直接跑 CLI：
 
 - `claude` → `claude login`
 - `codex` → `codex login`
 - `opencode` → `opencode auth login`
 
-然后重建会话。见[适配器 → 当 adapter 说 "unauthenticated"](adapters.md#当-adapter-说-unauthenticated)。
+然后重建会话。注意：侧栏里单纯的 "not logged in" 提示**不会**阻止创建（CLI 可能仍有 API key）；只有 CLI 在 spawn 时自己拒绝才会出现这个错误。见[适配器 → 当 adapter 说 "unauthenticated"](adapters.md#当-adapter-说-unauthenticated)。
 
 ### spawn 时 `command not found`
 

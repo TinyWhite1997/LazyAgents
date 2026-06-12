@@ -43,6 +43,8 @@ If a needle matches, the probe returns `Unauthenticated { docs_url }`. The TUI s
 
 After you re-authenticate in your terminal, the daemon's next probe will see it. There's no LazyAgents-side cache to invalidate.
 
+**`Unauthenticated` does not block a new session.** Interactive login is only one way to authenticate — the CLIs also accept an API key (e.g. `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` in the daemon's environment). Because LazyAgents can't tell from the probe whether an API key is configured, it lets `sessions.create` proceed and lets the CLI itself decide. The backend stays selectable in the new-session picker; it just carries a "not logged in" hint. Only `NotInstalled` backends are refused outright — and those are hidden from the TUI sidebar entirely, since an absent CLI isn't actionable.
+
 The probe is **conservative**: only an explicit "no credentials" / "not logged in" keyword classifies as unauthenticated. A non-zero exit code without a keyword stays `Available`, because some CLIs return non-zero for unrelated reasons (network blip, container issues) and we don't want to falsely tell you to log in again.
 
 ## Session discovery (`adapters.discover`)

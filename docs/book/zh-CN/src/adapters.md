@@ -43,6 +43,8 @@ adapter 是纯代码：不持有 PTY、不写 SQLite、不碰 IPC。所以容易
 
 在终端重新登录后，daemon 的下次探测就会看到。LazyAgents 这边没有缓存需要清。
 
+**`Unauthenticated` 不会阻止创建会话。** 交互式登录只是鉴权方式之一——这些 CLI 也接受 API key（例如在 daemon 环境里设置 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`）。由于探测无法判断是否配置了 API key，LazyAgents 会放行 `sessions.create`，把判断交给 CLI 本身。该后端仍然可以在新建会话选择器里选中，只是带一个 "not logged in" 提示。只有 `NotInstalled` 的后端会被直接拒绝——而且这类后端会被完全从 TUI 侧栏隐藏，因为未安装的 CLI 没有可操作性。
+
 探测是**保守**的：只有显式的 "no credentials" / "not logged in" 关键词才会被判为未鉴权。非零退出但没匹配到关键词仍然算 `Available`，因为有些 CLI 在与鉴权无关的原因（网络抖动、容器问题）下也返回非零，我们不想错误地让你再去登录一遍。
 
 ## 会话发现（`adapters.discover`）

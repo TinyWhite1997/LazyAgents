@@ -35,8 +35,8 @@ use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request};
 use la_proto::methods::{EventTopic, EventsSubscribeParams};
 use la_proto::notifications::{
-    BackendHealth as WireBackendHealth, CronFired, CronFiredParams, DaemonHealth,
-    DaemonHealthParams, NotificationMethod,
+    BackendHealth as WireBackendHealth, BackendHealthStatus, CronFired, CronFiredParams,
+    DaemonHealth, DaemonHealthParams, NotificationMethod,
 };
 
 use crate::BackendBadge;
@@ -270,17 +270,24 @@ async fn run_once(
     }
 }
 
+/// Build sidebar badges from the daemon health snapshot.
+///
+/// Backends the user hasn't installed are dropped entirely — an absent
+/// agent is noise, not actionable state, so the sidebar only ever shows
+/// agents that actually exist on this machine.
 fn wire_to_badges(wire: &[WireBackendHealth]) -> Vec<BackendBadge> {
-    wire.iter().map(BackendBadge::from_wire).collect()
+    wire.iter()
+        .filter(|w| w.status != BackendHealthStatus::NotInstalled)
+        .map(BackendBadge::from_wire)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use la_proto::notifications::BackendHealthStatus;
 
     #[test]
-    fn wire_to_badges_preserves_order_and_fields() {
+    fn wire_to_badges_preserves_order_and_drops_not_installed() {
         let wire = vec![
             WireBackendHealth {
                 id: "claude".into(),
@@ -294,6 +301,15 @@ mod tests {
             WireBackendHealth {
                 id: "codex".into(),
                 display_name: "Codex CLI".into(),
+                status: BackendHealthStatus::Unauthenticated,
+                version: None,
+                reason: Some("not logged in".into()),
+                docs_url: Some("https://example.com/login".into()),
+                last_probed_at: "2026-06-02T00:00:00Z".into(),
+            },
+            WireBackendHealth {
+                id: "opencode".into(),
+                display_name: "OpenCode".into(),
                 status: BackendHealthStatus::NotInstalled,
                 version: None,
                 reason: Some("not on PATH".into()),
@@ -302,15 +318,12 @@ mod tests {
             },
         ];
         let badges = wire_to_badges(&wire);
+        // NotInstalled is dropped entirely; the rest keep their order.
         assert_eq!(badges.len(), 2);
         assert_eq!(badges[0].id, "claude");
         assert_eq!(badges[0].status, BackendHealthStatus::Available);
         assert_eq!(badges[1].id, "codex");
-        assert_eq!(badges[1].status, BackendHealthStatus::NotInstalled);
-        assert_eq!(badges[1].reason.as_deref(), Some("not on PATH"));
-        assert_eq!(
-            badges[1].docs_url.as_deref(),
-            Some("https://example.com/install")
-        );
+        assert_eq!(badges[1].status, BackendHealthStatus::Unauthenticated);
+        assert!(badges.iter().all(|b| b.id != "opencode"));
     }
 }
