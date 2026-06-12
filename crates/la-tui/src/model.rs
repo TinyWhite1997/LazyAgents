@@ -48,8 +48,11 @@ impl Backend {
     }
 }
 
-/// Run-state glyph for the sidebar (PRD §5.3: `●` running / `○` idle /
-/// `⏸` waiting input / `✗` errored).
+/// Run-state glyph + colour bucket for the sidebar.
+///
+/// Glyphs: `●` running / `○` idle / `⏸` waiting input / `✗` errored /
+/// `·` exited. Colours follow the PRD §5.3 status palette: blue=running,
+/// green=complete (exited & waiting), grey=idle, red=errored.
 ///
 /// We compress the protocol's six states ([`SessionState`]) down to five
 /// presentation buckets (`Archived` is folded into the dedicated Archived

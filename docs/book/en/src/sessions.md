@@ -6,14 +6,14 @@ A **session** in LazyAgents is one PTY-backed run of a backend CLI (claude, code
 
 Every session is in one of six states:
 
-| State | Meaning | Glyph in TUI |
-|---|---|---|
-| `starting` | PTY spawned, no output yet. Promoted to `running` automatically after 250 ms of silence or the first output byte. | `●` |
-| `running` | Receiving or sending output. | `●` |
-| `waiting` | More than 2 seconds since the last PTY byte; the backend is idle, waiting for you. Only sessions whose stdin is the PTY (interactive) can enter this state. | `⏸` |
-| `exited` | Child process is gone. The transcript is preserved. | `·` |
-| `errored` | Reserved for adapter-level failures. Not currently emitted. | `✗` |
-| `archived` | Soft-deleted. Hidden from `sessions.list` unless you ask for it. | (in the Archived bucket) |
+| State | Meaning | Glyph in TUI | Colour in sidebar |
+|---|---|---|---|
+| `starting` | PTY spawned, no output yet. Promoted to `running` automatically after 250 ms of silence or the first output byte. | `●` | blue |
+| `running` | Receiving or sending output. | `●` | blue |
+| `waiting` | More than 2 seconds since the last PTY byte; the backend is idle, waiting for you. Only sessions whose stdin is the PTY (interactive) can enter this state. | `⏸` | green |
+| `exited` | Child process is gone. The transcript is preserved. | `·` | green |
+| `errored` | Reserved for adapter-level failures. Not currently emitted. | `✗` | red |
+| `archived` | Soft-deleted. Hidden from `sessions.list` unless you ask for it. | (in the Archived bucket) | — |
 
 Transitions you'll see day-to-day:
 
