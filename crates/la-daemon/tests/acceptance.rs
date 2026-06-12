@@ -2348,41 +2348,55 @@ async fn sessions_create_refuses_uninstalled_backend_with_business_code() {
     let _ = timeout(Duration::from_secs(15), daemon.join).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn sessions_create_refuses_unauthenticated_backend_with_business_code() {
+async fn sessions_create_allows_unauthenticated_backend() {
+    // An `Unauthenticated` probe is a hint, not a block: the CLI may run
+    // against an API key, so `sessions.create` must proceed and let the
+    // child decide. We model that with a shell adapter that reports
+    // Unauthenticated from probe() but still spawns normally.
+    struct UnauthShellAdapter(ShellAdapter);
+    #[async_trait]
+    impl AgentAdapter for UnauthShellAdapter {
+        fn descriptor(&self) -> AdapterDescriptor {
+            self.0.descriptor()
+        }
+        async fn probe(&self) -> ProbeResult {
+            ProbeResult::Unauthenticated {
+                docs_url: "https://example.com/login".into(),
+            }
+        }
+        fn spawn_spec(&self, req: &SpawnRequest) -> Result<SpawnSpec, la_adapter::AdapterError> {
+            self.0.spawn_spec(req)
+        }
+        fn encode_user_input(&self, text: &str) -> Bytes {
+            self.0.encode_user_input(text)
+        }
+    }
+
     let project = tempfile::tempdir().expect("project tmp");
     let mut adapters: HashMap<String, Arc<dyn AgentAdapter>> = HashMap::new();
     adapters.insert(
-        "opencode".to_string(),
-        Arc::new(ProbeOnlyAdapter {
-            id: "opencode",
-            probe_result: la_adapter::ProbeResult::Unauthenticated {
-                docs_url: "https://example.com/login".into(),
-            },
-        }),
+        "shtest".to_string(),
+        Arc::new(UnauthShellAdapter(ShellAdapter {
+            script: "echo ok; sleep 0.1".to_string(),
+        })),
     );
     let daemon = bootstrap_daemon_with_adapters(adapters).await;
     let mut conn = client(&daemon.socket).await;
 
-    let bad = SessionsCreateParams {
+    let params = SessionsCreateParams {
         project_dir: project.path().to_string_lossy().to_string(),
-        backend: "opencode".to_string(),
+        backend: "shtest".to_string(),
         args: vec![],
         prompt: None,
         worktree: false,
     };
-    send_request(&mut conn, 9, "sessions.create", &bad).await;
-    let err = recv_error_for(&mut conn, 9).await;
-    assert_eq!(
-        err.code,
-        la_proto::error_codes::ADAPTER_UNAUTHENTICATED,
-        "wrong error code for an unauthenticated backend: got {err:?}",
-    );
-    assert!(
-        err.message.contains("login"),
-        "error message should surface the login doc link, got {:?}",
-        err.message
-    );
+    send_request(&mut conn, 9, "sessions.create", &params).await;
+    // The spawn succeeds despite the Unauthenticated probe — the
+    // pre-flight no longer short-circuits this state.
+    let _: SessionsCreateResult =
+        serde_json::from_value(recv_response_for(&mut conn, 9).await).expect("decode create");
 
     daemon.handle.shutdown();
     let _ = timeout(Duration::from_secs(15), daemon.join).await;

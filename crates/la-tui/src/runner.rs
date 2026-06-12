@@ -1511,7 +1511,7 @@ fn render_new_session_modal(
     // --- Hint row -------------------------------------------------------
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "[Tab] next field  [⇧Tab] prev  [Ctrl+⏎] create  [Esc] cancel",
+        "[Tab] next field  [⇧Tab] prev  [⏎] create  [Esc] cancel",
         Style::default().fg(warn).add_modifier(Modifier::DIM),
     )]));
 

@@ -264,12 +264,18 @@ impl BackendBadge {
         }
     }
 
-    /// `true` when the backend cannot accept a fresh `sessions.create`
-    /// because the CLI is missing or the user is not authenticated. The
-    /// sidebar uses this to dim the badge and the surrounding hint bar
-    /// suppresses the `n` (new session) entry for it.
+    /// `true` when the backend cannot accept a fresh `sessions.create`.
+    /// Only `NotInstalled` (and the genuinely broken `ProtocolDrift` /
+    /// `Error` states) qualify. `Unauthenticated` is *available* — the
+    /// CLI can run against an API key, so it stays offered in the
+    /// new-session picker and is not flagged as an error.
     pub fn is_unavailable(&self) -> bool {
-        !matches!(self.status, BackendHealthStatus::Available)
+        matches!(
+            self.status,
+            BackendHealthStatus::NotInstalled
+                | BackendHealthStatus::ProtocolDrift
+                | BackendHealthStatus::Error
+        )
     }
 
     /// Glyph shown next to the backend name. Each variant has its own
@@ -393,6 +399,24 @@ mod tests {
         assert!(!badge.is_unavailable());
         assert_eq!(badge.glyph(), "●");
         assert_eq!(badge.version.as_deref(), Some("2.1.158"));
+    }
+
+    #[test]
+    fn backend_badge_unauthenticated_is_available() {
+        // API-key mode means an unauthenticated CLI is still usable, so it
+        // must not be grey-stated / dropped from the new-session picker.
+        let badge = BackendBadge::from_wire(&WireBackendHealth {
+            id: "codex".into(),
+            display_name: "Codex CLI".into(),
+            status: BackendHealthStatus::Unauthenticated,
+            version: None,
+            reason: Some("not logged in".into()),
+            docs_url: Some("https://example.com/login".into()),
+            last_probed_at: "2026-06-02T00:00:00Z".into(),
+        });
+        assert!(!badge.is_unavailable());
+        assert_eq!(badge.glyph(), "◐");
+        assert_eq!(badge.status_label(), "not logged in");
     }
 
     #[test]
