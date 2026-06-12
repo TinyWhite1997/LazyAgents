@@ -129,6 +129,30 @@ impl PtyWriter {
     }
 }
 
+/// Cloneable handle that can resize the PTY master independently of the
+/// [`PtyChild`] / [`ChildWaiter`] that owns the process.
+///
+/// The daemon hands one of these to the session manager so a
+/// `sessions.resize` RPC can re-size the window without reaching into the
+/// output pump that owns the `ChildWaiter`. The master is behind the same
+/// `Arc<Mutex<>>` as every other resize path, so concurrent resize / wait
+/// is safe.
+#[derive(Clone)]
+pub struct PtyResizer {
+    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+}
+
+impl PtyResizer {
+    /// Resize the PTY; safe to call from any thread.
+    pub fn resize(&self, size: PtySize) -> Result<(), PtyError> {
+        self.master
+            .lock()
+            .expect("master mutex poisoned")
+            .resize(size.into())
+            .map_err(|e| PtyError::Resize(e.to_string()))
+    }
+}
+
 /// A spawned child process attached to a PTY.
 ///
 /// Fields:
@@ -184,10 +208,14 @@ impl PtyChild {
     /// `Self::signal` — the daemon must use [`crate::send_signal`] with
     /// the pid returned in [`PtyChildParts::pid`].
     pub fn into_parts(self) -> PtyChildParts {
+        let resizer = PtyResizer {
+            master: self.master.clone(),
+        };
         PtyChildParts {
             pid: self.pid,
             reader: self.reader,
             writer: self.writer,
+            resizer,
             waiter: ChildWaiter {
                 master: self.master,
                 child: self.child,
@@ -202,6 +230,7 @@ pub struct PtyChildParts {
     pub pid: Option<u32>,
     pub reader: mpsc::Receiver<Bytes>,
     pub writer: PtyWriter,
+    pub resizer: PtyResizer,
     pub waiter: ChildWaiter,
 }
 

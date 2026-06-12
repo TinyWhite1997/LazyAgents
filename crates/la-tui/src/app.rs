@@ -627,7 +627,7 @@ pub enum AppMsg {
     /// failure). The App clears `attached` and returns focus to the
     /// sidebar.
     AttachClosed,
-    /// User asked to detach (Ctrl+B then `d`, see runner). Clears the
+    /// User asked to detach (`Ctrl+\`, see runner). Clears the
     /// attach state on the App; the runner emits the actual `detach`
     /// command on the pump.
     Detach,
