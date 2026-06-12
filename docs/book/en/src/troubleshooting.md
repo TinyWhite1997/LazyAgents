@@ -55,13 +55,13 @@ If you've intentionally rolled back to an older `lad`, you need to roll back the
 
 ### `unauthenticated; see <docs_url>`
 
-Your backend CLI is not logged in. Run the CLI directly to confirm:
+The backend CLI rejected the spawn because it has no usable credentials. Either log in, or provide an API key in the daemon's environment (e.g. `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`). To log in, run the CLI directly:
 
 - `claude` → `claude login`
 - `codex` → `codex login`
 - `opencode` → `opencode auth login`
 
-Then re-create the session. See [Adapters → When the adapter says "unauthenticated"](adapters.md#when-the-adapter-says-unauthenticated).
+Then re-create the session. A "not logged in" hint in the sidebar alone does **not** block creation (the CLI may still have an API key); this error only appears when the CLI itself refuses at spawn time. See [Adapters → When the adapter says "unauthenticated"](adapters.md#when-the-adapter-says-unauthenticated).
 
 ### `command not found` on spawn
 

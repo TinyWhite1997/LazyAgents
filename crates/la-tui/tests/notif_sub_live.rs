@@ -103,15 +103,28 @@ fn health_push() -> Message {
         queue_depth: 0,
         running: 3,
         errors_last_5m: 1,
-        backends: vec![BackendHealth {
-            id: "codex".into(),
-            display_name: "Codex CLI".into(),
-            status: BackendHealthStatus::NotInstalled,
-            version: None,
-            reason: Some("not on PATH".into()),
-            docs_url: Some("https://example.com/install".into()),
-            last_probed_at: "2026-06-02T00:00:00Z".into(),
-        }],
+        backends: vec![
+            BackendHealth {
+                id: "codex".into(),
+                display_name: "Codex CLI".into(),
+                status: BackendHealthStatus::Available,
+                version: Some("1.2.3".into()),
+                reason: None,
+                docs_url: None,
+                last_probed_at: "2026-06-02T00:00:00Z".into(),
+            },
+            // NotInstalled backends are dropped by the badge projection —
+            // this one must not reach the runner channel.
+            BackendHealth {
+                id: "opencode".into(),
+                display_name: "OpenCode".into(),
+                status: BackendHealthStatus::NotInstalled,
+                version: None,
+                reason: Some("not on PATH".into()),
+                docs_url: Some("https://example.com/install".into()),
+                last_probed_at: "2026-06-02T00:00:00Z".into(),
+            },
+        ],
         managed_by: None,
     };
     Message::Notification(Notification::new(DaemonHealth::NAME, &payload).expect("encode health"))
