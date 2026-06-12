@@ -21,7 +21,7 @@ use crossterm::terminal::{
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -583,7 +583,23 @@ pub fn draw<S: SessionSource, C: CronSource>(
     // (status spans only) and appends a single hint span trail. This
     // reclaims one full vertical line, which on small terminals is
     // what makes the conversation pane usable.
-    let palette = Palette::for_theme(app.ui_prefs.theme);
+    let palette = app.theme_catalog.palette(&app.ui_prefs.theme);
+    // Multi-theme: named themes paint a full canvas. When the palette
+    // supplies a concrete background (anything but `Color::Reset`), fill
+    // the whole frame first so untouched cells take the theme's bg + body
+    // fg. Widgets that set their own bg still win. `auto` keeps
+    // `bg = Reset` and skips the fill, preserving the terminal canvas.
+    let canvas_bg = palette.bg();
+    if canvas_bg != Color::Reset {
+        frame.render_widget(
+            Block::default().style(
+                Style::default()
+                    .bg(canvas_bg)
+                    .fg(palette.color(Accent::Body)),
+            ),
+            size,
+        );
+    }
     let key_hints_mode = app.ui_prefs.key_hints;
     let compact = app.ui_prefs.compact;
     let show_hints_row =
@@ -754,6 +770,7 @@ pub fn draw<S: SessionSource, C: CronSource>(
             app.tab,
             app.focus,
             &palette,
+            &app.theme_catalog,
         );
     }
 
@@ -1113,6 +1130,7 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_modal(
     frame: &mut Frame<'_>,
     full: Rect,
@@ -1121,6 +1139,7 @@ fn render_modal(
     tab: Tab,
     focus: Focus,
     palette: &Palette,
+    catalog: &crate::theme::ThemeCatalog,
 ) {
     let primary = palette.color(Accent::Primary);
     let warn = palette.color(Accent::Warn);
@@ -1299,7 +1318,85 @@ fn render_modal(
                 .wrap(Wrap { trim: false });
             frame.render_widget(para, area);
         }
+        Modal::ThemePicker(draft) => {
+            render_theme_picker(frame, full, draft, catalog, palette);
+        }
     }
+}
+
+/// Render the multi-theme picker: a scrollable list of theme labels with
+/// the highlighted row reversed, plus a swatch row that previews the
+/// highlighted theme's accent colours. The whole UI is already painted in
+/// the previewed theme (the App swaps `ui_prefs.theme` on each move), so
+/// this modal just adds the selection chrome.
+fn render_theme_picker(
+    frame: &mut Frame<'_>,
+    full: Rect,
+    draft: &crate::app::ThemePickerDraft,
+    catalog: &crate::theme::ThemeCatalog,
+    palette: &Palette,
+) {
+    let primary = palette.color(Accent::Primary);
+    let muted = palette.color(Accent::Muted);
+    let body = palette.color(Accent::Body);
+
+    // Height: header + list (capped) + swatch + footer, all inside borders.
+    let visible_rows = (draft.ids.len() as u16).clamp(1, 12);
+    let height = (visible_rows + 6).min(full.height.saturating_sub(2));
+    let area = centered(full, 52, height);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Theme — ↑/↓ preview, ⏎ apply, Esc cancel")
+        .border_style(Style::default().fg(primary));
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    frame.render_widget(block, area);
+
+    // Scroll the list so the highlight stays visible in a tall catalog.
+    let list_h = inner.height.saturating_sub(2) as usize; // reserve swatch + footer
+    let list_h = list_h.max(1);
+    let start = draft
+        .idx
+        .saturating_sub(list_h.saturating_sub(1))
+        .min(draft.ids.len().saturating_sub(list_h).min(draft.ids.len()));
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for (i, id) in draft.ids.iter().enumerate().skip(start).take(list_h) {
+        let label = catalog.label_for(id);
+        let selected = i == draft.idx;
+        let style = if selected {
+            Style::default().fg(body).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(body)
+        };
+        let marker = if selected { "▸ " } else { "  " };
+        lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+    }
+
+    // Swatch row: chips coloured by the highlighted theme's palette so a
+    // colour-blind-unfriendly accent set is visible before applying.
+    if let Some(id) = draft.current_id() {
+        let pal = catalog.palette(id);
+        let chip = |slot: Accent| Span::styled("  ", Style::default().bg(pal.color(slot)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("preview ", Style::default().fg(muted)),
+            chip(Accent::Primary),
+            Span::raw(" "),
+            chip(Accent::Ok),
+            Span::raw(" "),
+            chip(Accent::Warn),
+            Span::raw(" "),
+            chip(Accent::Error),
+            Span::raw(" "),
+            chip(Accent::Body),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn centered(parent: Rect, width: u16, height: u16) -> Rect {

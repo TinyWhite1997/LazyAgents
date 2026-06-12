@@ -90,5 +90,5 @@ pub use source::{
 };
 pub use status::{CronPulse, Status};
 pub use term_grid::{ScrollAction, TermGrid, TermGridView};
-pub use theme::{Accent, KeyHintsMode, Palette, Theme};
+pub use theme::{Accent, KeyHintsMode, Palette, ThemeCatalog, ThemeSpec};
 pub use ui_prefs::UiPrefs;

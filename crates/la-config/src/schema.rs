@@ -272,12 +272,19 @@ pub struct OpencodeConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct UiConfig {
-    /// `auto | dark | light`.
+    /// Active theme **id**: a built-in (`auto`, `dark`, `light`,
+    /// `catppuccin-mocha`, `gruvbox-dark`, `nord`, `dracula`,
+    /// `tokyo-night`, `solarized-dark`, …) or a custom theme defined in
+    /// `custom_theme`.
     pub theme: String,
     /// `rich | compact | hidden`.
     pub key_hints: String,
     /// Compact transcript mode.
     pub compact: bool,
+    /// User-defined palettes, surfaced in the TUI theme picker. The
+    /// daemon does not consume these — it only validates them so a
+    /// TUI-written `config.toml` round-trips through `lad config check`.
+    pub custom_theme: Vec<CustomThemeConfig>,
 }
 
 impl Default for UiConfig {
@@ -286,6 +293,39 @@ impl Default for UiConfig {
             theme: "auto".to_string(),
             key_hints: "rich".to_string(),
             compact: false,
+            custom_theme: Vec::new(),
         }
     }
+}
+
+/// One `[[ui.custom_theme]]` entry — a user-defined palette. All colours
+/// are `#rrggbb` (or `rrggbb`) hex strings; `la-tui` parses them, the
+/// daemon only validates structure. `label` and `on_accent` are
+/// optional (label defaults to `id`, on_accent to `bg`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomThemeConfig {
+    /// Stable theme id — the value `[ui].theme` selects by, and the
+    /// override key against built-in ids.
+    pub id: String,
+    /// Display name in the picker. Defaults to `id` when omitted.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Window background canvas (`#rrggbb`).
+    pub bg: String,
+    /// Body / foreground text (`#rrggbb`).
+    pub fg: String,
+    /// Dim secondary text (`#rrggbb`).
+    pub muted: String,
+    /// Cursor / focus / primary accent (`#rrggbb`).
+    pub primary: String,
+    /// Success / running accent (`#rrggbb`).
+    pub ok: String,
+    /// Warning accent (`#rrggbb`).
+    pub warn: String,
+    /// Error accent (`#rrggbb`).
+    pub error: String,
+    /// Text drawn on a coloured chip. Defaults to `bg` when omitted.
+    #[serde(default)]
+    pub on_accent: Option<String>,
 }
