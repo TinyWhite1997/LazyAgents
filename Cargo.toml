@@ -200,6 +200,13 @@ la-pty = { path = "crates/la-pty" }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events", "event-stream", "windows"] }
 vte = "0.15"
+# Full VT100 grid emulator for the session-attach pane. Full-screen agent
+# TUIs (Claude Code / Codex / OpenCode) address a fixed cell grid via cursor
+# motion + alternate screen; a real emulator is required to render them
+# faithfully. Used only by la-tui's terminal widget. Pinned to 0.15 because
+# 0.16 requires unicode-width >=0.2.1, which collides with ratatui 0.29's
+# exact `=0.2.0` pin; 0.15 uses the independent unicode-width 0.1 major.
+vt100 = "0.15"
 unicode-width = "0.2"
 # WEK-42 / M4.3: read/write the `[ui]` section of
 # `$XDG_CONFIG_HOME/lazyagents/config.toml` from la-tui without dragging

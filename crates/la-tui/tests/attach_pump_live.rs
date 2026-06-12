@@ -255,8 +255,10 @@ async fn attach_forwards_output_and_typed_input() {
 
     assert!(stub.received_acquire_input, "pump did not request input");
     assert_eq!(
-        stub.received_resume_from_seq, None,
-        "first attach must omit the resume cursor"
+        stub.received_resume_from_seq,
+        Some(0),
+        "first attach must request a full ring replay (Some(0)) so a \
+         full-screen agent's already-painted UI shows immediately"
     );
     assert!(stub.detached, "pump did not call sessions.detach on stop");
     // Concatenate every byte the stub saw on its write channel and
@@ -350,8 +352,9 @@ async fn pump_reconnects_with_resume_cursor_after_daemon_drop() {
         .expect("server task");
 
     assert_eq!(
-        first.received_resume_from_seq, None,
-        "first attach must not pass resume cursor"
+        first.received_resume_from_seq,
+        Some(0),
+        "first attach must request a full ring replay (Some(0))"
     );
     assert_eq!(
         second.received_resume_from_seq,

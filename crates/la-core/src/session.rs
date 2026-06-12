@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use la_ipc::{OutputHub, SubId};
 use la_proto::methods::SessionState;
-use la_pty::{PtyWriter, Signal};
+use la_pty::{PtyResizer, PtyWriter, Signal};
 
 /// Stable identifier — for now the same UUID v7 string the storage row
 /// uses, exposed as its own type so future internal indices don't leak.
@@ -62,6 +62,10 @@ pub(crate) struct SessionRuntime {
     /// Closure that delivers a [`Signal`] to the live child. Boxed so
     /// `Session` doesn't expose the inner PTY type.
     pub(crate) signaller: SignalFn,
+    /// Cloneable handle that resizes the PTY master, fulfilling
+    /// `sessions.resize` without reaching into the output pump that owns
+    /// the `ChildWaiter`.
+    pub(crate) resizer: PtyResizer,
     /// Current lifecycle state, kept in sync with the storage row.
     pub(crate) state: SessionState,
     /// Last exit code observed, or `None` while still alive.

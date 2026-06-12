@@ -17,7 +17,11 @@ la-ipc = { path = "../la-ipc" }
 
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-vte = { workspace = true }
+# Full VT100 grid emulator for the session-attach pane: full-screen agent
+# TUIs draw on a cursor-addressed cell grid, so the conversation area runs a
+# real emulator (not a line-log model). Pure parser, no la-core/la-storage
+# reach-through — §2.1 dependency rule still holds.
+vt100 = { workspace = true }
 unicode-width = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }

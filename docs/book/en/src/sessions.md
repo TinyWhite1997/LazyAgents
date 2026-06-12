@@ -54,7 +54,7 @@ On success the new (empty) project group lands at the top of the sidebar, the cu
 
 The Sessions tab in v1 ships the live navigation, sidebar, and modals — and the **New-session form is wired end-to-end**: pressing **`n`** on a project opens a modal that lets you pick a backend and toggle the worktree flag, then **`Enter`** calls `sessions.create` on the daemon. The session is created with no initial prompt — you type your first instruction into the live agent after attaching. The freshly minted session appears on the sidebar within the next ~2 s refresh tick.
 
-**Live attach is wired:** highlighting a session row and pressing **`Enter`** opens a live PTY pane backed by `sessions.attach { acquire_input: true }`. The daemon streams `session.output` chunks straight into the transcript, and every keystroke you type goes back through `sessions.write`.
+**Live attach is wired:** highlighting a session row and pressing **`Enter`** opens a live PTY pane backed by `sessions.attach { acquire_input: true }`. The daemon streams `session.output` chunks into a VT100 grid emulator that renders the agent's full-screen TUI faithfully, and every keystroke you type goes back through `sessions.write`. The pane reports its size to the daemon with `sessions.resize` so the agent reflows to your window.
 
 The New-session modal field map:
 
@@ -96,12 +96,19 @@ Response includes the `session_id` (UUID v7), the resolved `cwd` (which is the w
 |---|---|
 | `j` / `k` / arrow keys | Move the cursor in the session list. |
 | `Enter` | Attach to the highlighted session (live PTY pane opens; daemon owns input). |
-| `Ctrl+B d` | Detach prefix → `d` leaves the attach and returns to the sidebar (the session keeps running on the daemon). `Ctrl+B Esc` and `Ctrl+B .` also work. |
-| `Ctrl+B Ctrl+B` | Send a literal `Ctrl+B` (0x02) into the PTY for agents that use it themselves. |
-| Any other key | Forwarded to the daemon as PTY input — including arrows, PgUp/PgDn, Home/End, function keys. There is no local scroll mode yet; the agent process owns the pane. |
+| `Ctrl+\` | Detach and return to the sidebar (the session keeps running on the daemon). |
+| Any other key | Forwarded verbatim to the daemon as PTY input — including arrows, PgUp/PgDn, Home/End, function keys, and Ctrl chords. The session pane is a full terminal emulator, so the agent process owns the pane and its own scrolling. |
 | `q` (in the sidebar) | Quit `la`. Sessions and the daemon stay alive. |
 
-**Detach vs quit:** `Ctrl+B d` releases your viewer; the daemon eagerly drops your `acquire_input` ownership via `sessions.detach`. Quitting `la` does the same plus shuts down the TUI process. Neither stops the session.
+The attach pane runs a real VT100 grid emulator: full-screen agent TUIs
+(Claude Code, Codex, OpenCode) render exactly as they would in a native
+terminal — cursor addressing, clear-screen, alternate screen, and colors
+are all honored. The pane is sized to your window and the daemon's PTY is
+resized to match (via `sessions.resize`) on attach and whenever you resize
+the terminal. Because every key except `Ctrl+\` is forwarded verbatim, a
+literal `Ctrl+\` (SIGQUIT) cannot be sent into the agent from the pane.
+
+**Detach vs quit:** `Ctrl+\` releases your viewer; the daemon eagerly drops your `acquire_input` ownership via `sessions.detach`. Quitting `la` does the same plus shuts down the TUI process. Neither stops the session.
 
 **Reattach:** when you re-open `la`, the daemon replays everything in its in-memory ring buffer (2 MiB per session) on attach so you catch up to "now". Output beyond that is in the persisted transcript (see below) but isn't streamed back automatically.
 

@@ -260,17 +260,13 @@ impl HintRegistry {
     }
 
     /// Hints surfaced while a session attach is live. The bottom bar
-    /// shows the detach prefix (Ctrl+B) — every other keystroke,
-    /// including PgUp/PgDn/Home/End/G, is forwarded to the daemon PTY
-    /// via `sessions.write`, so we deliberately do NOT advertise any
-    /// local-scroll keys here (the agent process may have its own
-    /// pager binding). Bringing in a local scroll mode is its own
-    /// follow-up (likely `Ctrl+B [` tmux-style copy mode).
+    /// shows the detach key (`Ctrl+\`) — every other keystroke,
+    /// including PgUp/PgDn/Home/End/G and Ctrl chords, is forwarded
+    /// verbatim to the daemon PTY via `sessions.write`, so we deliberately
+    /// do NOT advertise any local-scroll keys here: the pane is a full
+    /// terminal emulator and the agent owns its own scrolling.
     fn for_attach() -> Vec<Hint> {
-        let mut out = vec![
-            Hint::new("Ctrl+B d", "detach", Importance::Primary),
-            Hint::new("Ctrl+B Ctrl+B", "send literal Ctrl+B", Importance::Low),
-        ];
+        let mut out = vec![Hint::new("Ctrl+\\", "detach", Importance::Primary)];
         out.extend(Self::globals());
         out.sort_by_key(|h| std::cmp::Reverse(h.importance));
         out

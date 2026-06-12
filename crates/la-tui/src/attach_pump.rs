@@ -35,7 +35,7 @@ use la_ipc::{client_handshake, Connection};
 use la_proto::jsonrpc::{Message, Request, RequestId};
 use la_proto::methods::{
     Method, SessionsAttach, SessionsAttachParams, SessionsAttachResult, SessionsDetach,
-    SessionsDetachParams, SessionsWrite, SessionsWriteParams,
+    SessionsDetachParams, SessionsResize, SessionsResizeParams, SessionsWrite, SessionsWriteParams,
 };
 use la_proto::notifications::{
     NotificationMethod, SessionGap, SessionGapParams, SessionOutput, SessionOutputParams,
@@ -87,6 +87,10 @@ pub enum AttachEvent {
 pub enum AttachCommand {
     /// User typed bytes that should hit the PTY master via `sessions.write`.
     Write(Vec<u8>),
+    /// The attach pane was resized; reflow the remote PTY via
+    /// `sessions.resize` so the agent's full-screen layout matches the
+    /// client viewport.
+    Resize { rows: u16, cols: u16 },
     /// User asked to leave the attach. The pump emits a best-effort
     /// `sessions.detach` then closes.
     Detach,
@@ -144,6 +148,11 @@ impl AttachPump {
     /// Forward a chunk of bytes to the daemon.
     pub fn write(&self, bytes: Vec<u8>) {
         let _ = self.tx.send(AttachCommand::Write(bytes));
+    }
+
+    /// Report a new PTY window size to the daemon.
+    pub fn resize(&self, rows: u16, cols: u16) {
+        let _ = self.tx.send(AttachCommand::Resize { rows, cols });
     }
 }
 
@@ -234,9 +243,16 @@ async fn run_one(
     // continues where we left off instead of double-delivering bytes
     // (WEK-49 contract: `reattach_with_resume_from_seq_catches_up_without_double_delivery`).
     let attach_id: i64 = 1;
+    // On a fresh attach `resume_from` is `None`. We pass `Some(0)` instead
+    // of `None` so the daemon replays its full output ring (all chunks with
+    // `seq > 0`) rather than going live-only: a full-screen agent paints
+    // its UI once and then only repaints on change, so without the replay
+    // the grid stays blank until the user happens to trigger a redraw. On a
+    // reconnect `resume_from` is `Some(last_seq)` and we replay only the
+    // newer chunks (the WEK-49 no-double-delivery contract).
     let attach_params = SessionsAttachParams {
         session_id: session_id.to_string(),
-        resume_from_seq: resume_from,
+        resume_from_seq: Some(resume_from.unwrap_or(0)),
         replay_bytes: None,
         acquire_input: true,
     };
@@ -312,6 +328,20 @@ async fn run_one(
                     conn.send(&Message::Request(req))
                         .await
                         .map_err(|e| format!("send sessions.write: {e}"))?;
+                }
+                Ok(AttachCommand::Resize { rows, cols }) => {
+                    let params = SessionsResizeParams {
+                        session_id: session_id.to_string(),
+                        cols,
+                        rows,
+                    };
+                    let id = next_req_id;
+                    next_req_id += 1;
+                    let req = Request::new(id, SessionsResize::NAME, &params)
+                        .map_err(|e| format!("encode sessions.resize: {e}"))?;
+                    conn.send(&Message::Request(req))
+                        .await
+                        .map_err(|e| format!("send sessions.resize: {e}"))?;
                 }
                 Ok(AttachCommand::Detach) => {
                     let id = next_req_id;

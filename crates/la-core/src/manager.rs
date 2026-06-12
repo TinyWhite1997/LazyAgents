@@ -412,6 +412,7 @@ impl SessionManager {
             hub: hub.clone(),
             writer: parts.writer,
             signaller,
+            resizer: parts.resizer,
             state: SessionState::Starting,
             exit_code: None,
             writer_holder: None,
@@ -623,6 +624,22 @@ impl SessionManager {
         };
         let entry = runtime.read().await;
         (entry.signaller)(pty_sig)?;
+        Ok(())
+    }
+
+    /// Resize the session's PTY window. Forwarded straight to the live
+    /// master via the cloned [`la_pty::PtyResizer`] handle so a
+    /// `sessions.resize` RPC re-flows the agent's full-screen layout to
+    /// the attached client's viewport.
+    pub async fn resize(&self, id: &SessionId, cols: u16, rows: u16) -> CoreResult<()> {
+        let runtime = self.runtime(id).await?;
+        let entry = runtime.read().await;
+        entry.resizer.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         Ok(())
     }
 
