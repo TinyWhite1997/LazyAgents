@@ -127,7 +127,8 @@ fn event_loop<S: SessionSource, C: CronSource>(
     };
     // WEK-92-A3: per-session attach runtime. The App owns the *state*
     // (`app.attached`), the runner owns the *I/O* (pump thread,
-    // transcript buffer, Ctrl+B detach-prefix latch).
+    // transcript buffer). On detach (Ctrl+\) the pump is torn down but
+    // the transcript stays frozen until the user attaches elsewhere.
     let mut attach: Option<AttachRuntime> = None;
     // WEK-92-A4.1: last `SessionSource::refresh_generation()` value the
     // runner has surfaced as a `RefreshSessions` dispatch. The bg poll
@@ -228,7 +229,7 @@ fn event_loop<S: SessionSource, C: CronSource>(
         // While the transcript pane is focused, raw key events route to
         // the daemon's PTY via `sessions.write` — they do NOT go through
         // the App's normal modal/key translator. The exception is the
-        // detach prefix Ctrl+B (see `AttachRuntime::feed_key`).
+        // detach gesture Ctrl+\ (see `AttachRuntime::feed_key`).
         if app.focus == Focus::Transcript && app.modal.is_none() {
             if let (Some(rt), Event::Key(k)) = (attach.as_mut(), &ev) {
                 // Mirror the normal input translator's release-event
@@ -271,14 +272,17 @@ fn event_loop<S: SessionSource, C: CronSource>(
 }
 
 /// Per-attach runtime state owned by the runner. Holds the pump, the
-/// transcript ring + VTE parser, and the Ctrl+B detach-prefix latch.
+/// transcript ring + VTE parser, and the Ctrl+\ detach-prefix latch.
 pub struct AttachRuntime {
     pub session_id: String,
     pub pump: AttachPump,
     pub transcript: Transcript,
-    /// True after the user pressed Ctrl+B; the next keystroke is the
-    /// detach action (or `Ctrl+B` to send a literal Ctrl+B byte).
-    detach_armed: bool,
+    /// True once the user detached (Ctrl+\): the pump has been torn down
+    /// but the transcript stays alive so the right pane keeps showing
+    /// the last bytes the session printed. A frozen runtime is replaced
+    /// only when the user attaches into a different session (or
+    /// re-attaches into this one).
+    frozen: bool,
 }
 
 /// What the runner should do after a raw key event landed in the
@@ -295,37 +299,14 @@ enum KeyOutcome {
 
 impl AttachRuntime {
     /// Translate a key event into the right side effect:
-    ///   * Ctrl+B → arm detach prefix
-    ///   * Ctrl+B then `d` / `Esc` / `.` → detach
-    ///   * Ctrl+B then Ctrl+B → send a literal Ctrl+B byte
-    ///   * any other key → encode and forward to the daemon
+    ///   * Ctrl+\ → detach (freeze the pane, tear the pump down)
+    ///   * any other key → encode and forward to the daemon PTY
     fn feed_key(&mut self, k: KeyEvent) -> KeyOutcome {
-        // Detach prefix takes priority. We only arm on Ctrl+B (not on
-        // `Ctrl+b`'s lowercase shadow because crossterm normalizes both
-        // to KeyCode::Char('b') with CONTROL set).
-        if self.detach_armed {
-            self.detach_armed = false;
-            match k.code {
-                KeyCode::Char('d') | KeyCode::Esc | KeyCode::Char('.') => {
-                    return KeyOutcome::Detach;
-                }
-                KeyCode::Char('b') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // User asked for a literal Ctrl+B byte (0x02).
-                    self.pump.write(vec![0x02]);
-                    return KeyOutcome::Consumed;
-                }
-                _ => {
-                    // Any other key cancels the prefix and is dropped
-                    // (so an accidental Ctrl+B doesn't fire a stray
-                    // character into the agent).
-                    return KeyOutcome::Consumed;
-                }
-            }
-        }
-        if let KeyCode::Char('b') = k.code {
+        // Ctrl+\ is the detach gesture. crossterm reports it as
+        // `KeyCode::Char('\\')` with CONTROL set.
+        if let KeyCode::Char('\\') = k.code {
             if k.modifiers.contains(KeyModifiers::CONTROL) {
-                self.detach_armed = true;
-                return KeyOutcome::Consumed;
+                return KeyOutcome::Detach;
             }
         }
         let bytes = match encode_key(k) {
@@ -351,12 +332,13 @@ fn reconcile_attach<S: SessionSource, C: CronSource>(
                 session_id: att.session_id.clone(),
                 pump,
                 transcript: Transcript::default(),
-                detach_armed: false,
+                frozen: false,
             });
         }
         (Some(att), Some(rt)) if att.session_id != rt.session_id => {
-            // Session changed under the runner. Tear down the old pump
-            // and spawn a fresh one.
+            // Session changed under the runner (the user attached into a
+            // different session — including out of a frozen view). Tear
+            // down the old pump + transcript and spawn a fresh one.
             if let Some(old) = attach.take() {
                 old.pump.stop();
             }
@@ -366,14 +348,49 @@ fn reconcile_attach<S: SessionSource, C: CronSource>(
                     session_id: att.session_id.clone(),
                     pump,
                     transcript: Transcript::default(),
-                    detach_armed: false,
+                    frozen: false,
                 });
             }
         }
+        (Some(att), Some(rt)) => {
+            // Same session. Two transitions to reconcile:
+            match (matches!(att.status, AttachStatus::Detached), rt.frozen) {
+                (true, false) => {
+                    // User just detached (Ctrl+\). Stop the live pump but
+                    // KEEP the transcript so the right pane stays frozen
+                    // on the last bytes. We can't mutate through the
+                    // shared borrow above, so re-borrow mutably here.
+                    if let Some(rt) = attach.as_mut() {
+                        rt.pump.stop();
+                        rt.frozen = true;
+                    }
+                }
+                (false, true) => {
+                    // User re-attached into the same session from its
+                    // frozen view (on_enter flipped the status back to
+                    // Connecting). Replace the frozen runtime with a live
+                    // pump + fresh transcript.
+                    if let Some(old) = attach.take() {
+                        old.pump.stop();
+                    }
+                    if let Some(socket) = socket {
+                        let pump = AttachPump::spawn(socket, &att.session_id);
+                        *attach = Some(AttachRuntime {
+                            session_id: att.session_id.clone(),
+                            pump,
+                            transcript: Transcript::default(),
+                            frozen: false,
+                        });
+                    }
+                }
+                // (false, false) live attach, (true, true) already frozen
+                // — nothing to do.
+                _ => {}
+            }
+        }
         (None, Some(_)) => {
-            // App cleared the attach (user pressed Ctrl+B d, or the
-            // pump emitted Closed and the App ran the AttachClosed
-            // handler). Tell the pump to stop and drop it.
+            // App cleared the attach (an unsolicited pump close ran the
+            // AttachClosed handler). Tell the pump to stop and drop it.
             if let Some(old) = attach.take() {
                 old.pump.stop();
             }
@@ -833,6 +850,7 @@ fn render_attach_pane(
             input_acquired: false,
         } => ("connected · read-only", warn),
         AttachStatus::Disconnected { .. } => ("已断开", err),
+        AttachStatus::Detached => ("已退出 · 历史", muted),
     };
     // The reason / retry suffix is rendered as a second styled span on
     // the header line (see below). The border title stays terse so it
@@ -876,8 +894,13 @@ fn render_attach_pane(
         if let Some(extra) = detached_extra {
             spans.push(Span::styled(extra, Style::default().fg(muted)));
         }
+        let hint = if matches!(att.status, AttachStatus::Detached) {
+            "   ⏎ 重新进入"
+        } else {
+            "   Ctrl+\\ 退出"
+        };
         spans.push(Span::styled(
-            "   Ctrl+B d 退出",
+            hint,
             Style::default().fg(muted).add_modifier(Modifier::DIM),
         ));
         let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
@@ -1604,8 +1627,8 @@ mod tests {
             KeyCode::Char('a'),
             KeyModifiers::NONE
         )));
-        // The release of `Ctrl+b` is the worst-case offender — without
-        // the filter it would arm the detach prefix latch.
+        // The release of any key must be filtered; without the gate
+        // every typed character would double on the PTY.
         assert!(!is_transcript_press(&key(
             KeyEventKind::Release,
             KeyCode::Char('b'),

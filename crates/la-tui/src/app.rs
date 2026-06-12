@@ -379,6 +379,12 @@ pub enum AttachStatus {
         reason: String,
         will_reconnect: bool,
     },
+    /// The user detached (Ctrl+\). The live pump is torn down but the
+    /// last transcript stays frozen in the right pane so the user can
+    /// still read what the session printed. Focus returns to the
+    /// sidebar; the frozen view persists until the user attaches into a
+    /// different session.
+    Detached,
 }
 
 /// One live attach. Tracked on the App so the renderer + key router
@@ -907,11 +913,9 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 session_id,
                 project_id,
             } => {
-                if self
-                    .attached
-                    .as_ref()
-                    .is_some_and(|a| a.session_id == session_id)
-                {
+                if self.attached.as_ref().is_some_and(|a| {
+                    a.session_id == session_id && !matches!(a.status, AttachStatus::Detached)
+                }) {
                     return AppOutcome::Continue;
                 }
                 self.attached = Some(AttachedSession {
@@ -952,18 +956,34 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 }
             }
             AppMsg::AttachClosed => {
-                self.attached = None;
-                self.focus = Focus::Sidebar;
-            }
-            AppMsg::Detach => {
-                // The App clears its state immediately so the renderer
-                // returns to the sidebar on the next frame; the runner
-                // tears down the pump asynchronously after observing
-                // `attached == None`.
-                if self.attached.is_some() {
+                // A `Detached` view froze the pane deliberately and tore
+                // the pump down itself — the resulting `Closed` must NOT
+                // clear the frozen transcript. Only an unsolicited close
+                // (e.g. the second reconnect failure) clears the pane.
+                if !self
+                    .attached
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.status, AttachStatus::Detached))
+                {
                     self.attached = None;
                     self.focus = Focus::Sidebar;
-                    self.last_toast = Some("detached".into());
+                }
+            }
+            AppMsg::Detach => {
+                // The user detached (Ctrl+\). We keep `attached` set but
+                // flip it to `Detached` so the renderer freezes the last
+                // transcript in the right pane; the runner observes the
+                // `Detached` status and tears down the pump while keeping
+                // its transcript buffer alive. Focus returns to the
+                // sidebar so j/k navigation works again. The frozen view
+                // persists until the user attaches into a different
+                // session (see `on_enter`).
+                if let Some(att) = self.attached.as_mut() {
+                    if !matches!(att.status, AttachStatus::Detached) {
+                        att.status = AttachStatus::Detached;
+                        self.focus = Focus::Sidebar;
+                        self.last_toast = Some("detached".into());
+                    }
                 }
             }
 
@@ -1394,13 +1414,13 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             } => {
                 // WEK-92-A3: attach to the session. Record the intent on
                 // the App; the runner observes `attached = Some(Connecting)`
-                // and spawns the pump. We refuse re-entry into the same
-                // session (the pump would mis-acquire input).
-                if self
-                    .attached
-                    .as_ref()
-                    .is_some_and(|a| a.session_id == session_id)
-                {
+                // and spawns the pump. We refuse re-entry into a session
+                // we are *actively* attached to (the pump would
+                // mis-acquire input) — but a `Detached` frozen view of
+                // that same session re-attaches normally.
+                if self.attached.as_ref().is_some_and(|a| {
+                    a.session_id == session_id && !matches!(a.status, AttachStatus::Detached)
+                }) {
                     return;
                 }
                 self.attached = Some(AttachedSession {
@@ -2367,14 +2387,44 @@ mod tests {
     }
 
     #[test]
-    fn detach_msg_drops_state_immediately() {
+    fn detach_freezes_view_and_returns_focus_to_sidebar() {
         let mut a = app();
         let _ = navigate_to_first_session(&mut a);
         a.handle(AppMsg::Enter);
         a.handle(AppMsg::Detach);
-        assert!(a.attached.is_none());
+        // The view stays "attached" but frozen so the runner keeps the
+        // transcript pane up; focus returns to the sidebar.
+        let att = a.attached.as_ref().expect("frozen view persists");
+        assert_eq!(att.status, AttachStatus::Detached);
         assert_eq!(a.focus, Focus::Sidebar);
         assert_eq!(a.last_toast.as_deref(), Some("detached"));
+    }
+
+    #[test]
+    fn attach_closed_does_not_clear_a_detached_frozen_view() {
+        // After detach the runner stops the pump, which emits Closed.
+        // That solicited close must NOT wipe the frozen transcript.
+        let mut a = app();
+        let _ = navigate_to_first_session(&mut a);
+        a.handle(AppMsg::Enter);
+        a.handle(AppMsg::Detach);
+        a.handle(AppMsg::AttachClosed);
+        let att = a.attached.as_ref().expect("frozen view survives Closed");
+        assert_eq!(att.status, AttachStatus::Detached);
+    }
+
+    #[test]
+    fn enter_reattaches_into_a_detached_session() {
+        let mut a = app();
+        let sid = navigate_to_first_session(&mut a);
+        a.handle(AppMsg::Enter);
+        a.handle(AppMsg::Detach);
+        // Re-entering the same (now frozen) session attaches again.
+        a.handle(AppMsg::Enter);
+        let att = a.attached.as_ref().expect("re-attached");
+        assert_eq!(att.session_id, sid);
+        assert_eq!(att.status, AttachStatus::Connecting);
+        assert_eq!(a.focus, Focus::Transcript);
     }
 
     #[test]
