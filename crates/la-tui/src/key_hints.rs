@@ -202,6 +202,13 @@ impl HintRegistry {
                 Hint::new("Esc / ⏎", "close", Importance::Primary),
                 Hint::new("f", "close", Importance::Low),
             ],
+            Modal::ThemePicker(_) => vec![
+                // hint == real binding, verified by
+                // `every_advertised_modal_key_is_translatable`.
+                Hint::new("⏎", "apply", Importance::Primary),
+                Hint::new("↑/↓", "preview", Importance::High),
+                Hint::new("Esc", "cancel", Importance::High),
+            ],
         }
     }
 
@@ -288,7 +295,7 @@ impl HintRegistry {
             // overlay so they're discoverable without a manual. Meta
             // importance keeps them out of the truncated hint bar in
             // the default Rich mode (the bar already has enough cargo).
-            Hint::new("T", "cycle theme", Importance::Meta),
+            Hint::new("T", "theme picker", Importance::Meta),
             Hint::new("H", "cycle hints mode", Importance::Meta),
             Hint::new("C", "toggle compact", Importance::Meta),
             Hint::new("?", "all keys", Importance::Meta),
@@ -515,6 +522,10 @@ mod tests {
                 cron_id: "c1".into(),
                 fires: vec!["t".into()],
             },
+            Modal::ThemePicker(crate::app::ThemePickerDraft::new(
+                vec!["auto".into(), "dark".into()],
+                "auto",
+            )),
         ];
         for m in &modals {
             let hints = HintRegistry::for_context(

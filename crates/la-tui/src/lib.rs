@@ -90,7 +90,7 @@ pub use source::{
     MockSessionSource, NewSessionRequest, ProjectId, SessionId, SessionSource, SourceError,
 };
 pub use status::{CronPulse, Status};
-pub use theme::{Accent, KeyHintsMode, Palette, Theme};
+pub use theme::{Accent, KeyHintsMode, Palette, ThemeCatalog, ThemeSpec};
 pub use transcript::{ScrollAction, Transcript, TranscriptView};
 pub use ui_prefs::UiPrefs;
 pub use vte_term::{StyledCell, TerminalLine, TerminalScreen};

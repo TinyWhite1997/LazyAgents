@@ -31,7 +31,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::theme::{Accent, Palette, Theme};
+use crate::theme::{Accent, Palette};
 
 /// Most-recent cron firing pulse, used to flash a brief "↻ cron-id" badge
 /// on the bar.
@@ -85,7 +85,7 @@ impl Status {
 }
 
 pub fn render_status(frame: &mut Frame<'_>, area: Rect, status: &Status) {
-    render_status_themed(frame, area, status, &Palette::for_theme(Theme::Auto))
+    render_status_themed(frame, area, status, &Palette::auto())
 }
 
 /// Like [`render_status`] but with a caller-supplied palette so the
@@ -256,7 +256,7 @@ mod tests {
     fn render_to_text(status: &Status, now: DateTime<Utc>) -> String {
         let backend = TestBackend::new(120, 2);
         let mut terminal = Terminal::new(backend).expect("test terminal");
-        let palette = Palette::for_theme(Theme::Auto);
+        let palette = Palette::auto();
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, 120, 2);

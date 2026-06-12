@@ -206,9 +206,9 @@ fn real_main(source: SourceChoice) -> io::Result<()> {
 
     // WEK-42 / M4.3: load `[ui]` from $XDG_CONFIG_HOME/lazyagents/config.toml
     // before instantiating App so the very first frame reflects the
-    // user's saved theme + key-hints mode. A missing or unreadable file
-    // yields `UiPrefs::default()`; mutations via `T`/`H`/`C` write back
-    // to the same path.
+    // user's saved theme + key-hints mode + any `[[ui.custom_theme]]`
+    // palettes. A missing or unreadable file yields `UiPrefs::default()`;
+    // the theme picker (`T`) and `H`/`C` toggles write back to the same path.
     let ui_prefs_path = la_tui::ui_prefs::default_config_path();
     let ui_prefs = ui_prefs_path
         .as_deref()

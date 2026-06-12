@@ -173,7 +173,7 @@ The TUI's `[ui]` section lives in `$XDG_CONFIG_HOME/lazyagents/config.toml`:
 
 ```toml
 [ui]
-theme = "auto"        # auto | dark | light
+theme = "auto"        # any built-in or custom theme id (see below)
 key_hints = "rich"    # rich | compact | hidden
 compact = false
 ```
@@ -182,11 +182,53 @@ You can edit the file by hand, or use the in-TUI keys:
 
 | Key | Effect |
 |---|---|
-| `T` | Cycle theme: auto → dark → light |
+| `T` | Open the theme picker (live preview) |
 | `H` | Cycle key hints: rich → compact → hidden |
 | `C` | Toggle compact layout |
 
-Changes write through to `config.toml` immediately via an atomic rename. Any other sections (`[daemon]`, `[scheduler]`, `[adapters.*]`) you've added by hand are preserved verbatim.
+### Themes
+
+Press `T` to open the theme picker. Use `↑`/`↓` (or `k`/`j`) to move the
+highlight — the whole UI previews the theme live — then `⏎` to apply and
+persist, or `Esc` to revert to the theme you started with.
+
+Built-in theme ids:
+
+- `auto` — defers the background to your terminal (only accents are themed)
+- `dark`, `light`
+- `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`
+- `gruvbox-dark`, `gruvbox-light`
+- `nord`, `dracula`, `tokyo-night`
+- `solarized-dark`, `solarized-light`
+
+Every named theme paints its own background canvas; `auto` leaves the
+canvas to your terminal.
+
+### Custom themes
+
+Define your own palettes with `[[ui.custom_theme]]` blocks — they appear
+in the picker alongside the built-ins. A custom theme whose `id` matches a
+built-in overrides it. Colours are `#rrggbb` hex; `label` defaults to `id`
+and `on_accent` (text on a coloured chip) defaults to `bg`:
+
+```toml
+[[ui.custom_theme]]
+id = "my-theme"
+label = "My Theme"
+bg = "#1e1e2e"
+fg = "#cdd6f4"
+muted = "#a6adc8"
+primary = "#89b4fa"
+ok = "#a6e3a1"
+warn = "#f9e2af"
+error = "#f38ba8"
+on_accent = "#1e1e2e"
+```
+
+A custom theme with a missing or malformed colour is skipped — the TUI
+never refuses to start over a config typo.
+
+Changes write through to `config.toml` immediately via an atomic rename. Any other sections (`[daemon]`, `[scheduler]`, `[adapters.*]`) you've added by hand are preserved verbatim — as are your `[[ui.custom_theme]]` blocks, which the picker never edits.
 
 ## Backup
 

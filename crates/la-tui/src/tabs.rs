@@ -66,7 +66,7 @@ pub fn tab_at_column(column: u16, ranges: &[(Tab, std::ops::Range<u16>)]) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::Theme;
+    use crate::theme::ThemeCatalog;
 
     #[test]
     fn hit_test_picks_right_tab() {
@@ -81,12 +81,13 @@ mod tests {
     /// palette's `Accent::Primary`, not a hardcoded `Color::Cyan`.
     #[test]
     fn active_tab_bg_tracks_palette() {
-        let dark = Palette::for_theme(Theme::Dark);
-        let light = Palette::for_theme(Theme::Light);
+        let cat = ThemeCatalog::builtin();
+        let dark = cat.palette("dark");
+        let light = cat.palette("light");
         assert_ne!(
             dark.color(Accent::Primary),
             light.color(Accent::Primary),
-            "Dark vs Light primary must differ — otherwise theme cycle is a no-op"
+            "Dark vs Light primary must differ — otherwise theme switch is a no-op"
         );
     }
 }

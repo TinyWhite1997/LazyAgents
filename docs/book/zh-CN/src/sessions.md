@@ -173,7 +173,7 @@ TUI 的 `[ui]` 段位于 `$XDG_CONFIG_HOME/lazyagents/config.toml`：
 
 ```toml
 [ui]
-theme = "auto"        # auto | dark | light
+theme = "auto"        # 任意内置或自定义主题 id（见下文）
 key_hints = "rich"    # rich | compact | hidden
 compact = false
 ```
@@ -182,11 +182,46 @@ compact = false
 
 | 键 | 效果 |
 |---|---|
-| `T` | 循环切换主题：auto → dark → light |
+| `T` | 打开主题选择器（实时预览） |
 | `H` | 循环切换 key_hints：rich → compact → hidden |
 | `C` | 切换 compact 布局 |
 
-改动会立即通过原子 rename 写回 `config.toml`。你手写的其它段（`[daemon]`、`[scheduler]`、`[adapters.*]`）会逐字保留。
+### 主题
+
+按 `T` 打开主题选择器。用 `↑`/`↓`（或 `k`/`j`）移动高亮——整个界面会实时预览该主题——再按 `⏎` 应用并保存，或按 `Esc` 还原为打开时的主题。
+
+内置主题 id：
+
+- `auto` —— 背景交由终端决定（仅着色强调色）
+- `dark`、`light`
+- `catppuccin-latte`、`catppuccin-frappe`、`catppuccin-macchiato`、`catppuccin-mocha`
+- `gruvbox-dark`、`gruvbox-light`
+- `nord`、`dracula`、`tokyo-night`
+- `solarized-dark`、`solarized-light`
+
+每个具名主题都会绘制自己的背景画布；`auto` 把画布留给终端。
+
+### 自定义主题
+
+用 `[[ui.custom_theme]]` 块定义自己的调色板——它们会与内置主题一起出现在选择器里。`id` 与某个内置主题相同时会覆盖该内置主题。颜色用 `#rrggbb` 十六进制；`label` 缺省取 `id`，`on_accent`（色块上的文字）缺省取 `bg`：
+
+```toml
+[[ui.custom_theme]]
+id = "my-theme"
+label = "My Theme"
+bg = "#1e1e2e"
+fg = "#cdd6f4"
+muted = "#a6adc8"
+primary = "#89b4fa"
+ok = "#a6e3a1"
+warn = "#f9e2af"
+error = "#f38ba8"
+on_accent = "#1e1e2e"
+```
+
+颜色缺失或格式错误的自定义主题会被跳过——TUI 不会因为配置笔误而拒绝启动。
+
+改动会立即通过原子 rename 写回 `config.toml`。你手写的其它段（`[daemon]`、`[scheduler]`、`[adapters.*]`）会逐字保留——你的 `[[ui.custom_theme]]` 块也一样，选择器从不改写它们。
 
 ## 备份
 
