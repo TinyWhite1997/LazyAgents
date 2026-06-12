@@ -468,7 +468,7 @@ async fn dispatch(
     use la_proto::methods::{
         AdaptersDiscover, Initialize, ProjectsCreate, ProjectsList, SessionsArchive,
         SessionsAttach, SessionsCreate, SessionsDelete, SessionsDetach, SessionsImport,
-        SessionsList, SessionsSignal, SessionsWrite,
+        SessionsList, SessionsResize, SessionsSignal, SessionsWrite,
     };
 
     match req.method.as_str() {
@@ -502,6 +502,10 @@ async fn dispatch(
         SessionsSignal::NAME => {
             let params: SessionsSignalParams = decode_params(req)?;
             handle_sessions_signal(state, params).await
+        }
+        SessionsResize::NAME => {
+            let params: la_proto::methods::SessionsResizeParams = decode_params(req)?;
+            handle_sessions_resize(state, params).await
         }
         SessionsArchive::NAME => {
             let params = decode_params::<la_proto::methods::SessionsArchiveParams>(req)?;
@@ -1045,6 +1049,19 @@ async fn handle_sessions_signal(
         .await
         .map_err(core_to_rpc)?;
     ok(SessionsSignalResult {})
+}
+
+async fn handle_sessions_resize(
+    state: &ConnState,
+    params: la_proto::methods::SessionsResizeParams,
+) -> Result<serde_json::Value, RpcError> {
+    let id = SessionId(params.session_id);
+    state
+        .manager
+        .resize(&id, params.cols, params.rows)
+        .await
+        .map_err(core_to_rpc)?;
+    ok(la_proto::methods::SessionsResizeResult {})
 }
 
 async fn handle_adapters_discover(

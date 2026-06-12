@@ -46,7 +46,7 @@ That's it. `la` checks whether `lad` is already running and runs `lad daemonize`
 LazyAgents v1 ships the full daemon — sessions, crons, worktrees, adapters all work. **The TUI is wired end-to-end against the live daemon**:
 
 - Pressing `n` on a project opens the New-session form: pick a backend, toggle the worktree flag, and `Enter` to create. The session starts with no initial prompt — attach and type your first instruction into the live agent. The new session appears on the sidebar within the next ~2 s refresh tick.
-- Pressing `Enter` on a session row streams the PTY into the pane and routes your keystrokes back to the daemon via `sessions.write`. Use `Ctrl+B d` (or `Ctrl+B Esc` / `Ctrl+B .`) to detach — the session keeps running on the daemon. `Ctrl+B Ctrl+B` sends a literal `Ctrl+B` (0x02) for agents that need it.
+- Pressing `Enter` on a session row opens a full terminal-emulator pane that renders the agent's TUI faithfully and routes your keystrokes back to the daemon via `sessions.write`. The pane is sized to your window (`sessions.resize`). Press `Ctrl+\` to detach — the session keeps running on the daemon. Every other key is forwarded verbatim to the agent.
 
 If you want to drive `la` without a daemon (regression screenshots, design iteration), pass **`la --demo`** — that reverts the sidebar to the in-process demo fixture. The default `la` invocation always talks to `lad` and refuses to inject demo data into a real workspace.
 

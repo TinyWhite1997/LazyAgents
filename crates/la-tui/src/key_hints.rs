@@ -202,6 +202,13 @@ impl HintRegistry {
                 Hint::new("Esc / ⏎", "close", Importance::Primary),
                 Hint::new("f", "close", Importance::Low),
             ],
+            Modal::ThemePicker(_) => vec![
+                // hint == real binding, verified by
+                // `every_advertised_modal_key_is_translatable`.
+                Hint::new("⏎", "apply", Importance::Primary),
+                Hint::new("↑/↓", "preview", Importance::High),
+                Hint::new("Esc", "cancel", Importance::High),
+            ],
         }
     }
 
@@ -260,17 +267,13 @@ impl HintRegistry {
     }
 
     /// Hints surfaced while a session attach is live. The bottom bar
-    /// shows the detach prefix (Ctrl+B) — every other keystroke,
-    /// including PgUp/PgDn/Home/End/G, is forwarded to the daemon PTY
-    /// via `sessions.write`, so we deliberately do NOT advertise any
-    /// local-scroll keys here (the agent process may have its own
-    /// pager binding). Bringing in a local scroll mode is its own
-    /// follow-up (likely `Ctrl+B [` tmux-style copy mode).
+    /// shows the detach key (`Ctrl+\`) — every other keystroke,
+    /// including PgUp/PgDn/Home/End/G and Ctrl chords, is forwarded
+    /// verbatim to the daemon PTY via `sessions.write`, so we deliberately
+    /// do NOT advertise any local-scroll keys here: the pane is a full
+    /// terminal emulator and the agent owns its own scrolling.
     fn for_attach() -> Vec<Hint> {
-        let mut out = vec![
-            Hint::new("Ctrl+B d", "detach", Importance::Primary),
-            Hint::new("Ctrl+B Ctrl+B", "send literal Ctrl+B", Importance::Low),
-        ];
+        let mut out = vec![Hint::new("Ctrl+\\", "detach", Importance::Primary)];
         out.extend(Self::globals());
         out.sort_by_key(|h| std::cmp::Reverse(h.importance));
         out
@@ -288,7 +291,7 @@ impl HintRegistry {
             // overlay so they're discoverable without a manual. Meta
             // importance keeps them out of the truncated hint bar in
             // the default Rich mode (the bar already has enough cargo).
-            Hint::new("T", "cycle theme", Importance::Meta),
+            Hint::new("T", "theme picker", Importance::Meta),
             Hint::new("H", "cycle hints mode", Importance::Meta),
             Hint::new("C", "toggle compact", Importance::Meta),
             Hint::new("?", "all keys", Importance::Meta),
@@ -515,6 +518,10 @@ mod tests {
                 cron_id: "c1".into(),
                 fires: vec!["t".into()],
             },
+            Modal::ThemePicker(crate::app::ThemePickerDraft::new(
+                vec!["auto".into(), "dark".into()],
+                "auto",
+            )),
         ];
         for m in &modals {
             let hints = HintRegistry::for_context(

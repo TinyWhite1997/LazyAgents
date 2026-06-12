@@ -46,7 +46,7 @@ la
 LazyAgents v1 提供完整的 daemon —— sessions、crons、worktree、adapter 全部可用。**TUI 已端到端接入 daemon**：
 
 - 在项目上按 `n` 打开 New-session 表单：挑 backend、勾 worktree，`Enter` 创建。会话创建时不带初始提示词 —— attach 进去后再向实时 agent 输入第一条指令。新会话会在下一次 ~2 s 刷新里出现在侧栏。
-- 在会话行按 `Enter` 把 PTY 流入面板，并把你的键入通过 `sessions.write` 回送到 daemon。用 `Ctrl+B d`（或 `Ctrl+B Esc` / `Ctrl+B .`）退出 attach —— 会话仍在 daemon 上跑。`Ctrl+B Ctrl+B` 发字面量 `Ctrl+B`（0x02），供需要该键的 agent 使用。
+- 在会话行按 `Enter` 打开一个完整的终端仿真器面板，忠实渲染 agent 的 TUI，并把你的键入通过 `sessions.write` 回送到 daemon。面板按你的窗口尺寸排版（走 `sessions.resize`）。按 `Ctrl+\` 退出 attach —— 会话仍在 daemon 上跑。其它所有按键都原样转发给 agent。
 
 如果你想在没有 daemon 的情况下驱动 `la`（截图、设计回归），传 **`la --demo`** —— 会切回进程内 demo fixture。默认的 `la` 始终连 daemon，不会把假数据塞进真工作区。
 

@@ -21,6 +21,7 @@ use crate::path_complete::{self, Completion};
 use crate::sidebar::{Selection, SidebarState};
 use crate::source::{NewSessionRequest, SessionSource, SourceError};
 use crate::status::{CronPulse, Status};
+use crate::theme::ThemeCatalog;
 use crate::ui_prefs::UiPrefs;
 use la_proto::notifications::CronFiredParams;
 use std::path::PathBuf;
@@ -303,6 +304,55 @@ impl Default for NewProjectDraft {
     }
 }
 
+/// State carried inside [`Modal::ThemePicker`]. Holds the ordered list of
+/// selectable theme ids, the highlighted index (which is previewed live
+/// by swapping `App::ui_prefs.theme`), and the theme that was active when
+/// the picker opened so `Esc` can revert without persisting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemePickerDraft {
+    /// Theme ids in display order (built-ins then custom).
+    pub ids: Vec<String>,
+    /// Highlighted row.
+    pub idx: usize,
+    /// The theme id active when the picker opened — restored on cancel.
+    pub original: String,
+}
+
+impl ThemePickerDraft {
+    /// Build a draft from the catalog ids and the currently-active theme.
+    /// The highlight starts on `current` (or row 0 if it isn't in the
+    /// list, e.g. a stale id resolving to `auto`).
+    pub fn new(ids: Vec<String>, current: &str) -> Self {
+        let idx = ids.iter().position(|id| id == current).unwrap_or(0);
+        Self {
+            ids,
+            idx,
+            original: current.to_string(),
+        }
+    }
+
+    /// The currently-highlighted theme id, if any.
+    pub fn current_id(&self) -> Option<&str> {
+        self.ids.get(self.idx).map(String::as_str)
+    }
+
+    /// Move the highlight down one (wrapping). No-op on an empty list.
+    pub fn next(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        self.idx = (self.idx + 1) % self.ids.len();
+    }
+
+    /// Move the highlight up one (wrapping). No-op on an empty list.
+    pub fn prev(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        self.idx = (self.idx + self.ids.len() - 1) % self.ids.len();
+    }
+}
+
 /// Modal overlays. At most one open at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
@@ -338,6 +388,10 @@ pub enum Modal {
     /// `R` on a cron row → list the next 5 fire times so the user can
     /// sanity-check the expression before enabling. Read-only modal.
     DryRunCron { cron_id: String, fires: Vec<String> },
+    /// `T` → live theme picker. Arrow keys move the highlight and
+    /// preview the theme immediately (the whole UI repaints); Enter
+    /// applies + persists, Esc reverts to the theme active on open.
+    ThemePicker(ThemePickerDraft),
     /// `f` from the status bar's error badge: list every backend whose
     /// last probe was not `Available`, with reason + docs link. The
     /// rows are computed from the live [`crate::App::backends`]
@@ -521,16 +575,19 @@ pub enum AppMsg {
 
     // --- UI prefs (WEK-42 / M4.3) -----------------------------------
     //
-    // Three keystrokes mutate `[ui]` and persist back to config.toml
-    // asynchronously. The App owns the in-memory copy; the runner reads
-    // it each frame to pick a Palette + decide the bottom-row layout.
-    //
-    // We intentionally cycle through fixed enums (`Theme::next()` /
-    // `KeyHintsMode::next()`) rather than offering a chooser modal:
-    // M4.3 acceptance is "切换无闪屏", and a fast in-place cycle is the
-    // least disruptive UX.
-    /// `T` — Auto → Dark → Light → Auto.
-    CycleTheme,
+    // These keystrokes mutate `[ui]` and persist back to config.toml.
+    // The App owns the in-memory copy; the runner reads it each frame to
+    // pick a Palette (via the theme catalog) + decide the bottom-row
+    // layout.
+    /// `T` — open the theme picker modal (live preview + apply/cancel).
+    /// Replaces the original Auto→Dark→Light in-place cycle now that
+    /// there are 14+ built-in themes plus user-defined ones.
+    OpenThemePicker,
+    /// Theme picker navigation: move the highlight to the next / prev
+    /// theme. Each move previews the theme live by swapping
+    /// `ui_prefs.theme` in place.
+    ThemePickerNext,
+    ThemePickerPrev,
     /// `H` — Rich → Compact → Hidden → Rich. Distinct from the global
     /// `?` (which opens the FullHints modal); `H` reshapes the bottom
     /// row instead.
@@ -570,7 +627,7 @@ pub enum AppMsg {
     /// failure). The App clears `attached` and returns focus to the
     /// sidebar.
     AttachClosed,
-    /// User asked to detach (Ctrl+B then `d`, see runner). Clears the
+    /// User asked to detach (`Ctrl+\`, see runner). Clears the
     /// attach state on the App; the runner emits the actual `detach`
     /// command on the pump.
     Detach,
@@ -607,10 +664,15 @@ pub struct App<S: SessionSource, C: CronSource = crate::crons::MockCronSource> {
     /// to keep tests deterministic without poking at private state.
     pub last_toast: Option<String>,
     /// Live `[ui]` preferences (WEK-42 / M4.3). Mutated in place by the
-    /// `CycleTheme` / `CycleKeyHints` / `ToggleCompact` handlers; the
+    /// theme picker / `CycleKeyHints` / `ToggleCompact` handlers; the
     /// runner reads it each frame to build the [`crate::theme::Palette`]
     /// and decide the bottom-row layout.
     pub ui_prefs: UiPrefs,
+    /// The set of selectable themes (built-ins + any user-defined
+    /// `[[ui.custom_theme]]`). Built once from `ui_prefs.custom` in
+    /// [`Self::with_ui_prefs`]; the runner resolves `ui_prefs.theme`
+    /// against it each frame.
+    pub theme_catalog: ThemeCatalog,
     /// Where to persist `ui_prefs` on every mutation. `None` disables
     /// persistence (default for in-process tests; production wires
     /// [`crate::ui_prefs::default_config_path`]).
@@ -650,6 +712,7 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             backends: Vec::new(),
             last_toast: None,
             ui_prefs: UiPrefs::default(),
+            theme_catalog: ThemeCatalog::builtin(),
             ui_prefs_path: None,
             attached: None,
         };
@@ -662,6 +725,7 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
     /// resolving [`crate::ui_prefs::default_config_path`]; tests can
     /// leave both parameters as defaults and skip persistence entirely.
     pub fn with_ui_prefs(mut self, prefs: UiPrefs, path: Option<PathBuf>) -> Self {
+        self.theme_catalog = ThemeCatalog::with_custom(prefs.custom.clone());
         self.ui_prefs = prefs;
         self.ui_prefs_path = path;
         self
@@ -890,17 +954,24 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
 
             // --- UI prefs ----------------------------------------------
             //
-            // These three variants are normally applied BEFORE the modal
-            // short-circuit by [`Self::try_apply_ui_pref`] so that `T`/
-            // `H`/`C` work as true globals even inside a modal (review
-            // fix for WEK-42 / M4.3). Reaching this arm is the
-            // non-modal fallthrough; the toggle + persist + toast logic
-            // is shared with the pre-modal path, so we just delegate.
-            AppMsg::CycleTheme | AppMsg::CycleKeyHints | AppMsg::ToggleCompact => {
-                // try_apply_ui_pref consumes the message (returns None)
-                // when it matches one of the three UI-pref variants.
+            // `H` / `C` are normally applied BEFORE the modal short-circuit
+            // by [`Self::try_apply_ui_pref`] so they work as true globals
+            // even inside a modal (review fix for WEK-42 / M4.3). Reaching
+            // this arm is the non-modal fallthrough; delegate to the shared
+            // toggle + persist + toast logic.
+            AppMsg::CycleKeyHints | AppMsg::ToggleCompact => {
                 let _ = self.try_apply_ui_pref(msg);
             }
+            // `T` opens the live theme picker. Built from the catalog ids
+            // with the highlight seeded on the active theme.
+            AppMsg::OpenThemePicker => {
+                let draft = ThemePickerDraft::new(self.theme_catalog.ids(), &self.ui_prefs.theme);
+                self.modal = Some(Modal::ThemePicker(draft));
+            }
+            // Picker navigation only has meaning while the picker is open;
+            // it is routed inside the modal short-circuit. Reaching here
+            // means no picker was open — drop silently.
+            AppMsg::ThemePickerNext | AppMsg::ThemePickerPrev => {}
 
             // --- Attach dispatch (WEK-92-A3) -------------------------
             AppMsg::BeginAttach {
@@ -1023,12 +1094,6 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
     /// and silently drops them.
     fn try_apply_ui_pref(&mut self, msg: AppMsg) -> Option<AppMsg> {
         match msg {
-            AppMsg::CycleTheme => {
-                self.ui_prefs.theme = self.ui_prefs.theme.next();
-                self.persist_ui_prefs();
-                self.last_toast = Some(format!("theme: {}", self.ui_prefs.theme.label()));
-                None
-            }
             AppMsg::CycleKeyHints => {
                 self.ui_prefs.key_hints = self.ui_prefs.key_hints.next();
                 self.persist_ui_prefs();
@@ -1046,6 +1111,20 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
             }
             other => Some(other),
         }
+    }
+
+    /// Live-preview the theme highlighted in the picker by swapping
+    /// `ui_prefs.theme` in place. Persistence is deferred to Confirm; a
+    /// Cancel restores [`ThemePickerDraft::original`].
+    fn preview_picker_theme(&mut self, draft: &ThemePickerDraft) {
+        if let Some(id) = draft.current_id() {
+            self.ui_prefs.theme = id.to_string();
+        }
+    }
+
+    /// Display label for a theme id, falling back to the id itself.
+    fn theme_label(&self, id: &str) -> String {
+        self.theme_catalog.label_for(id)
     }
 
     /// Apply a [`Modal::NewSession`] field-edit message in place. Run
@@ -1360,6 +1439,32 @@ impl<S: SessionSource, C: CronSource> App<S, C> {
                 self.modal = None;
             }
             (Modal::Errors { .. }, AppMsg::Cancel) | (Modal::Errors { .. }, AppMsg::Confirm) => {
+                self.modal = None;
+            }
+            // --- Theme picker (live preview) ----------------------------
+            (Modal::ThemePicker(mut draft), AppMsg::ThemePickerNext) => {
+                draft.next();
+                self.preview_picker_theme(&draft);
+                self.modal = Some(Modal::ThemePicker(draft));
+            }
+            (Modal::ThemePicker(mut draft), AppMsg::ThemePickerPrev) => {
+                draft.prev();
+                self.preview_picker_theme(&draft);
+                self.modal = Some(Modal::ThemePicker(draft));
+            }
+            (Modal::ThemePicker(draft), AppMsg::Confirm) => {
+                // The live preview already set `ui_prefs.theme`; just
+                // persist + close.
+                self.persist_ui_prefs();
+                self.last_toast =
+                    Some(format!("theme: {}", self.theme_label(&self.ui_prefs.theme)));
+                let _ = draft;
+                self.modal = None;
+            }
+            (Modal::ThemePicker(draft), AppMsg::Cancel) => {
+                // Revert the live preview to whatever was active on open;
+                // do NOT persist.
+                self.ui_prefs.theme = draft.original;
                 self.modal = None;
             }
             // Inside a modal, Quit still wins (so the user is never

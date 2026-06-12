@@ -1,9 +1,10 @@
-//! WEK-42 / M4.3 acceptance tests — theme cycle, compact layout, key
+//! WEK-42 / M4.3 acceptance tests — theme picker, compact layout, key
 //! hints modes, and `[ui]` persistence round-trip.
 //!
 //! Each test maps to one row of the issue's verification checklist:
 //!
-//! - 三套色板：auto (跟终端) / dark / light  → [`theme_cycle_visits_all_three_palettes`]
+//! - 多套色板 + picker：auto / dark / light / catppuccin / … →
+//!   [`theme_picker_previews_and_applies`]
 //! - 紧凑模式：状态栏 + key hints 单行；侧栏单色后端徽标  →
 //!   [`compact_mode_collapses_status_and_hint_into_one_row`] +
 //!   [`compact_mode_renders_single_color_backend_badges`]
@@ -11,14 +12,12 @@
 //!   [`key_hints_hidden_drops_bottom_row`] +
 //!   [`key_hints_compact_keeps_primary_plus_meta_only`]
 //! - 偏好持久化到 settings  → [`ui_pref_changes_round_trip_through_config_toml`]
-//! - 切换无闪屏: every cycle returns control in one [`App::handle`] tick,
-//!   so the runner's next [`draw`] frame is the only render —
-//!   exercised implicitly by the cycle tests below (no extra wait or
-//!   teardown beyond a single message).
-//! - WCAG AA contrast is covered by `theme::tests::wcag_aa_passes_for_both_palettes`.
+//! - 切换无闪屏: every change returns control in one [`App::handle`] tick,
+//!   so the runner's next [`draw`] frame is the only render.
+//! - WCAG AA contrast is covered by `theme::tests::wcag_aa_passes_for_builtin_dark_light`.
 
 use la_tui::runner::draw;
-use la_tui::theme::{KeyHintsMode, Theme};
+use la_tui::theme::{KeyHintsMode, ThemeCatalog};
 use la_tui::ui_prefs::{self, UiPrefs};
 use la_tui::{App, AppMsg, MockSessionSource};
 use ratatui::backend::TestBackend;
@@ -53,16 +52,60 @@ fn render_with_prefs(prefs: UiPrefs) -> String {
     buffer_text(terminal.backend().buffer())
 }
 
+/// `T` opens the picker; navigating previews the highlighted theme live
+/// (mutating `ui_prefs.theme`), `Confirm` applies + closes, `Cancel`
+/// reverts to the theme active on open.
 #[test]
-fn theme_cycle_visits_all_three_palettes() {
+fn theme_picker_previews_and_applies() {
     let mut a = App::new(MockSessionSource::fixture());
-    assert_eq!(a.ui_prefs.theme, Theme::Auto);
-    a.handle(AppMsg::CycleTheme);
-    assert_eq!(a.ui_prefs.theme, Theme::Dark);
-    a.handle(AppMsg::CycleTheme);
-    assert_eq!(a.ui_prefs.theme, Theme::Light);
-    a.handle(AppMsg::CycleTheme);
-    assert_eq!(a.ui_prefs.theme, Theme::Auto, "must cycle back to start");
+    assert_eq!(a.ui_prefs.theme, "auto");
+
+    // Open the picker.
+    a.handle(AppMsg::OpenThemePicker);
+    assert!(matches!(a.modal, Some(la_tui::app::Modal::ThemePicker(_))));
+
+    // Next previews the following catalog entry ("dark").
+    a.handle(AppMsg::ThemePickerNext);
+    assert_eq!(
+        a.ui_prefs.theme, "dark",
+        "navigating the picker previews the highlighted theme live"
+    );
+
+    // Confirm applies + closes.
+    a.handle(AppMsg::Confirm);
+    assert!(a.modal.is_none(), "Confirm closes the picker");
+    assert_eq!(a.ui_prefs.theme, "dark");
+}
+
+#[test]
+fn theme_picker_cancel_reverts_preview() {
+    let mut a = App::new(MockSessionSource::fixture());
+    a.handle(AppMsg::OpenThemePicker);
+    a.handle(AppMsg::ThemePickerNext); // preview "dark"
+    assert_eq!(a.ui_prefs.theme, "dark");
+    a.handle(AppMsg::Cancel);
+    assert!(a.modal.is_none());
+    assert_eq!(
+        a.ui_prefs.theme, "auto",
+        "Cancel must revert the live preview to the theme active on open"
+    );
+}
+
+#[test]
+fn theme_picker_persists_selection_to_disk() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    let mut a = App::new(MockSessionSource::fixture())
+        .with_ui_prefs(UiPrefs::default(), Some(path.clone()));
+    a.handle(AppMsg::OpenThemePicker);
+    a.handle(AppMsg::ThemePickerNext); // → dark
+    a.handle(AppMsg::Confirm);
+
+    let reloaded = ui_prefs::load(&path);
+    assert_eq!(
+        reloaded.theme, "dark",
+        "applied theme must hit disk for the next launch"
+    );
 }
 
 #[test]
@@ -87,31 +130,22 @@ fn toggle_compact_flips_pref() {
     assert!(!a.ui_prefs.compact);
 }
 
-/// WEK-42 / M4.3 review fix: the translator routes T/H/C inside a
-/// modal, but the App's modal short-circuit used to drop them on the
-/// floor (handle_in_modal had no arm). Pin both halves: (a) firing
-/// `CycleTheme` while a modal is open actually mutates `ui_prefs.theme`;
-/// (b) the modal stays open afterwards (the toggle is a pref change,
-/// not a modal action).
+/// WEK-42 / M4.3 review fix: the translator routes H/C inside a modal,
+/// but the App's modal short-circuit used to drop them on the floor
+/// (handle_in_modal had no arm). Pin both halves: (a) firing
+/// `CycleKeyHints` / `ToggleCompact` while a modal is open actually
+/// mutates the pref; (b) the modal stays open afterwards.
+///
+/// `T` is NO LONGER an in-modal global — it opens the picker, which would
+/// stack a second modal — so only H/C are exercised here.
 #[test]
 fn ui_pref_messages_apply_even_when_modal_is_open() {
     let mut a = App::new(MockSessionSource::fixture());
     a.handle(AppMsg::ToggleFullHints);
     assert!(matches!(a.modal, Some(la_tui::app::Modal::FullHints)));
 
-    let theme_before = a.ui_prefs.theme;
     let hints_before = a.ui_prefs.key_hints;
     let compact_before = a.ui_prefs.compact;
-
-    a.handle(AppMsg::CycleTheme);
-    assert_ne!(
-        a.ui_prefs.theme, theme_before,
-        "CycleTheme inside a modal must mutate ui_prefs.theme"
-    );
-    assert!(
-        matches!(a.modal, Some(la_tui::app::Modal::FullHints)),
-        "modal must stay open after a global pref toggle"
-    );
 
     a.handle(AppMsg::CycleKeyHints);
     assert_ne!(a.ui_prefs.key_hints, hints_before);
@@ -147,28 +181,27 @@ fn ui_pref_persists_to_toml_even_when_toggled_inside_modal() {
     let mut a = App::new(MockSessionSource::fixture())
         .with_ui_prefs(UiPrefs::default(), Some(path.clone()));
     a.handle(AppMsg::ToggleFullHints);
-    a.handle(AppMsg::CycleTheme); // Auto → Dark, with FullHints open
+    a.handle(AppMsg::CycleKeyHints); // Rich → Compact, with FullHints open
     a.handle(AppMsg::Cancel); // close overlay
 
     let reloaded = ui_prefs::load(&path);
     assert_eq!(
-        reloaded.theme,
-        Theme::Dark,
+        reloaded.key_hints,
+        KeyHintsMode::Compact,
         "pref toggled inside a modal must hit disk just like the non-modal path"
     );
 }
 
-/// Translator-level companion to `ui_pref_messages_apply_even_when_modal_is_open`:
-/// the input layer must produce the right AppMsg even with a modal
-/// open, so the App-level check above isn't testing a path the user
-/// can't reach through real keystrokes.
+/// Translator-level companion: `T` opens the picker from a normal
+/// context, while `H`/`C` route as globals even with a modal open. (T
+/// inside a modal is intentionally inert — covered in input.rs unit
+/// tests — so it is not asserted here.)
 #[test]
-fn t_h_c_route_through_translator_inside_a_modal() {
+fn t_opens_picker_and_h_c_route_inside_a_modal() {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use la_tui::app::{Focus, Tab};
     use la_tui::input::{translate, HitBoxes};
 
-    let modal = la_tui::app::Modal::FullHints;
     let hit = HitBoxes {
         tabs: Vec::new(),
         sidebar: ratatui::layout::Rect::default(),
@@ -177,11 +210,17 @@ fn t_h_c_route_through_translator_inside_a_modal() {
         tab: Tab::Sessions,
         focus: Focus::Sidebar,
     };
-    for (ch, expected) in [
-        ('T', AppMsg::CycleTheme),
-        ('H', AppMsg::CycleKeyHints),
-        ('C', AppMsg::ToggleCompact),
-    ] {
+    // `T` from a normal context opens the picker.
+    let ev = Event::Key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE));
+    assert_eq!(
+        translate(ev, None, &hit),
+        Some(AppMsg::OpenThemePicker),
+        "'T' must open the theme picker"
+    );
+
+    // `H`/`C` route through even with a modal open.
+    let modal = la_tui::app::Modal::FullHints;
+    for (ch, expected) in [('H', AppMsg::CycleKeyHints), ('C', AppMsg::ToggleCompact)] {
         let ev = Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         let msg = translate(ev, Some(&modal), &hit)
             .unwrap_or_else(|| panic!("'{ch}' must route even with modal open"));
@@ -190,10 +229,8 @@ fn t_h_c_route_through_translator_inside_a_modal() {
 }
 
 /// WEK-42 / M4.3 scope decision: the Crons editor pane is a free-typing
-/// context so T/H/C are CAPTURED as field input there (chord-free
-/// alternatives like Ctrl+H would collide with terminal backspace, and
-/// the user can always Esc → list to use the global pref keys). Pin
-/// this so the next reviewer sees the intentional asymmetry.
+/// context so T/H/C are CAPTURED as field input there. Pin this so the
+/// next reviewer sees the intentional asymmetry.
 #[test]
 fn crons_editor_captures_t_h_c_as_field_input() {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -214,7 +251,7 @@ fn crons_editor_captures_t_h_c_as_field_input() {
         // Should resolve to a CronFieldEdit, NOT to a UI-pref AppMsg.
         let is_pref = matches!(
             msg,
-            AppMsg::CycleTheme | AppMsg::CycleKeyHints | AppMsg::ToggleCompact
+            AppMsg::OpenThemePicker | AppMsg::CycleKeyHints | AppMsg::ToggleCompact
         );
         assert!(
             !is_pref,
@@ -433,15 +470,17 @@ fn ui_pref_changes_round_trip_through_config_toml() {
 
     let prefs = ui_prefs::load(&path);
     let mut a = App::new(MockSessionSource::fixture()).with_ui_prefs(prefs, Some(path.clone()));
-    assert_eq!(a.ui_prefs.theme, Theme::Auto);
+    assert_eq!(a.ui_prefs.theme, "auto");
 
-    a.handle(AppMsg::CycleTheme); // → Dark
+    a.handle(AppMsg::OpenThemePicker);
+    a.handle(AppMsg::ThemePickerNext); // → dark
+    a.handle(AppMsg::Confirm);
     a.handle(AppMsg::CycleKeyHints); // → Compact
     a.handle(AppMsg::ToggleCompact); // → true
 
     // Reload from disk — the next launch must observe what we typed.
     let reloaded = ui_prefs::load(&path);
-    assert_eq!(reloaded.theme, Theme::Dark);
+    assert_eq!(reloaded.theme, "dark");
     assert_eq!(reloaded.key_hints, KeyHintsMode::Compact);
     assert!(reloaded.compact);
 
@@ -464,12 +503,12 @@ fn ui_pref_changes_round_trip_through_config_toml() {
 fn dark_and_light_themes_actually_diverge_on_real_cells() {
     use ratatui::style::Color;
 
-    fn render(theme: Theme) -> ratatui::buffer::Buffer {
+    fn render(theme: &str) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut app = App::new(MockSessionSource::fixture()).with_ui_prefs(
             UiPrefs {
-                theme,
+                theme: theme.to_string(),
                 ..UiPrefs::default()
             },
             None,
@@ -483,10 +522,11 @@ fn dark_and_light_themes_actually_diverge_on_real_cells() {
         terminal.backend().buffer().clone()
     }
 
-    let dark = render(Theme::Dark);
-    let light = render(Theme::Light);
-    let dark_pal = la_tui::theme::Palette::for_theme(Theme::Dark);
-    let light_pal = la_tui::theme::Palette::for_theme(Theme::Light);
+    let catalog = ThemeCatalog::builtin();
+    let dark = render("dark");
+    let light = render("light");
+    let dark_pal = catalog.palette("dark");
+    let light_pal = catalog.palette("light");
 
     /// Find the first cell whose symbol matches `needle` **within** the
     /// inclusive y range `y0..=y1`. Bounded so the search doesn't pick

@@ -376,9 +376,31 @@ fn validate_impl(cfg: &Config) -> Result<(), CheckError> {
             "[scheduler].global_max_concurrent_runs must be >= 1".to_string(),
         ));
     }
-    if !matches!(cfg.ui.theme.as_str(), "auto" | "dark" | "light") {
+    // `theme` may name a built-in palette or any `[[ui.custom_theme]]`
+    // defined below. The daemon doesn't render — it only sanity-checks
+    // that the id resolves to *something*, so a typo surfaces at `config
+    // check` instead of silently demoting to `auto` in the TUI.
+    const BUILTIN_THEME_IDS: &[&str] = &[
+        "auto",
+        "dark",
+        "light",
+        "catppuccin-latte",
+        "catppuccin-frappe",
+        "catppuccin-macchiato",
+        "catppuccin-mocha",
+        "gruvbox-dark",
+        "gruvbox-light",
+        "nord",
+        "dracula",
+        "tokyo-night",
+        "solarized-dark",
+        "solarized-light",
+    ];
+    let theme_known = BUILTIN_THEME_IDS.contains(&cfg.ui.theme.as_str())
+        || cfg.ui.custom_theme.iter().any(|c| c.id == cfg.ui.theme);
+    if !theme_known {
         return Err(CheckError::Validation(format!(
-            "[ui].theme must be auto|dark|light (got {:?})",
+            "[ui].theme {:?} is not a built-in theme and has no matching [[ui.custom_theme]] id",
             cfg.ui.theme
         )));
     }
@@ -388,7 +410,42 @@ fn validate_impl(cfg: &Config) -> Result<(), CheckError> {
             cfg.ui.key_hints
         )));
     }
+    // Validate every custom theme's required hex colours so a malformed
+    // palette is caught at `config check` time rather than silently
+    // skipped by the TUI.
+    for c in &cfg.ui.custom_theme {
+        if c.id.trim().is_empty() {
+            return Err(CheckError::Validation(
+                "[[ui.custom_theme]] entry has an empty id".to_string(),
+            ));
+        }
+        let check_hex = |key: &str, val: &str| -> Result<(), CheckError> {
+            if !is_hex_color(val) {
+                return Err(CheckError::Validation(format!(
+                    "[[ui.custom_theme]] {:?}: {key} = {val:?} is not a #rrggbb colour",
+                    c.id
+                )));
+            }
+            Ok(())
+        };
+        check_hex("bg", &c.bg)?;
+        check_hex("fg", &c.fg)?;
+        check_hex("muted", &c.muted)?;
+        check_hex("primary", &c.primary)?;
+        check_hex("ok", &c.ok)?;
+        check_hex("warn", &c.warn)?;
+        check_hex("error", &c.error)?;
+        if let Some(oa) = &c.on_accent {
+            check_hex("on_accent", oa)?;
+        }
+    }
     Ok(())
+}
+
+/// True for a `#rrggbb` or `rrggbb` hex colour string.
+fn is_hex_color(s: &str) -> bool {
+    let h = s.trim().strip_prefix('#').unwrap_or(s.trim());
+    h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn top_level_sections(raw: &str) -> Vec<String> {
@@ -763,6 +820,62 @@ listen_tcp = "0.0.0.0:7042"
 "#;
         let err = check_str(raw).unwrap_err();
         assert!(format!("{err}").contains("listen_tcp"));
+    }
+
+    #[test]
+    fn accepts_builtin_named_theme() {
+        let raw = "[ui]\ntheme = \"catppuccin-mocha\"\n";
+        check_str(raw).expect("built-in named theme must validate");
+    }
+
+    #[test]
+    fn rejects_unknown_theme_without_custom_definition() {
+        let raw = "[ui]\ntheme = \"moonbeam\"\n";
+        let err = check_str(raw).unwrap_err();
+        assert!(
+            format!("{err}").contains("not a built-in theme"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_theme_backed_by_custom_definition() {
+        let raw = r##"[ui]
+theme = "my-theme"
+
+[[ui.custom_theme]]
+id = "my-theme"
+bg = "#1e1e2e"
+fg = "#cdd6f4"
+muted = "#a6adc8"
+primary = "#89b4fa"
+ok = "#a6e3a1"
+warn = "#f9e2af"
+error = "#f38ba8"
+"##;
+        check_str(raw).expect("theme matching a custom_theme id must validate");
+    }
+
+    #[test]
+    fn rejects_custom_theme_with_bad_hex() {
+        let raw = r##"[ui]
+theme = "auto"
+
+[[ui.custom_theme]]
+id = "x"
+bg = "not-a-color"
+fg = "#ffffff"
+muted = "#808080"
+primary = "#89b4fa"
+ok = "#a6e3a1"
+warn = "#f9e2af"
+error = "#f38ba8"
+"##;
+        let err = check_str(raw).unwrap_err();
+        assert!(
+            format!("{err}").contains("not a #rrggbb colour"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

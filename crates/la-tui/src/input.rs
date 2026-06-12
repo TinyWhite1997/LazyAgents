@@ -112,10 +112,11 @@ fn translate_key(
         KeyCode::Char('f') => AppMsg::OpenErrors,
         KeyCode::Esc => AppMsg::Cancel,
 
-        // WEK-42 / M4.3: uppercase UI-pref cycles. Capitals chosen so
+        // WEK-42 / M4.3: uppercase UI-pref keys. Capitals chosen so
         // they don't shadow the lowercase Sessions actions (`d`, `n`)
         // and feel discoverable as "shift = global preference toggle".
-        KeyCode::Char('T') => AppMsg::CycleTheme,
+        // `T` opens the theme picker; `H`/`C` cycle/toggle in place.
+        KeyCode::Char('T') => AppMsg::OpenThemePicker,
         KeyCode::Char('H') => AppMsg::CycleKeyHints,
         KeyCode::Char('C') => AppMsg::ToggleCompact,
 
@@ -212,7 +213,7 @@ fn translate_globals(code: KeyCode, mods: KeyModifiers) -> Option<AppMsg> {
         // globals not already claimed by the Sessions / Crons tabs.
         // Lowercase t/h/c would collide with vim-style navigation
         // (`h` = fold, `t` is reserved for future inline filter).
-        KeyCode::Char('T') => AppMsg::CycleTheme,
+        KeyCode::Char('T') => AppMsg::OpenThemePicker,
         KeyCode::Char('H') => AppMsg::CycleKeyHints,
         KeyCode::Char('C') => AppMsg::ToggleCompact,
         _ => return None,
@@ -226,15 +227,24 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
             return Some(AppMsg::Quit);
         }
     }
-    // WEK-42 / M4.3 review feedback: T/H/C are advertised as "globals" in
+    // Theme picker owns its own key matrix and is routed BEFORE the
+    // T/H/C global short-circuit: `T` here must NOT reopen the picker
+    // (it's already open), and j/k/arrows drive the live preview rather
+    // than leaking out as sidebar navigation.
+    if let Modal::ThemePicker(_) = modal {
+        return translate_theme_picker_key(code);
+    }
+    // WEK-42 / M4.3 review feedback: H/C are advertised as "globals" in
     // the `?` overlay, so they must work inside modals too — otherwise
     // a user who opens FullHints to read the binding can't actually try
     // it. Capital letters are unambiguous (no modal handler takes them
     // as confirm/cancel) so route them up to the global pref handlers
-    // before the per-modal switch claims the keystroke.
-    if let KeyCode::Char(c @ ('T' | 'H' | 'C')) = code {
+    // before the per-modal switch claims the keystroke. `T` opens the
+    // picker modal, which would stack a second modal — so it is only a
+    // global outside any modal (handled in `translate_globals` /
+    // `translate_key`), not here.
+    if let KeyCode::Char(c @ ('H' | 'C')) = code {
         return Some(match c {
-            'T' => AppMsg::CycleTheme,
             'H' => AppMsg::CycleKeyHints,
             _ => AppMsg::ToggleCompact,
         });
@@ -278,6 +288,21 @@ fn translate_modal_key(code: KeyCode, mods: KeyModifiers, modal: &Modal) -> Opti
             }
             _ => return None,
         },
+        Modal::ThemePicker(_) => unreachable!("handled above"),
+    })
+}
+
+/// Modal-key translator for [`Modal::ThemePicker`]. Arrow keys + j/k move
+/// the highlight (previewing live); Enter applies + persists; Esc reverts.
+/// Routed before the H/C global short-circuit so `T` here is inert rather
+/// than stacking a second picker.
+fn translate_theme_picker_key(code: KeyCode) -> Option<AppMsg> {
+    Some(match code {
+        KeyCode::Down | KeyCode::Char('j') => AppMsg::ThemePickerNext,
+        KeyCode::Up | KeyCode::Char('k') => AppMsg::ThemePickerPrev,
+        KeyCode::Enter => AppMsg::Confirm,
+        KeyCode::Esc => AppMsg::Cancel,
+        _ => return None,
     })
 }
 
@@ -623,5 +648,59 @@ mod tests {
         let modal = Modal::NewProject(crate::app::NewProjectDraft::new());
         let ev = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(translate(ev, Some(&modal), &hit()), Some(AppMsg::Quit));
+    }
+
+    // ---- Multi-theme: T opens the picker, picker keys drive preview ----
+
+    #[test]
+    fn uppercase_t_opens_theme_picker_in_normal_context() {
+        assert_eq!(
+            translate(key(KeyCode::Char('T')), None, &hit()),
+            Some(AppMsg::OpenThemePicker)
+        );
+    }
+
+    fn theme_picker_modal() -> Modal {
+        Modal::ThemePicker(crate::app::ThemePickerDraft::new(
+            vec!["auto".into(), "dark".into(), "light".into()],
+            "auto",
+        ))
+    }
+
+    #[test]
+    fn theme_picker_navigation_and_confirm_cancel() {
+        let m = theme_picker_modal();
+        assert_eq!(
+            translate(key(KeyCode::Down), Some(&m), &hit()),
+            Some(AppMsg::ThemePickerNext)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('j')), Some(&m), &hit()),
+            Some(AppMsg::ThemePickerNext)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Up), Some(&m), &hit()),
+            Some(AppMsg::ThemePickerPrev)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('k')), Some(&m), &hit()),
+            Some(AppMsg::ThemePickerPrev)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Enter), Some(&m), &hit()),
+            Some(AppMsg::Confirm)
+        );
+        assert_eq!(
+            translate(key(KeyCode::Esc), Some(&m), &hit()),
+            Some(AppMsg::Cancel)
+        );
+    }
+
+    #[test]
+    fn t_inside_theme_picker_does_not_reopen_it() {
+        // `T` while the picker is open must be inert (no second picker),
+        // not route back to OpenThemePicker.
+        let m = theme_picker_modal();
+        assert_eq!(translate(key(KeyCode::Char('T')), Some(&m), &hit()), None);
     }
 }

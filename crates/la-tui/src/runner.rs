@@ -21,7 +21,7 @@ use crossterm::terminal::{
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -37,8 +37,8 @@ use crate::sidebar::{render_sidebar_themed, Selection};
 use crate::source::SessionSource;
 use crate::status::{render_status_compact, render_status_themed};
 use crate::tabs::render_tabs;
+use crate::term_grid::{TermGrid, TermGridView};
 use crate::theme::{Accent, KeyHintsMode, Palette};
-use crate::transcript::{Transcript, TranscriptView};
 
 /// Back-compat re-export — pre-WEK-36 callers spelled this as
 /// `crate::health_sub::HealthEvent`. New code should use [`NotifEvent`].
@@ -126,8 +126,8 @@ fn event_loop<S: SessionSource, C: CronSource>(
         focus: Focus::Sidebar,
     };
     // WEK-92-A3: per-session attach runtime. The App owns the *state*
-    // (`app.attached`), the runner owns the *I/O* (pump thread,
-    // transcript buffer, Ctrl+B detach-prefix latch).
+    // (`app.attached`), the runner owns the *I/O* (pump thread, VT100
+    // grid emulator).
     let mut attach: Option<AttachRuntime> = None;
     // WEK-92-A4.1: last `SessionSource::refresh_generation()` value the
     // runner has surfaced as a `RefreshSessions` dispatch. The bg poll
@@ -225,10 +225,10 @@ fn event_loop<S: SessionSource, C: CronSource>(
         if let Event::Resize(_, _) = ev {
             continue;
         }
-        // While the transcript pane is focused, raw key events route to
+        // While the session pane is focused, raw key events route to
         // the daemon's PTY via `sessions.write` — they do NOT go through
-        // the App's normal modal/key translator. The exception is the
-        // detach prefix Ctrl+B (see `AttachRuntime::feed_key`).
+        // the App's normal modal/key translator. The one exception is the
+        // `Ctrl+\` detach key (see `AttachRuntime::feed_key`).
         if app.focus == Focus::Transcript && app.modal.is_none() {
             if let (Some(rt), Event::Key(k)) = (attach.as_mut(), &ev) {
                 // Mirror the normal input translator's release-event
@@ -236,8 +236,7 @@ fn event_loop<S: SessionSource, C: CronSource>(
                 // (notably Windows) report both Press and Release for
                 // every key. Without this gate the Release event would
                 // also be encoded and written to the PTY, doubling
-                // every keystroke and arming the detach prefix on key-up
-                // by mistake.
+                // every keystroke.
                 if !is_transcript_press(k) {
                     continue;
                 }
@@ -270,63 +269,45 @@ fn event_loop<S: SessionSource, C: CronSource>(
     }
 }
 
-/// Per-attach runtime state owned by the runner. Holds the pump, the
-/// transcript ring + VTE parser, and the Ctrl+B detach-prefix latch.
+/// Per-attach runtime state owned by the runner. Holds the pump and the
+/// live VT100 grid emulator for the session's PTY.
 pub struct AttachRuntime {
     pub session_id: String,
     pub pump: AttachPump,
-    pub transcript: Transcript,
-    /// True after the user pressed Ctrl+B; the next keystroke is the
-    /// detach action (or `Ctrl+B` to send a literal Ctrl+B byte).
-    detach_armed: bool,
+    pub grid: TermGrid,
+    /// Last grid size we reported to the daemon, so we only emit a
+    /// `sessions.resize` when the pane dimensions actually change.
+    last_reported_size: Option<(u16, u16)>,
+    /// Transient wire-level notice (gap / lifecycle) rendered on the
+    /// header line instead of being injected into the agent's grid.
+    transient_notice: Option<String>,
 }
 
 /// What the runner should do after a raw key event landed in the
-/// transcript pane.
+/// session pane.
 enum KeyOutcome {
-    /// The byte was forwarded (or absorbed by the detach prefix latch).
+    /// The byte was forwarded to the PTY.
     Consumed,
-    /// The user typed the detach gesture (Ctrl+B then `d` / Esc / `.`).
+    /// The user typed the detach gesture (`Ctrl+\`).
     Detach,
-    /// The key has no transcript meaning — fall through to the App's
+    /// The key has no terminal encoding — fall through to the App's
     /// normal translator.
     FallThrough,
 }
 
 impl AttachRuntime {
     /// Translate a key event into the right side effect:
-    ///   * Ctrl+B → arm detach prefix
-    ///   * Ctrl+B then `d` / `Esc` / `.` → detach
-    ///   * Ctrl+B then Ctrl+B → send a literal Ctrl+B byte
-    ///   * any other key → encode and forward to the daemon
+    ///   * `Ctrl+\` → detach back to session management
+    ///   * any other key → encode and forward to the daemon's PTY
+    ///
+    /// Everything except the single `Ctrl+\` escape is forwarded verbatim
+    /// so the agent gets a faithful, native terminal (the whole point of
+    /// the grid emulator). `Ctrl+\`'s literal byte (`0x1c`, SIGQUIT) is
+    /// therefore unreachable from the pane — an acceptable trade for a
+    /// reliable, conflict-free exit.
     fn feed_key(&mut self, k: KeyEvent) -> KeyOutcome {
-        // Detach prefix takes priority. We only arm on Ctrl+B (not on
-        // `Ctrl+b`'s lowercase shadow because crossterm normalizes both
-        // to KeyCode::Char('b') with CONTROL set).
-        if self.detach_armed {
-            self.detach_armed = false;
-            match k.code {
-                KeyCode::Char('d') | KeyCode::Esc | KeyCode::Char('.') => {
-                    return KeyOutcome::Detach;
-                }
-                KeyCode::Char('b') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // User asked for a literal Ctrl+B byte (0x02).
-                    self.pump.write(vec![0x02]);
-                    return KeyOutcome::Consumed;
-                }
-                _ => {
-                    // Any other key cancels the prefix and is dropped
-                    // (so an accidental Ctrl+B doesn't fire a stray
-                    // character into the agent).
-                    return KeyOutcome::Consumed;
-                }
-            }
-        }
-        if let KeyCode::Char('b') = k.code {
-            if k.modifiers.contains(KeyModifiers::CONTROL) {
-                self.detach_armed = true;
-                return KeyOutcome::Consumed;
-            }
+        if is_detach_chord(k) {
+            return KeyOutcome::Detach;
         }
         let bytes = match encode_key(k) {
             Some(b) => b,
@@ -334,6 +315,30 @@ impl AttachRuntime {
         };
         self.pump.write(bytes);
         KeyOutcome::Consumed
+    }
+
+    /// Sync the local grid + remote PTY to `(rows, cols)`. Only emits a
+    /// `sessions.resize` when the size changed, so steady-state frames
+    /// don't spam the daemon.
+    fn sync_size(&mut self, rows: u16, cols: u16) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        if self.last_reported_size == Some((rows, cols)) {
+            return;
+        }
+        self.grid.resize(rows, cols);
+        self.pump.resize(rows, cols);
+        self.last_reported_size = Some((rows, cols));
+    }
+}
+
+fn new_attach_runtime(session_id: String, pump: AttachPump) -> AttachRuntime {
+    AttachRuntime {
+        session_id,
+        pump,
+        grid: TermGrid::default(),
+        last_reported_size: None,
+        transient_notice: None,
     }
 }
 
@@ -347,12 +352,7 @@ fn reconcile_attach<S: SessionSource, C: CronSource>(
             // App wants an attach and we have none. Need a socket to spawn.
             let Some(socket) = socket else { return };
             let pump = AttachPump::spawn(socket, &att.session_id);
-            *attach = Some(AttachRuntime {
-                session_id: att.session_id.clone(),
-                pump,
-                transcript: Transcript::default(),
-                detach_armed: false,
-            });
+            *attach = Some(new_attach_runtime(att.session_id.clone(), pump));
         }
         (Some(att), Some(rt)) if att.session_id != rt.session_id => {
             // Session changed under the runner. Tear down the old pump
@@ -362,18 +362,13 @@ fn reconcile_attach<S: SessionSource, C: CronSource>(
             }
             if let Some(socket) = socket {
                 let pump = AttachPump::spawn(socket, &att.session_id);
-                *attach = Some(AttachRuntime {
-                    session_id: att.session_id.clone(),
-                    pump,
-                    transcript: Transcript::default(),
-                    detach_armed: false,
-                });
+                *attach = Some(new_attach_runtime(att.session_id.clone(), pump));
             }
         }
         (None, Some(_)) => {
-            // App cleared the attach (user pressed Ctrl+B d, or the
-            // pump emitted Closed and the App ran the AttachClosed
-            // handler). Tell the pump to stop and drop it.
+            // App cleared the attach (user pressed Ctrl+\, or the pump
+            // emitted Closed and the App ran the AttachClosed handler).
+            // Tell the pump to stop and drop it.
             if let Some(old) = attach.take() {
                 old.pump.stop();
             }
@@ -400,7 +395,7 @@ fn drain_attach<S: SessionSource, C: CronSource>(rt: &mut AttachRuntime, app: &m
                 });
             }
             AttachEvent::Bytes { bytes, .. } => {
-                rt.transcript.feed(&bytes);
+                rt.grid.feed(&bytes);
             }
             AttachEvent::Gap {
                 from_seq,
@@ -408,23 +403,18 @@ fn drain_attach<S: SessionSource, C: CronSource>(rt: &mut AttachRuntime, app: &m
                 dropped_bytes,
                 ..
             } => {
-                // The transcript widget already renders a "…N lines
-                // dropped" hint when the scrollback cap evicts old
-                // bytes; for a wire-level gap we surface a short toast
-                // so the user knows the stream skipped, then keep going.
-                rt.transcript.feed(
-                    format!(
-                        "\n── gap: skipped {dropped_bytes} bytes (seq {from_seq}..={to_seq}) ──\n"
-                    )
-                    .as_bytes(),
-                );
+                // A wire-level gap must NOT be injected into the agent's
+                // grid — raw text would corrupt the cursor-addressed
+                // layout. Surface it on the header status line instead.
+                rt.transient_notice = Some(format!(
+                    "gap: skipped {dropped_bytes} bytes (seq {from_seq}..={to_seq})"
+                ));
             }
             AttachEvent::State { state, reason, .. } => {
-                let line = match reason {
-                    Some(r) => format!("\n── state: {state} ({r}) ──\n"),
-                    None => format!("\n── state: {state} ──\n"),
-                };
-                rt.transcript.feed(line.as_bytes());
+                rt.transient_notice = Some(match reason {
+                    Some(r) => format!("state: {state} ({r})"),
+                    None => format!("state: {state}"),
+                });
             }
             AttachEvent::Disconnected {
                 reason,
@@ -449,9 +439,23 @@ fn drain_attach<S: SessionSource, C: CronSource>(rt: &mut AttachRuntime, app: &m
 /// translator in [`crate::input::translate`]. Some terminals — Windows
 /// is the canonical offender — report both Press and Release for every
 /// keystroke; without this gate every typed character would double on
-/// the PTY and a key release of `b` would arm the Ctrl+B detach prefix.
+/// the PTY.
 fn is_transcript_press(k: &KeyEvent) -> bool {
     matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+/// True for the `Ctrl+\` detach chord. crossterm 0.28 does NOT report this
+/// as `Char('\\')` + CONTROL: in legacy (non-Kitty) mode it decodes the
+/// control byte `0x1C` to `Char('4')` + CONTROL (see crossterm's
+/// `parse_event`: `c - 0x1C + b'4'`). Terminals on the Kitty keyboard
+/// protocol *do* report `Char('\\')` + CONTROL. Accept both so the exit
+/// key works regardless of terminal, and never let either form fall
+/// through to `encode_key` (which would type a literal '4' / '\\').
+fn is_detach_chord(k: KeyEvent) -> bool {
+    if !k.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'))
 }
 
 /// Translate a crossterm [`KeyEvent`] into the byte sequence the daemon
@@ -579,7 +583,23 @@ pub fn draw<S: SessionSource, C: CronSource>(
     // (status spans only) and appends a single hint span trail. This
     // reclaims one full vertical line, which on small terminals is
     // what makes the conversation pane usable.
-    let palette = Palette::for_theme(app.ui_prefs.theme);
+    let palette = app.theme_catalog.palette(&app.ui_prefs.theme);
+    // Multi-theme: named themes paint a full canvas. When the palette
+    // supplies a concrete background (anything but `Color::Reset`), fill
+    // the whole frame first so untouched cells take the theme's bg + body
+    // fg. Widgets that set their own bg still win. `auto` keeps
+    // `bg = Reset` and skips the fill, preserving the terminal canvas.
+    let canvas_bg = palette.bg();
+    if canvas_bg != Color::Reset {
+        frame.render_widget(
+            Block::default().style(
+                Style::default()
+                    .bg(canvas_bg)
+                    .fg(palette.color(Accent::Body)),
+            ),
+            size,
+        );
+    }
     let key_hints_mode = app.ui_prefs.key_hints;
     let compact = app.ui_prefs.compact;
     let show_hints_row =
@@ -750,6 +770,7 @@ pub fn draw<S: SessionSource, C: CronSource>(
             app.tab,
             app.focus,
             &palette,
+            &app.theme_catalog,
         );
     }
 
@@ -876,8 +897,16 @@ fn render_attach_pane(
         if let Some(extra) = detached_extra {
             spans.push(Span::styled(extra, Style::default().fg(muted)));
         }
+        // Transient wire-level notice (gap / lifecycle), kept off the
+        // agent's grid so it never corrupts the cursor-addressed layout.
+        if let Some(notice) = &rt.transient_notice {
+            spans.push(Span::styled(
+                format!("   {notice}"),
+                Style::default().fg(warn),
+            ));
+        }
         spans.push(Span::styled(
-            "   Ctrl+B d 退出",
+            "   Ctrl+\\ 退出",
             Style::default().fg(muted).add_modifier(Modifier::DIM),
         ));
         let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
@@ -885,7 +914,9 @@ fn render_attach_pane(
     }
     if inner.height >= 2 {
         let body_area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
-        let widget = TranscriptView::new(&mut rt.transcript).style(Style::default().fg(body_color));
+        // Keep the local emulator and the remote PTY sized to the body.
+        rt.sync_size(body_area.height, body_area.width);
+        let widget = TermGridView::new(&rt.grid).style(Style::default().fg(body_color));
         frame.render_widget(widget, body_area);
     }
 }
@@ -1099,6 +1130,7 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_modal(
     frame: &mut Frame<'_>,
     full: Rect,
@@ -1107,6 +1139,7 @@ fn render_modal(
     tab: Tab,
     focus: Focus,
     palette: &Palette,
+    catalog: &crate::theme::ThemeCatalog,
 ) {
     let primary = palette.color(Accent::Primary);
     let warn = palette.color(Accent::Warn);
@@ -1285,7 +1318,85 @@ fn render_modal(
                 .wrap(Wrap { trim: false });
             frame.render_widget(para, area);
         }
+        Modal::ThemePicker(draft) => {
+            render_theme_picker(frame, full, draft, catalog, palette);
+        }
     }
+}
+
+/// Render the multi-theme picker: a scrollable list of theme labels with
+/// the highlighted row reversed, plus a swatch row that previews the
+/// highlighted theme's accent colours. The whole UI is already painted in
+/// the previewed theme (the App swaps `ui_prefs.theme` on each move), so
+/// this modal just adds the selection chrome.
+fn render_theme_picker(
+    frame: &mut Frame<'_>,
+    full: Rect,
+    draft: &crate::app::ThemePickerDraft,
+    catalog: &crate::theme::ThemeCatalog,
+    palette: &Palette,
+) {
+    let primary = palette.color(Accent::Primary);
+    let muted = palette.color(Accent::Muted);
+    let body = palette.color(Accent::Body);
+
+    // Height: header + list (capped) + swatch + footer, all inside borders.
+    let visible_rows = (draft.ids.len() as u16).clamp(1, 12);
+    let height = (visible_rows + 6).min(full.height.saturating_sub(2));
+    let area = centered(full, 52, height);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Theme — ↑/↓ preview, ⏎ apply, Esc cancel")
+        .border_style(Style::default().fg(primary));
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    frame.render_widget(block, area);
+
+    // Scroll the list so the highlight stays visible in a tall catalog.
+    let list_h = inner.height.saturating_sub(2) as usize; // reserve swatch + footer
+    let list_h = list_h.max(1);
+    let start = draft
+        .idx
+        .saturating_sub(list_h.saturating_sub(1))
+        .min(draft.ids.len().saturating_sub(list_h).min(draft.ids.len()));
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for (i, id) in draft.ids.iter().enumerate().skip(start).take(list_h) {
+        let label = catalog.label_for(id);
+        let selected = i == draft.idx;
+        let style = if selected {
+            Style::default().fg(body).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(body)
+        };
+        let marker = if selected { "▸ " } else { "  " };
+        lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+    }
+
+    // Swatch row: chips coloured by the highlighted theme's palette so a
+    // colour-blind-unfriendly accent set is visible before applying.
+    if let Some(id) = draft.current_id() {
+        let pal = catalog.palette(id);
+        let chip = |slot: Accent| Span::styled("  ", Style::default().bg(pal.color(slot)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("preview ", Style::default().fg(muted)),
+            chip(Accent::Primary),
+            Span::raw(" "),
+            chip(Accent::Ok),
+            Span::raw(" "),
+            chip(Accent::Warn),
+            Span::raw(" "),
+            chip(Accent::Error),
+            Span::raw(" "),
+            chip(Accent::Body),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn centered(parent: Rect, width: u16, height: u16) -> Rect {
@@ -1586,9 +1697,8 @@ mod tests {
     fn release_events_do_not_reach_the_attach_pump() {
         // Regression: on terminals that emit both Press and Release for
         // every key (Windows is the canonical case), the runner's
-        // transcript fast path used to forward the release too — which
-        // doubled every typed character and could arm the Ctrl+B detach
-        // prefix on key-up.
+        // session fast path used to forward the release too — which
+        // doubled every typed character on the PTY.
         assert!(is_transcript_press(&key(
             KeyEventKind::Press,
             KeyCode::Char('a'),
@@ -1604,13 +1714,30 @@ mod tests {
             KeyCode::Char('a'),
             KeyModifiers::NONE
         )));
-        // The release of `Ctrl+b` is the worst-case offender — without
-        // the filter it would arm the detach prefix latch.
+        // A `Ctrl+\` release must not trigger a second detach.
         assert!(!is_transcript_press(&key(
             KeyEventKind::Release,
-            KeyCode::Char('b'),
+            KeyCode::Char('\\'),
             KeyModifiers::CONTROL
         )));
+    }
+
+    #[test]
+    fn detach_chord_matches_both_crossterm_encodings() {
+        // crossterm 0.28 legacy mode decodes the `Ctrl+\` control byte
+        // (0x1C) to Char('4') + CONTROL, NOT Char('\\'). The Kitty
+        // keyboard protocol reports Char('\\') + CONTROL. Both must detach.
+        let press = |code| key(KeyEventKind::Press, code, KeyModifiers::CONTROL);
+        assert!(is_detach_chord(press(KeyCode::Char('4'))));
+        assert!(is_detach_chord(press(KeyCode::Char('\\'))));
+        // A plain '4' (no Ctrl) must type a digit, not detach.
+        assert!(!is_detach_chord(key(
+            KeyEventKind::Press,
+            KeyCode::Char('4'),
+            KeyModifiers::NONE
+        )));
+        // Other Ctrl chords must not detach.
+        assert!(!is_detach_chord(press(KeyCode::Char('c'))));
     }
 
     #[test]
