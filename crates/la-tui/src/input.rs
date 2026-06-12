@@ -290,8 +290,8 @@ fn translate_new_session_key(
     mods: KeyModifiers,
     _draft: &crate::app::NewSessionDraft,
 ) -> Option<AppMsg> {
-    // Enter confirms from any field. Ctrl+Enter is accepted too so the
-    // advertised "Ctrl+⏎ create" hint stays translatable.
+    // Enter confirms from any field (Ctrl+Enter too — modifiers are
+    // ignored here). Matches the advertised "⏎ create" hint.
     if let KeyCode::Enter = code {
         return Some(AppMsg::Confirm);
     }
