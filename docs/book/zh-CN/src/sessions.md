@@ -54,7 +54,7 @@ modal 内的快捷键：
 
 v1 的 Sessions tab 完成了导航、侧栏与所有 modal，**New-session 表单已端到端接入**：在项目上按 **`n`** 会打开一个真表单，可以挑 backend、勾选 worktree，按 **`Enter`** 即调 daemon 的 `sessions.create`。会话创建时不带初始提示词 —— 等 attach 进去后再向实时 agent 输入第一条指令。新会话会在下一次 ~2 s 刷新里出现在侧栏。
 
-**Live attach 已接入：** 选中会话行按 **`Enter`** 会打开一个实时 PTY 面板，底层走 `sessions.attach { acquire_input: true }`，daemon 把 `session.output` 直接送进 transcript，你键入的每一个字符通过 `sessions.write` 回送到 session。
+**Live attach 已接入：** 选中会话行按 **`Enter`** 会打开一个实时 PTY 面板，底层走 `sessions.attach { acquire_input: true }`，daemon 把 `session.output` 送进一个 VT100 网格仿真器，忠实渲染 agent 的全屏 TUI，你键入的每一个字符通过 `sessions.write` 回送到 session。面板通过 `sessions.resize` 把自己的尺寸上报给 daemon，让 agent 按你的窗口重排。
 
 New-session 表单的字段：
 
@@ -96,12 +96,18 @@ modal 内的快捷键：
 |---|---|
 | `j` / `k` / 方向键 | 移动会话列表光标。 |
 | `Enter` | attach 到选中的会话（打开实时 PTY 面板；daemon 持有输入）。 |
-| `Ctrl+B d` | detach 前缀 → `d` 退回侧栏（session 仍在 daemon 上跑）。`Ctrl+B Esc` 与 `Ctrl+B .` 同样工作。 |
-| `Ctrl+B Ctrl+B` | 给 PTY 发字面量 `Ctrl+B`（0x02），方便依赖该键的 agent。 |
-| 其它任何按键 | 作为 PTY 输入转发到 daemon —— 包括方向键、PgUp/PgDn、Home/End、功能键。当前没有本地滚动模式，面板由 agent 进程拥有。 |
+| `Ctrl+\` | detach 退回侧栏（session 仍在 daemon 上跑）。 |
+| 其它任何按键 | 原样转发到 daemon 作为 PTY 输入 —— 包括方向键、PgUp/PgDn、Home/End、功能键、Ctrl 组合键。会话面板是一个完整的终端仿真器，由 agent 进程拥有面板及其自身的滚动。 |
 | `q`（在侧栏中） | 退出 `la`。会话与 daemon 都还活着。 |
 
-**detach vs 退出：** `Ctrl+B d` 仅释放你的查看器，daemon 立即放弃你的 `acquire_input` 所有权（走 `sessions.detach`）。退出 `la` 在此基础上额外关闭 TUI 进程。两者都不会停止会话。
+attach 面板运行一个真正的 VT100 网格仿真器：全屏 agent TUI（Claude
+Code、Codex、OpenCode）会像在原生终端里一样精确渲染 —— 光标寻址、清屏、
+alternate screen、颜色全部被正确处理。面板按你的窗口尺寸排版,daemon 端的
+PTY 也会随之 resize（走 `sessions.resize`）—— attach 时以及每次你 resize
+终端时都会同步。由于除 `Ctrl+\` 外所有按键都原样转发,面板内无法向 agent
+发送字面量 `Ctrl+\`（SIGQUIT）。
+
+**detach vs 退出：** `Ctrl+\` 仅释放你的查看器，daemon 立即放弃你的 `acquire_input` 所有权（走 `sessions.detach`）。退出 `la` 在此基础上额外关闭 TUI 进程。两者都不会停止会话。
 
 **重新 attach：** 你再次打开 `la` 时，daemon 会把内存环形缓冲（每会话 2 MiB）中的内容在 attach 时回放，让你跟上 "现在"。超出这个范围的输出在持久脚本里（见下文），但不会自动回放。
 
@@ -173,7 +179,7 @@ TUI 的 `[ui]` 段位于 `$XDG_CONFIG_HOME/lazyagents/config.toml`：
 
 ```toml
 [ui]
-theme = "auto"        # auto | dark | light
+theme = "auto"        # 任意内置或自定义主题 id（见下文）
 key_hints = "rich"    # rich | compact | hidden
 compact = false
 ```
@@ -182,11 +188,46 @@ compact = false
 
 | 键 | 效果 |
 |---|---|
-| `T` | 循环切换主题：auto → dark → light |
+| `T` | 打开主题选择器（实时预览） |
 | `H` | 循环切换 key_hints：rich → compact → hidden |
 | `C` | 切换 compact 布局 |
 
-改动会立即通过原子 rename 写回 `config.toml`。你手写的其它段（`[daemon]`、`[scheduler]`、`[adapters.*]`）会逐字保留。
+### 主题
+
+按 `T` 打开主题选择器。用 `↑`/`↓`（或 `k`/`j`）移动高亮——整个界面会实时预览该主题——再按 `⏎` 应用并保存，或按 `Esc` 还原为打开时的主题。
+
+内置主题 id：
+
+- `auto` —— 背景交由终端决定（仅着色强调色）
+- `dark`、`light`
+- `catppuccin-latte`、`catppuccin-frappe`、`catppuccin-macchiato`、`catppuccin-mocha`
+- `gruvbox-dark`、`gruvbox-light`
+- `nord`、`dracula`、`tokyo-night`
+- `solarized-dark`、`solarized-light`
+
+每个具名主题都会绘制自己的背景画布；`auto` 把画布留给终端。
+
+### 自定义主题
+
+用 `[[ui.custom_theme]]` 块定义自己的调色板——它们会与内置主题一起出现在选择器里。`id` 与某个内置主题相同时会覆盖该内置主题。颜色用 `#rrggbb` 十六进制；`label` 缺省取 `id`，`on_accent`（色块上的文字）缺省取 `bg`：
+
+```toml
+[[ui.custom_theme]]
+id = "my-theme"
+label = "My Theme"
+bg = "#1e1e2e"
+fg = "#cdd6f4"
+muted = "#a6adc8"
+primary = "#89b4fa"
+ok = "#a6e3a1"
+warn = "#f9e2af"
+error = "#f38ba8"
+on_accent = "#1e1e2e"
+```
+
+颜色缺失或格式错误的自定义主题会被跳过——TUI 不会因为配置笔误而拒绝启动。
+
+改动会立即通过原子 rename 写回 `config.toml`。你手写的其它段（`[daemon]`、`[scheduler]`、`[adapters.*]`）会逐字保留——你的 `[[ui.custom_theme]]` 块也一样，选择器从不改写它们。
 
 ## 备份
 

@@ -65,9 +65,31 @@ extra_args = []
 extra_args = []
 
 [ui]
-# auto | dark | light
+# Active theme id. Built-ins:
+#   auto | dark | light
+#   catppuccin-latte | catppuccin-frappe | catppuccin-macchiato | catppuccin-mocha
+#   gruvbox-dark | gruvbox-light | nord | dracula | tokyo-night
+#   solarized-dark | solarized-light
+# Or the id of a [[ui.custom_theme]] you define below. Press `T` in the
+# TUI to open the theme picker (live preview). `auto` keeps the terminal
+# background; every named theme paints its own canvas.
 theme = "auto"
 # rich | compact | hidden
 key_hints = "rich"
 # Compact transcript mode in the TUI.
 compact = false
+
+# Optional user-defined palettes. Each appears in the theme picker under
+# `label` (defaults to `id`). Colours are #rrggbb hex. `on_accent`
+# (text drawn on a coloured chip) defaults to `bg` if omitted.
+# [[ui.custom_theme]]
+# id = "my-theme"
+# label = "My Theme"
+# bg = "#1e1e2e"
+# fg = "#cdd6f4"
+# muted = "#a6adc8"
+# primary = "#89b4fa"
+# ok = "#a6e3a1"
+# warn = "#f9e2af"
+# error = "#f38ba8"
+# on_accent = "#1e1e2e"

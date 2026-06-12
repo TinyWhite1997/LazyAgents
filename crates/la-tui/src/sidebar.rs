@@ -27,7 +27,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::model::{BackendBadge, ProjectGroup, RunState};
-use crate::theme::{Accent, Palette, Theme};
+use crate::theme::{Accent, Palette};
 
 /// What the cursor is pointing at.
 ///
@@ -365,13 +365,7 @@ impl Default for SidebarState {
 /// The widget itself is stateless; cursor highlighting is driven through
 /// ratatui's [`ListState`] derived from [`SidebarState::cursor`].
 pub fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &SidebarState, focused: bool) {
-    render_sidebar_themed(
-        frame,
-        area,
-        state,
-        focused,
-        &Palette::for_theme(Theme::Auto),
-    )
+    render_sidebar_themed(frame, area, state, focused, &Palette::auto())
 }
 
 /// WEK-42 / M4.3: theme-aware variant. The runner calls this with the
@@ -433,7 +427,7 @@ pub fn render_sidebar_themed(
 /// the chosen backend is unavailable (the dispatcher refuses the
 /// `sessions.create` with the right business code).
 pub fn render_backends(frame: &mut Frame<'_>, area: Rect, badges: &[BackendBadge]) {
-    render_backends_with_style(frame, area, badges, false, &Palette::for_theme(Theme::Auto))
+    render_backends_with_style(frame, area, badges, false, &Palette::auto())
 }
 
 /// WEK-42 / M4.3: compact-mode entry point.
