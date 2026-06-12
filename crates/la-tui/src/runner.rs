@@ -281,6 +281,12 @@ pub struct AttachRuntime {
     /// Transient wire-level notice (gap / lifecycle) rendered on the
     /// header line instead of being injected into the agent's grid.
     transient_notice: Option<String>,
+    /// True once the user detached (Ctrl+\): the pump has been torn down
+    /// but the grid stays alive so the right pane keeps showing the last
+    /// frame the session drew. A frozen runtime is replaced only when the
+    /// user attaches into a different session (or re-attaches into this
+    /// one).
+    frozen: bool,
 }
 
 /// What the runner should do after a raw key event landed in the
@@ -339,6 +345,7 @@ fn new_attach_runtime(session_id: String, pump: AttachPump) -> AttachRuntime {
         grid: TermGrid::default(),
         last_reported_size: None,
         transient_notice: None,
+        frozen: false,
     }
 }
 
@@ -355,8 +362,9 @@ fn reconcile_attach<S: SessionSource, C: CronSource>(
             *attach = Some(new_attach_runtime(att.session_id.clone(), pump));
         }
         (Some(att), Some(rt)) if att.session_id != rt.session_id => {
-            // Session changed under the runner. Tear down the old pump
-            // and spawn a fresh one.
+            // Session changed under the runner (the user attached into a
+            // different session — including out of a frozen view). Tear
+            // down the old pump + grid and spawn a fresh one.
             if let Some(old) = attach.take() {
                 old.pump.stop();
             }
@@ -365,10 +373,40 @@ fn reconcile_attach<S: SessionSource, C: CronSource>(
                 *attach = Some(new_attach_runtime(att.session_id.clone(), pump));
             }
         }
+        (Some(att), Some(rt)) => {
+            // Same session. Two transitions to reconcile:
+            match (matches!(att.status, AttachStatus::Detached), rt.frozen) {
+                (true, false) => {
+                    // User just detached (Ctrl+\). Stop the live pump but
+                    // KEEP the grid so the right pane stays frozen on the
+                    // last frame. Re-borrow mutably (the match above holds
+                    // a shared borrow).
+                    if let Some(rt) = attach.as_mut() {
+                        rt.pump.stop();
+                        rt.frozen = true;
+                    }
+                }
+                (false, true) => {
+                    // User re-attached into the same session from its
+                    // frozen view (on_enter flipped the status back to
+                    // Connecting). Replace the frozen runtime with a live
+                    // pump + fresh grid.
+                    if let Some(old) = attach.take() {
+                        old.pump.stop();
+                    }
+                    if let Some(socket) = socket {
+                        let pump = AttachPump::spawn(socket, &att.session_id);
+                        *attach = Some(new_attach_runtime(att.session_id.clone(), pump));
+                    }
+                }
+                // (false, false) live attach, (true, true) already frozen
+                // — nothing to do.
+                _ => {}
+            }
+        }
         (None, Some(_)) => {
-            // App cleared the attach (user pressed Ctrl+\, or the pump
-            // emitted Closed and the App ran the AttachClosed handler).
-            // Tell the pump to stop and drop it.
+            // App cleared the attach (an unsolicited pump close ran the
+            // AttachClosed handler). Tell the pump to stop and drop it.
             if let Some(old) = attach.take() {
                 old.pump.stop();
             }
@@ -854,6 +892,7 @@ fn render_attach_pane(
             input_acquired: false,
         } => ("connected · read-only", warn),
         AttachStatus::Disconnected { .. } => ("已断开", err),
+        AttachStatus::Detached => ("已退出 · 历史", muted),
     };
     // The reason / retry suffix is rendered as a second styled span on
     // the header line (see below). The border title stays terse so it
@@ -906,7 +945,11 @@ fn render_attach_pane(
             ));
         }
         spans.push(Span::styled(
-            "   Ctrl+\\ 退出",
+            if matches!(att.status, AttachStatus::Detached) {
+                "   ⏎ 重新进入"
+            } else {
+                "   Ctrl+\\ 退出"
+            },
             Style::default().fg(muted).add_modifier(Modifier::DIM),
         ));
         let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
@@ -914,8 +957,12 @@ fn render_attach_pane(
     }
     if inner.height >= 2 {
         let body_area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
-        // Keep the local emulator and the remote PTY sized to the body.
-        rt.sync_size(body_area.height, body_area.width);
+        // Keep the local emulator and the remote PTY sized to the body —
+        // but only while live. A frozen (detached) grid has no pump to
+        // resize, and reflowing it would just scramble the last frame.
+        if !rt.frozen {
+            rt.sync_size(body_area.height, body_area.width);
+        }
         let widget = TermGridView::new(&rt.grid).style(Style::default().fg(body_color));
         frame.render_widget(widget, body_area);
     }
