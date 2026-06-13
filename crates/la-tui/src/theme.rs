@@ -95,7 +95,12 @@ pub const DEFAULT_THEME_ID: &str = "auto";
 pub enum Accent {
     /// Cursor / focus borders / "next action" highlight.
     Primary,
-    /// Success / running / enabled.
+    /// Informational / in-progress. The sidebar paints a *running* session
+    /// row in this blue (PRD §5.3 status palette: blue=running). Defaults to
+    /// the theme's `primary` blue unless a palette overrides it.
+    Info,
+    /// Success / completed / enabled. The sidebar paints an *exited* (a
+    /// finished agent turn) session row green here.
     Ok,
     /// Warning / pending confirm.
     Warn,
@@ -117,6 +122,7 @@ pub enum Accent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     primary: Color,
+    info: Color,
     ok: Color,
     warn: Color,
     error: Color,
@@ -130,6 +136,7 @@ impl Palette {
     pub fn color(&self, slot: Accent) -> Color {
         match slot {
             Accent::Primary => self.primary,
+            Accent::Info => self.info,
             Accent::Ok => self.ok,
             Accent::Warn => self.warn,
             Accent::Error => self.error,
@@ -268,6 +275,11 @@ const fn rgb_palette(
 ) -> Palette {
     Palette {
         primary: Color::Rgb(primary.0, primary.1, primary.2),
+        // Third-party / user palettes don't carry a dedicated "info" hue;
+        // most of their `primary` is already a blue, so reuse it for the
+        // running-session glyph rather than forcing every theme table to
+        // grow an eighth column.
+        info: Color::Rgb(primary.0, primary.1, primary.2),
         ok: Color::Rgb(ok.0, ok.1, ok.2),
         warn: Color::Rgb(warn.0, warn.1, warn.2),
         error: Color::Rgb(error.0, error.1, error.2),
@@ -284,6 +296,7 @@ const fn rgb_palette(
 fn auto_palette() -> Palette {
     Palette {
         primary: Color::Rgb(0x6c, 0xc0, 0xdf),
+        info: Color::Rgb(0x58, 0xa6, 0xff),
         ok: Color::Rgb(0x7c, 0xe3, 0x8a),
         warn: Color::Rgb(0xff, 0xc8, 0x57),
         error: Color::Rgb(0xff, 0x7b, 0x72),
@@ -313,6 +326,7 @@ pub fn builtin_specs() -> Vec<ThemeSpec> {
             "Dark",
             Palette {
                 primary: Color::Rgb(0x6c, 0xc0, 0xdf),
+                info: Color::Rgb(0x58, 0xa6, 0xff),
                 ok: Color::Rgb(0x7c, 0xe3, 0x8a),
                 warn: Color::Rgb(0xff, 0xc8, 0x57),
                 error: Color::Rgb(0xff, 0x7b, 0x72),
@@ -327,6 +341,7 @@ pub fn builtin_specs() -> Vec<ThemeSpec> {
             "Light",
             Palette {
                 primary: Color::Rgb(0x05, 0x59, 0x80),
+                info: Color::Rgb(0x09, 0x57, 0xc7),
                 ok: Color::Rgb(0x1a, 0x73, 0x2e),
                 warn: Color::Rgb(0x8a, 0x5a, 0x00),
                 error: Color::Rgb(0xb3, 0x10, 0x10),
@@ -651,6 +666,7 @@ mod tests {
         let cases: [(&str, (u8, u8, u8)); 2] = [("dark", DARK_BG), ("light", LIGHT_BG)];
         let slots = [
             Accent::Primary,
+            Accent::Info,
             Accent::Ok,
             Accent::Warn,
             Accent::Error,

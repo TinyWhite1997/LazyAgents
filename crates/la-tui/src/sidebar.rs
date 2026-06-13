@@ -611,8 +611,8 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn render_item<'a>(state: &'a SidebarState, item: &'a Item, palette: &Palette) -> ListItem<'a> {
+    let info = palette.color(Accent::Info);
     let ok = palette.color(Accent::Ok);
-    let warn = palette.color(Accent::Warn);
     let err = palette.color(Accent::Error);
     let muted = palette.color(Accent::Muted);
     let body = palette.color(Accent::Body);
@@ -640,15 +640,17 @@ fn render_item<'a>(state: &'a SidebarState, item: &'a Item, palette: &Palette) -
             session_index,
         } => {
             let row = &state.groups[*group_index].sessions[*session_index];
-            // Per-state glyph colour now sources from `Accent::*` so a
-            // Light theme uses the WCAG-tuned amber/red rather than the
-            // pre-M4.3 raw ANSI Yellow/Red.
+            // Status palette (PRD §5.3): blue=running, green=complete,
+            // grey=idle, red=errored. The daemon can't yet tell "finished a
+            // turn" (complete) from "paused on a prompt" — both surface as
+            // `Waiting` — so until an adapter parses that signal, `Waiting`
+            // is treated as complete (green) rather than guessing red.
             let glyph_color = match row.run_state {
-                RunState::Running => ok,
+                RunState::Running => info,
+                RunState::Exited => ok,
+                RunState::Waiting => ok,
                 RunState::Idle => muted,
-                RunState::Waiting => warn,
                 RunState::Errored => err,
-                RunState::Exited => muted,
             };
             ListItem::new(Line::from(vec![
                 Span::raw("  "),
